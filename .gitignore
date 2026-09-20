@@ -1,0 +1,55 @@
+# Keil MDK
+Objects/
+Listings/
+DebugConfig/
+RTE/
+*.uvguix.*
+*.uvoptx
+*.bak
+*.dep
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.d
+*.crf
+*.lst
+
+# STM32CubeIDE / Eclipse
+Debug/
+Release/
+.settings/
+*.launch
+.metadata/
+
+# PlatformIO
+.pio/
+.pioenvs/
+
+# VSCode
+.vscode/
+
+# Python / 上位机
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ROS2
+build/
+install/
+log/
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 密钥（千万别提交）
+*.pem
+*.key
+credentials.json
+secrets.h
+.env
