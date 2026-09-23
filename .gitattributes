@@ -1,0 +1,39 @@
+# 统一换行符，避免跨机器/跨编辑器出现「整片文件被修改」的假 diff
+#
+# 规则说明：
+#   text=auto  由 Git 自动判断是否为文本文件
+#   eol=lf     仓库与工作区统一用 LF（Keil 能正常读写 LF）
+# 属性优先级高于 core.autocrlf，所以无论队友的 autocrlf 设成什么，行为都一致。
+
+* text=auto eol=lf
+
+# Keil MDK 工程文件强制保持 CRLF，避免 Keil 回写时产生假 diff
+*.uvprojx   text eol=crlf
+*.mxproject text eol=crlf
+
+# 二进制文件：禁止任何换行符转换
+*.a     binary
+*.lib   binary
+*.hex   binary
+*.bin   binary
+*.elf   binary
+*.axf   binary
+*.o     binary
+*.d     binary
+*.crf   binary
+*.dep   binary
+*.map   binary
+*.bak   binary
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.xlsx  binary
+*.docx  binary
+
+# 让 Git 在 diff 与语言统计中正确识别
+*.c     diff=cpp
+*.h     diff=cpp
+*.cpp   diff=cpp
+*.md    diff=markdown
