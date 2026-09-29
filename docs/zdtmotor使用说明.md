@@ -2,9 +2,12 @@
 
 ZDT Y42 第二代闭环步进电机 **CAN 通讯控制封装库**（针对 **X 固件**）。
 
+> ⚠️ **当前项目实际使用的是 UART 版（`zdtmotor_uart.c/.h`），本 CAN 版库暂未启用，仅保留备用**（将来若换 CAN 时使用）。
+> 本库文件仍保留在 `Hardware/` 下，但**已从 Keil 工程移除**，can.c 的接收回调和 main.c 的初始化也已删除；要重新启用需按下方「接入步骤」重新加回。
+
 - 适用芯片：STM32F103C8（CAN1，PA11=RX / PA12=TX，500K 波特率）
 - 控制对象：7 个电机 —— 4 个麦克纳姆底盘 + 3 轴机械臂
-- 文件位置：`Core/Inc/zdtmotor.h`、`Core/Src/zdtmotor.c`
+- 文件位置：`Hardware/zdtmotor.h`、`Hardware/zdtmotor.c`
 
 ---
 
@@ -25,7 +28,7 @@ CAN 通讯采用**扩展帧**，与手册「4.2 CAN 通讯」一致：
 
 ## 2. 接入步骤
 
-1. 把 `zdtmotor.c`、`zdtmotor.h` 放进工程（已在 Keil 工程的 `Application/User/Core` 分组，若用 CubeMX 重新生成工程需重新确认）。
+1. 把 `Hardware/zdtmotor.c`、`Hardware/zdtmotor.h` 加进 Keil 工程（当前已被移除，需重新添加；并确认 Include Path 里有 `..\Hardware`）。
 2. `main.c` 中 `MX_CAN_Init()` 之后调用初始化：
 
 ```c
@@ -33,7 +36,7 @@ MX_CAN_Init();
 ZDT_Motor_Init();   // 配置过滤器、启动 CAN、使能接收中断
 ```
 
-3. 接收回调已放在 `can.c` 的 `HAL_CAN_RxFifo0MsgPendingCallback` 中，收到电机返回帧后会自动解析到 `zdt_state[]`，无需手动处理。
+3. 接收回调需加回 `can.c` 的 `HAL_CAN_RxFifo0MsgPendingCallback` 中，收到电机返回帧后解析到 `zdt_state[]`（此回调在切换到 UART 版时已删除，换回 CAN 时需重新补上）。
 
 ---
 
