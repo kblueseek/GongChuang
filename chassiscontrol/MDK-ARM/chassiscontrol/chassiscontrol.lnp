@@ -26,6 +26,7 @@
 "chassiscontrol\controllertask.o"
 "chassiscontrol\zdtmotor_uart.o"
 "chassiscontrol\ble_control.o"
+"chassiscontrol\servo.o"
 --strict --scatter "chassiscontrol\chassiscontrol.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers

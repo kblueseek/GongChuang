@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "zdtmotor_uart.h"
 #include "ble_control.h"
+#include "servo.h"
 #include "ControllerTask.h"
 /* USER CODE END Includes */
 
@@ -98,6 +99,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
   ZDT_UART_Init();
   BLE_Init();
+  Servo_Init();
   ControllerTask_Init();
   /* USER CODE END 2 */
 

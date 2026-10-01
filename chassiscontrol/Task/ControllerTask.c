@@ -129,7 +129,9 @@ void BLE_OnKey(BLE_KeyEvent *e)
     }
 }
 
-/* 滑杆（暂未用，占位） */
+/* 滑杆：本任务只做底盘运动控制，舵机不在这里管。
+ * 若要蓝牙调舵机，在这里调用 Servo_HandleSlider(e->name, e->value)。
+ * 留空函数是为了保持 ble_control.c 的回调约定不破。 */
 void BLE_OnSlider(BLE_SliderEvent *e)
 {
     (void)e;
