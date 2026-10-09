@@ -1,0 +1,25 @@
+# YDLIDAR X3 PRO 参数（ydlidar_ros2_driver）
+# 参数名以 ydlidar_ros2_driver 仓库内的 sample launch/yaml 为准，不同版本可能有细微差异。
+ydlidar_ros2_driver_node:
+  ros__parameters:
+    port: /dev/ydlidar          # 依赖 udev 规则建立的符号链接（见 scripts/setup.sh）
+    frame_id: laser_frame
+    ignore_array: ""
+    baudrate: 115200            # X3 PRO 出厂波特率
+    lidar_type: 1               # 三角测距类（X3/X3 PRO）
+    device_type: 0
+    sample_rate: 5              # 采样率（kHz）
+    abnormal_check_count: 4
+    fixed_resolution: true
+    reversion: true
+    inverted: true
+    auto_reconnect: true
+    isSingleChannel: false
+    intensity: false
+    support_motor_dtr: true     # X3 PRO 电机靠 CP2102 的 DTR 起转，须为 true
+    angle_min: -180
+    angle_max: 180              # 360° 扫描
+    range_min: 0.1
+    range_max: 8.0              # X3 PRO 最大量程约 8m
+    frequency: 10.0             # 扫描频率 Hz（X3 PRO 支持 8~12）
+    invalid_range_is_inf: false
