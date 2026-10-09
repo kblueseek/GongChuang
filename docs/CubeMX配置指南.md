@@ -1,6 +1,6 @@
 # STM32F407VET6 整车控制板 — CubeMX 配置指南（FreeRTOS 版）
 
-> 目标：用 CubeMX 生成 Keil（MDK-ARM）工程，配置 **FreeRTOS**（5 任务）、**CAN1**（7 个 ZDT 步进电机）、**USART1**（树莓派）、**USART2**（JY901S 陀螺仪）、**USART6**（调试输出）、**TIM3**（3 路舵机 PWM）。
+> 目标：用 CubeMX 生成 Keil（MDK-ARM）工程，配置 **FreeRTOS**（5 任务）、**CAN1**（7 个 ZDT 步进电机）、**USART1**（调试输出）、**USART2**（蓝牙）、**USART3**（JY901S 陀螺仪）、**USART6**（树莓派）、**TIM3**（3 路舵机 PWM）。
 > 工程结构参照 RM 标准项目：`Core`（CubeMX 生成）/ `ExHardware`（外设驱动）/ `Task`（FreeRTOS 任务）/ `UserLibrary`（工具库）。
 > 更新日期：2026-10-02
 
@@ -10,11 +10,11 @@
 
 | 外设 | 引脚 | 说明 |
 |---|---|---|
-| CAN1_RX / CAN1_TX | **PA11 / PA12** | 7 个 ZDT 电机总线（并联，500kbps） |
-| USART1_TX / RX | **PA9 / PA10** | 树莓派（双向，115200） |
+| CAN1_RX / CAN1_TX | **PB8 / PB9** | 7 个 ZDT 电机总线（并联，500kbps） |
+| USART1_TX / RX | **PA9 / PA10** | 调试数据输出（115200，TX 走 DMA） |
 | USART2_TX / RX | **PA2 / PA3** | 蓝牙遥控（115200，类比 DBUS） |
 | USART3_TX / RX | **PB10 / PB11** | JY901S 陀螺仪（默认 9600，可改 115200） |
-| USART6_TX / RX | **PC6 / PC7** | 调试数据输出（460800，TX 走 DMA） |
+| USART6_TX / RX | **PC6 / PC7** | 树莓派（双向，115200） |
 | TIM3_CH1 | **PA6** | 夹爪舵机（180°） |
 | TIM3_CH2 | **PA7** | 载物盘舵机（180°） |
 | TIM3_CH3 | **PB0** | 摄像头舵机（180°） |
@@ -37,8 +37,8 @@
 | 参数 | 值 |
 |---|---|
 | PLL Source | HSE |
-| **PLLM** | **8**（8MHz/8 = 1MHz） |
-| **PLLN** | **336**（1MHz×336 = 336MHz） |
+| **PLLM** | **4**（8MHz/4 = 2MHz） |
+| **PLLN** | **168**（2MHz×168 = 336MHz） |
 | **PLLP** | **2**（336/2 = 168MHz） |
 | PLLQ | 7（48MHz，给 USB/SDIO 预留） |
 | SYSCLK | **168 MHz** |
@@ -86,7 +86,7 @@
 
 ## 5. CAN1（7 个 ZDT 电机，500 kbps）
 
-`Connectivity → CAN1`，勾选 **Activated**，引脚 `CAN1_RX → PA11`、`CAN1_TX → PA12`。
+`Connectivity → CAN1`，勾选 **Activated**，引脚 `CAN1_RX → PB8`、`CAN1_TX → PB9`。
 
 **Parameter Settings**：
 
@@ -104,9 +104,9 @@
 > ⚠️ 漏勾 = 永远收不到电机反馈。
 > ⚠️ F4 双 CAN 注意：`ZdtCan_Init()` 里已写 `SlaveStartFilterBank = 14`，这是 F407 双 CAN 过滤器分段必需的，不加会 `HAL_ERROR`。
 
-## 6. USART1（树莓派，双向）
+## 6. USART6（树莓派，双向）
 
-Mode = Asynchronous，PA9/PA10。参数：**115200** 8N1，Overrun Disable。NVIC 勾选 **USART1 global interrupt**。
+Mode = Asynchronous，PC6/PC7。参数：**115200** 8N1，Overrun Disable。NVIC 勾选 **USART6 global interrupt**。
 
 > 后续遥测量大可升 460800（APB2=84MHz，460800 误差 0.02%，可用）。
 
@@ -120,23 +120,23 @@ Mode = Asynchronous，PA2/PA3。参数：**115200** 8N1。NVIC 勾选 **USART2 g
 
 Mode = Asynchronous，PB10/PB11。参数：**9600** 8N1（JY901S 出厂默认；用上位机改成 115200 后此处同步改）。NVIC 勾选 **USART3 global interrupt**。
 
-## 9. USART6（调试输出，DMA）
+## 9. USART1（调试输出，DMA）
 
-Mode = Asynchronous，PC6/PC7。参数：**460800** 8N1。
+Mode = Asynchronous，PA9/PA10。参数：**115200** 8N1。
 
-**DMA Settings 标签**：Add → 选 **USART6_TX**：
+**DMA Settings 标签**：Add → 选 **USART1_TX**：
 
 | 参数 | 值 |
 |---|---|
-| DMA Request | USART6_TX |
-| Stream | DMA1 Stream 6（默认） |
+| DMA Request | USART1_TX |
+| Stream | DMA2 Stream 7（默认，Channel 4） |
 | Direction | Memory To Peripheral |
 | Mode | **Normal**（每帧发一次，不用 Circular） |
 | 其余 | 默认（Data Width Byte） |
 
-NVIC 勾选 USART6 global interrupt（可不勾，发送不用中断）。
+NVIC 勾选 USART1 global interrupt（可不勾，发送不用中断）。
 
-> DebugTask 用 `HAL_UART_Transmit_DMA(&huart6, ...)` 每 10ms 发一帧 56 字节，@460800 ≈ 1.2ms，无阻塞。
+> DebugTask 用 `HAL_UART_Transmit_DMA(&huart1, ...)` 每 10ms 发一帧 DebugData，无阻塞。
 
 ## 10. TIM3（3 路舵机 PWM，50Hz）
 
@@ -217,18 +217,18 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 #include "JY901S.h"
 #include "BleControl.h"
 
-uint8_t uart1_rx_byte;   /* USART1 — 树莓派 */
 uint8_t uart2_rx_byte;   /* USART2 — 蓝牙遥控 */
 uint8_t uart3_rx_byte;   /* USART3 — JY901S */
+uint8_t uart6_rx_byte;   /* USART6 — 树莓派 */
 /* USER CODE END 0 */
 ```
 
 **② 每个 MX_USARTx_UART_Init() 末尾的 USER CODE 2 段，启动中断接收：**
 
 ```c
-  /* USER CODE BEGIN USART1_Init 2 */
-  HAL_UART_Receive_IT(&huart1, &uart1_rx_byte, 1);
-  /* USER CODE END USART1_Init 2 */
+  /* USER CODE BEGIN USART6_Init 2 */
+  HAL_UART_Receive_IT(&huart6, &uart6_rx_byte, 1);
+  /* USER CODE END USART6_Init 2 */
 ```
 
 ```c
@@ -250,9 +250,9 @@ uint8_t uart3_rx_byte;   /* USART3 — JY901S */
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART1) {
-        PiComm_RxByte(uart1_rx_byte);
-        HAL_UART_Receive_IT(&huart1, &uart1_rx_byte, 1);
+    if (huart->Instance == USART6) {
+        PiComm_RxByte(uart6_rx_byte);
+        HAL_UART_Receive_IT(&huart6, &uart6_rx_byte, 1);
     } else if (huart->Instance == USART2) {
         BLE_RxCallback(uart2_rx_byte);
         HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
@@ -297,8 +297,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 | CAN 初始化返回 HAL_ERROR | F4 双 CAN 过滤器分段没设 | 确认 `SlaveStartFilterBank = 14` |
 | 任务没跑 | 任务实现没加进工程 | Task/*.c 加入 Keil + Include Paths |
 | CubeMX 重新生成后任务实现没了 | 任务没选 As weak | Tasks 标签 Code Generation = As weak |
-| 树莓派指令收不到 | USART1 RX 中断没启动 | 确认 13.4 ② 的两段代码 |
-| 编译报 hdma_usart6_tx 未定义 | USART6 DMA 没配 | 见第 9 节 |
+| 树莓派指令收不到 | USART6 RX 中断没启动 | 确认 13.4 ② 的两段代码 |
+| 编译报 hdma_usart1_tx 未定义 | USART1 DMA 没配 | 见第 9 节 |
 | 电机不转 | 电机侧没配 CAN 模式 | 上位机把「通讯端口复用」设 CAN(03)、地址 1-7、波特率 500K |
 
 ---
