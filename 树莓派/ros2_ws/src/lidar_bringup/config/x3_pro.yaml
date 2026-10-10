@@ -1,25 +1,39 @@
-# YDLIDAR X3 PRO 参数（ydlidar_ros2_driver）
-# 参数名以 ydlidar_ros2_driver 仓库内的 sample launch/yaml 为准，不同版本可能有细微差异。
+# YDLIDAR X3 PRO 激光雷达的配置参数。
+#
+# 大白话：这个文件告诉雷达驱动"你的雷达是谁、连在哪个口、什么波特率、扫多大范围"。
+# 这些参数会被 launch 文件加载，传给第三方驱动 ydlidar_ros2_driver。
+#
+# 注意：顶层那个名字 ydlidar_ros2_driver_node 必须是【节点名】（launch 文件里 Node 的 name），
+# 参数才能正确加载到那个节点上。
+
 ydlidar_ros2_driver_node:
   ros__parameters:
-    port: /dev/ydlidar          # 依赖 udev 规则建立的符号链接（见 scripts/setup.sh）
-    frame_id: laser_frame
-    ignore_array: ""
-    baudrate: 115200            # X3 PRO 出厂波特率
-    lidar_type: 1               # 三角测距类（X3/X3 PRO）
-    device_type: 0
-    sample_rate: 5              # 采样率（kHz）
-    abnormal_check_count: 4
-    fixed_resolution: true
-    reversion: true
-    inverted: true
-    auto_reconnect: true
-    isSingleChannel: false
-    intensity: false
-    support_motor_dtr: true     # X3 PRO 电机靠 CP2102 的 DTR 起转，须为 true
-    angle_min: -180
-    angle_max: 180              # 360° 扫描
-    range_min: 0.1
-    range_max: 8.0              # X3 PRO 最大量程约 8m
-    frequency: 10.0             # 扫描频率 Hz（X3 PRO 支持 8~12）
-    invalid_range_is_inf: false
+    port: /dev/ydlidar          # 串口设备。这个 /dev/ydlidar 是 setup.sh 里 udev 规则建的符号链接，
+                                # 作用是把"不管插哪个USB口"都固定成同一个名字。
+    frame_id: laser_frame       # 雷达数据的坐标系名（点云挂在哪个坐标系下）。
+    ignore_array: ""            # 要忽略的角度范围（留空=不忽略）。
+
+    baudrate: 115200            # 波特率。X3 PRO 出厂就是 115200，别乱改，改了连不上。
+
+    lidar_type: 1               # 雷达类型。1 = 三角测距类（X3/X3 PRO 属于这类）。
+    device_type: 0              # 连接方式。0 = 串口。
+    sample_rate: 5              # 采样率（kHz），每秒采多少个点。
+
+    abnormal_check_count: 4     # 连续多少次异常就判定雷达出问题。
+    fixed_resolution: true      # 是否固定角分辨率。
+
+    reversion: true             # 是否反转角度方向。
+    inverted: true              # 是否上下颠倒点云（安装方向不同时用）。
+    auto_reconnect: true        # 雷达断线后自动重连。
+
+    isSingleChannel: false      # 是否单通道（X3 PRO 用 false）。
+    intensity: false            # 是否输出每个点的强度值（我们不需要，关掉省带宽）。
+    support_motor_dtr: true     # 重要：X3 PRO 的电机靠串口芯片 CP2102 的 DTR 信号起转，
+                                # 必须设 true，否则雷达不转、扫不出完整一圈。
+
+    angle_min: -180             # 扫描起始角度。
+    angle_max: 180              # 扫描结束角度（-180~180 就是 360° 一整圈）。
+    range_min: 0.1              # 最小有效距离（米），小于它算无效。
+    range_max: 8.0              # 最大量程（米），X3 PRO 约 8 米。
+    frequency: 10.0             # 扫描频率（Hz），对应电机 600 转/分钟。
+    invalid_range_is_inf: false # 无效距离用 0 还是用无穷大表示（我们后续会过滤掉）。

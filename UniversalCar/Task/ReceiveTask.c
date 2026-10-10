@@ -28,6 +28,7 @@ void ReceiveTask(void const* argument)
     Receive.LastOnlineTick = 0;
 
     uint32_t LastReportTick = 0;
+    uint32_t LastOdomTick = 0;
 
     while (1)
     {
@@ -72,6 +73,15 @@ void ReceiveTask(void const* argument)
                     mask |= (1 << (i - 1));
 
             PiComm_SendStatus(Receive.State, Receive.ErrorFlag, mask);
+        }
+
+        /* ---- 里程计回传（PI_RPT_FREQ_HZ，默认50Hz）：Pi 位置闭环/状态机靠它判断是否到位 ---- */
+        if (NowTick - LastOdomTick >= (1000 / PI_RPT_FREQ_HZ))
+        {
+            LastOdomTick = NowTick;
+            PiComm_SendOdometry(Chassis.Pos.X * 1000.f,
+                                Chassis.Pos.Y * 1000.f,
+                                Imu.Yaw * (PI / 180.f) * 1000.f);   /* ° → mrad */
         }
     }
 }

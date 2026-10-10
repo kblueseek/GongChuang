@@ -62,6 +62,7 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
             PiCommand.Vel.Vx = (int16_t)((d[0] << 8) | d[1]) / 1000.f;    /* mm/s → m/s */
             PiCommand.Vel.Vy = (int16_t)((d[2] << 8) | d[3]) / 1000.f;
             PiCommand.Vel.Wz = (int16_t)((d[4] << 8) | d[5]) / 1000.f;    /* mrad/s → rad/s */
+            PiCommand.PosTarget.Valid = 0;   /* 收到速度指令：退出位置闭环，回到手动速度模式 */
         }
         break;
     case PI_CMD_GIMBAL_TARGET:
@@ -77,6 +78,18 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
     case PI_CMD_GIMBAL_HOME:
         if (dLen >= 1)
             PiCommand.HomeMask = d[0] & 0x07;
+        break;
+    case PI_CMD_POSE:               /* x y yaw：int32 mm, int32 mm, int16 mrad */
+        if (dLen >= 10) {
+            int32_t x = (int32_t)((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]);
+            int32_t y = (int32_t)((d[4] << 24) | (d[5] << 16) | (d[6] << 8) | d[7]);
+            int16_t t = (int16_t)((d[8] << 8) | d[9]);
+            PiCommand.PosTarget.X = x / 1000.f;                  /* mm → m */
+            PiCommand.PosTarget.Y = y / 1000.f;
+            PiCommand.TargetYaw = t * (180.f / (PI * 1000.f));   /* mrad → ° */
+            PiCommand.TargetYawValid = 1;
+            PiCommand.PosTarget.Valid = 1;
+        }
         break;
     case PI_CMD_GRIPPER:
         if (dLen >= 1)
@@ -100,7 +113,7 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
         }
         break;
     case PI_CMD_ESTOP:
-        PiCommand.Estop = 1;
+        PiCommand.Estop = (dLen >= 1 && d[0] == 0) ? 0 : 1;   /* 无数据=置急停；字节0=解除急停 */
         PiCommand.Vel.Vx = PiCommand.Vel.Vy = PiCommand.Vel.Wz = 0;
         break;
     case PI_CMD_HEARTBEAT:

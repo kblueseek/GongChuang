@@ -23,7 +23,8 @@
 #define PI_CMD_PLATE         0x05    /* DATA: pos(u8, 0~180°) */
 #define PI_CMD_CAM           0x06    /* DATA: pos(u8, 0~180°) */
 #define PI_CMD_ENABLE        0x07    /* DATA: en(u8) + mask(u8, bit0-6 = 电机1-7) */
-#define PI_CMD_ESTOP         0x08    /* DATA: 无，最高优先级 */
+#define PI_CMD_ESTOP         0x08    /* DATA: 无=置急停；或1字节(0=解除, 非0=置急停)，最高优先级 */
+#define PI_CMD_POSE          0x09    /* DATA: x y yaw (int32 mm, int32 mm, int16 mrad)，底盘位姿目标(位置+航向闭环) */
 #define PI_CMD_HEARTBEAT     0x10    /* DATA: 无，1Hz */
 
 /* ============ 遥测码（STM32 → 树莓派） ============ */
@@ -51,6 +52,13 @@ typedef struct
     uint8_t Estop;      //急停标志（收到即置位，上位机解除前保持）
 
     uint8_t ReturnHome; //回到坐标零点请求（蓝牙 return 键触发，到达后由底盘任务清除）
+
+    struct
+    {
+        float X;        //世界系位置目标 m（PI_CMD_POSE 下发）
+        float Y;
+        uint8_t Valid;  //1=位置闭环生效；收到速度指令(PI_CMD_VEL)会清掉它，退回手动速度模式
+    } PosTarget;
 
     float   TargetYaw;      //目标航向 °（-180~180），航向 PID 的被控目标
     uint8_t TargetYawValid; //是否收到过有效目标航向（0 = 锁存当前朝向，不做修正）

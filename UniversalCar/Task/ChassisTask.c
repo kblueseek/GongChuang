@@ -181,17 +181,19 @@ static void Chassis_OdometryUpdate(void)
     Chassis.Pos.Y += dx * sinY + dy * cosY;
 }
 
-/* 回零：世界系位置误差 → PID → 世界系速度 → 转车体系，覆盖 Vx/Vy。
-   到位后清请求并停车。由 return 键触发，目标恒为里程计零点 (0,0)。 */
-static void Chassis_ReturnHomeControl(void)
+/* 位置闭环：世界系位置误差 → PID → 世界系速度 → 转车体系，覆盖 Vx/Vy。
+   目标可以是 Pi 下发的任意位姿(PI_CMD_POSE)，也可以是蓝牙回零的零点(0,0)。
+   Pi 位姿目标到达后由 Pi 侧判定并下发下一目标，这里持续 PID 锁定、不自动停；
+   蓝牙回零是"一次性"的：到位即停、清请求、清积分。 */
+static void Chassis_PoseControl(float targetX, float targetY)
 {
     float yawRad = Imu.Yaw * PI / 180.0f;
     float cosY = cosf(yawRad);
     float sinY = sinf(yawRad);
 
     /* 世界系误差 → PID → 世界系速度 */
-    PID_Calc(&Chassis.PosPidX, Chassis.Pos.X, 0.0f);
-    PID_Calc(&Chassis.PosPidY, Chassis.Pos.Y, 0.0f);
+    PID_Calc(&Chassis.PosPidX, Chassis.Pos.X, targetX);
+    PID_Calc(&Chassis.PosPidY, Chassis.Pos.Y, targetY);
     float vxWorld = Chassis.PosPidX.Output;
     float vyWorld = Chassis.PosPidY.Output;
 
@@ -199,8 +201,9 @@ static void Chassis_ReturnHomeControl(void)
     Chassis.Move.Vx =  vxWorld * cosY + vyWorld * sinY;
     Chassis.Move.Vy = -vxWorld * sinY + vyWorld * cosY;
 
-    /* 到位判定：距离零点足够近则停车、清请求、清积分 */
-    if (sqrtf(Chassis.Pos.X * Chassis.Pos.X + Chassis.Pos.Y * Chassis.Pos.Y) < CHASSIS_RETURN_ARRIVED)
+    /* 蓝牙回零到位判定：距离零点足够近则停车、清请求、清积分 */
+    if (PiCommand.ReturnHome &&
+        sqrtf(Chassis.Pos.X * Chassis.Pos.X + Chassis.Pos.Y * Chassis.Pos.Y) < CHASSIS_RETURN_ARRIVED)
     {
         Chassis.Move.Vx = 0;
         Chassis.Move.Vy = 0;
@@ -313,9 +316,11 @@ void ChassisTask(void const* argument)
         Chassis.Move.Wz = PiCommand.Vel.Wz;   /* 手动自旋指令（原逻辑，宏关闭时生效） */
 #endif
 
-        /* ---- 回零：return 键触发，位置闭环覆盖 Vx/Vy ---- */
-        if (PiCommand.ReturnHome)
-            Chassis_ReturnHomeControl();
+        /* ---- 位置闭环：Pi 位姿目标(PosTarget.Valid) 或 蓝牙回零(ReturnHome) → 覆盖 Vx/Vy ---- */
+        if (PiCommand.PosTarget.Valid)
+            Chassis_PoseControl(PiCommand.PosTarget.X, PiCommand.PosTarget.Y);
+        else if (PiCommand.ReturnHome)
+            Chassis_PoseControl(0.0f, 0.0f);
 
         /* ---- 里程计：积分车体速度 → 世界系位置 ---- */
         Chassis_OdometryUpdate();

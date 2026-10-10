@@ -1,3 +1,6 @@
+# setup.py：告诉 colcon 怎么安装 f407_bridge 包。
+# 和 obstacle_detect 结构完全一样，只是命令名不同。
+
 from setuptools import find_packages, setup
 
 package_name = 'f407_bridge'
@@ -18,6 +21,7 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
+            # 命令名 f407_bridge_node -> 调用 f407_bridge.f407_bridge_node 里的 main()
             'f407_bridge_node = f407_bridge.f407_bridge_node:main',
         ],
     },
