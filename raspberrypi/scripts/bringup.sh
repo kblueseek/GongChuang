@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 一键启动整车 ROS2 侧：激光雷达 + 障碍检测 + F407 桥接 + 运动规划。
 # 用法：bash scripts/bringup.sh
-set -euo pipefail
+# 不用 set -u：ROS2 的 setup.bash 会引用未定义的 AMENT_TRACE_SETUP_FILES，-u 会导致 source 失败
+set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO="${ROS_DISTRO:-lyrical}"

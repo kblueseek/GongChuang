@@ -235,7 +235,7 @@ class PiCommLink:
 
     def __init__(
         self,
-        device: str = "/dev/serial0",   # 串口设备名（树莓派的串口）
+        device: str = "/dev/ttyAMA0",   # 串口设备名（树莓派的串口）
         baudrate: int = 115200,         # 波特率，必须和 F407 一致
         reconnect_interval_s: float = 1.0,  # 断线后隔几秒再尝试重连
         serial_factory: Callable = serial.Serial if serial else None,  # 串口"工厂"（测试时可替换）
@@ -411,11 +411,11 @@ class PiCommLink:
 
 if __name__ == "__main__":
     # 直接运行这个文件（不通过 ROS2），用来单独测试串口和协议是否打通：
-    #   python3 comm/pi_comm.py /dev/serial0
+    #   python3 comm/pi_comm.py /dev/ttyAMA0
     # 它会每秒发一次心跳，并把收到的帧打印出来。
     import sys
 
-    device = sys.argv[1] if len(sys.argv) > 1 else "/dev/serial0"  # 从命令行读设备名
+    device = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyAMA0"  # 从命令行读设备名
     link = PiCommLink(device=device)
     print(f"PiComm 自检：{device} @ {link.baudrate}，Ctrl-C 退出")
     last_hb = 0.0

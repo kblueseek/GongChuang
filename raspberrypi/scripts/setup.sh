@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 树莓派（Ubuntu 26.04 + ROS2 Lyrical Luth）环境准备脚本。
 # 用法：bash setup.sh    （脚本内部对需要 root 的命令使用 sudo）
-set -euo pipefail
+# 不用 set -u：ROS2 的 setup.bash 会引用未定义的 AMENT_TRACE_SETUP_FILES，-u 会导致 source 失败
+set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO="${ROS_DISTRO:-lyrical}"

@@ -20,7 +20,8 @@ import math   # 用于算四元数（姿态的一种数学表示）
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose2D, Quaternion, Twist   # Pose2D=平面位姿(x,y,朝向), Quaternion=四元数, Twist=速度
+from geometry_msgs.msg import Quaternion, Twist   # Quaternion=四元数, Twist=速度
+from car_interfaces.msg import Pose2D             # 自定义平面位姿(x,y,theta)，ROS2 的 geometry_msgs 没有 Pose2D
 from nav_msgs.msg import Odometry                 # 里程计消息
 from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray
 
@@ -39,7 +40,7 @@ class F407BridgeNode(Node):
         super().__init__('f407_bridge')   # 节点名
 
         # 声明三个可配置参数（串口设备、波特率、坐标系名）
-        self.declare_parameter('device', '/dev/serial0')   # 树莓派的串口设备
+        self.declare_parameter('device', '/dev/ttyAMA0')   # 树莓派 GPIO14/15 主串口（Pi5 上 /dev/serial0 别名默认不建，直接用 ttyAMA0）
         self.declare_parameter('baudrate', 115200)         # 波特率，必须和 F407 一致
         self.declare_parameter('frame_id', 'odom')         # 里程计的坐标系名
 
@@ -74,9 +75,11 @@ class F407BridgeNode(Node):
         self._pub_status = self.create_publisher(Int32MultiArray, '/robot_status', 10)
 
         # 两个定时器：
-        #   每 1.0 秒调一次 _on_heartbeat（发心跳）
+        #   每 0.2 秒调一次 _on_heartbeat（发心跳）
         #   每 0.1 秒调一次 _on_poll（去串口收数据，即 10Hz）
-        self._heartbeat_timer = self.create_timer(1.0, self._on_heartbeat)
+        # 心跳必须快于 F407 侧的离线判定（PI_CMD_TIMEOUT_MS=500ms）：原来是 1Hz，
+        # 每秒会有约 500ms 的"掉线窗口"，底盘会周期性停车。改成 5Hz 留足余量。
+        self._heartbeat_timer = self.create_timer(0.2, self._on_heartbeat)
         self._poll_timer = self.create_timer(0.1, self._on_poll)
 
     # ---------------- 订阅回调（收到话题消息时自动执行） ----------------

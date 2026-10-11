@@ -36,7 +36,7 @@ import math        # 三角函数、弧度换算
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose2D               # 平面位姿：x, y, theta(弧度)
+from car_interfaces.msg import Pose2D               # 平面位姿：x, y, theta(弧度)，自定义消息
 from nav_msgs.msg import Odometry                  # 里程计消息
 from std_msgs.msg import Bool, Float32MultiArray, String
 
