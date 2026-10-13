@@ -103,6 +103,12 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
         if (dLen >= 1)
             PiCommand.Cam = d[0];
         break;
+    case PI_CMD_LED:                /* 补光灯亮度 %（0~100），收到即执行（PWM 无闭环） */
+        if (dLen >= 1) {
+            PiCommand.Led = d[0];
+            Led_SetBrightness((float)d[0]);
+        }
+        break;
     case PI_CMD_ENABLE:
         if (dLen >= 2) {
             uint8_t mask = d[1] & 0x7F;

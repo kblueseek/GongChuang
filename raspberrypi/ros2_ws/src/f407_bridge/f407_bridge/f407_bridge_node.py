@@ -23,7 +23,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Quaternion, Twist   # Quaternion=四元数, Twist=速度
 from car_interfaces.msg import Pose2D             # 自定义平面位姿(x,y,theta)，ROS2 的 geometry_msgs 没有 Pose2D
 from nav_msgs.msg import Odometry                 # 里程计消息
-from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray
 
 # 从本包内导入协议模块（pi_comm.py 是和 comm/pi_comm.py 内容一致的副本）
 from f407_bridge.pi_comm import (
@@ -67,6 +67,10 @@ class F407BridgeNode(Node):
         self.create_subscription(Pose2D, '/cmd_pose', self._cb_cmd_pose, 10)
         # 订阅 /cmd_gimbal（云台三轴角度 [yaw°, lift°, extend°]）
         self.create_subscription(Float32MultiArray, '/cmd_gimbal', self._cb_cmd_gimbal, 10)
+        # 订阅 /cmd_gimbal_home（云台回零，mask bit0=yaw bit1=lift bit2=extend）
+        self.create_subscription(Int32, '/cmd_gimbal_home', self._cb_cmd_gimbal_home, 10)
+        # 订阅 /cmd_led（补光灯亮度 0~100%）
+        self.create_subscription(Int32, '/cmd_led', self._cb_cmd_led, 10)
 
         # ================= 方向2：发布话题（F407 -> ROS2） =================
         # 发布 /odom（里程计）
@@ -135,6 +139,16 @@ class F407BridgeNode(Node):
             self._link.send_gimbal(1, msg.data[1])   # lift(z升降) 轴
         if len(msg.data) >= 3:
             self._link.send_gimbal(2, msg.data[2])   # extend(x伸缩) 轴
+
+    def _cb_cmd_gimbal_home(self, msg: Int32):
+        """收到 /cmd_gimbal_home：云台回零，msg.data 为 mask（bit0=yaw bit1=lift bit2=extend）。"""
+        mask = int(msg.data) & 0x07
+        if mask:
+            self._link.send_home(mask)
+
+    def _cb_cmd_led(self, msg: Int32):
+        """收到 /cmd_led：补光灯亮度 0~100%。"""
+        self._link.send_led(float(msg.data))
 
     # ---------------- 定时器回调（按固定周期自动执行） ----------------
 

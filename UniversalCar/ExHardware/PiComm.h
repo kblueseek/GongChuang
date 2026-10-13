@@ -25,6 +25,7 @@
 #define PI_CMD_ENABLE        0x07    /* DATA: en(u8) + mask(u8, bit0-6 = 电机1-7) */
 #define PI_CMD_ESTOP         0x08    /* DATA: 无=置急停；或1字节(0=解除, 非0=置急停)，最高优先级 */
 #define PI_CMD_POSE          0x09    /* DATA: x y yaw (int32 mm, int32 mm, int16 mrad)，底盘位姿目标(位置+航向闭环) */
+#define PI_CMD_LED           0x0A    /* DATA: brightness(u8, 0~100%) 补光灯亮度（PWM 调光） */
 #define PI_CMD_HEARTBEAT     0x10    /* DATA: 无，1Hz */
 
 /* ============ 遥测码（STM32 → 树莓派） ============ */
@@ -66,6 +67,7 @@ typedef struct
     float Gripper;      //夹爪舵机角度 °
     float Plate;        //载物盘舵机角度 °
     float Cam;          //摄像头舵机角度 °
+    float Led;          //补光灯亮度 %（0~100）
 
     uint32_t LastOnlineTick;    //最后一次收到有效指令的时刻
 } PiCommand_t;
