@@ -112,11 +112,18 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
     case PI_CMD_ENABLE:
         if (dLen >= 2) {
             uint8_t mask = d[1] & 0x7F;
-            if (d[0])
-                PiCommand.EnableMask |= mask;
-            else
-                PiCommand.EnableMask &= ~mask;
+            if (d[0]) {
+                /* 失能锁存期间：使能一律无效，防止失控节点把车重新顶起来 */
+                if (!PiCommand.SafetyLock)
+                    PiCommand.EnableMask |= mask;
+            } else {
+                PiCommand.EnableMask &= ~mask;   /* 失能 */
+                PiCommand.SafetyLock = 1;        /* 立刻锁存，之后必须显式解锁才能再使能 */
+            }
         }
+        break;
+    case PI_CMD_UNLOCK:             /* 解除失能锁存（使能前必须先发） */
+        PiCommand.SafetyLock = 0;
         break;
     case PI_CMD_ESTOP:
         PiCommand.Estop = (dLen >= 1 && d[0] == 0) ? 0 : 1;   /* 无数据=置急停；字节0=解除急停 */

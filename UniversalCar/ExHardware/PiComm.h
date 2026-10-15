@@ -26,6 +26,7 @@
 #define PI_CMD_ESTOP         0x08    /* DATA: 无=置急停；或1字节(0=解除, 非0=置急停)，最高优先级 */
 #define PI_CMD_POSE          0x09    /* DATA: x y yaw (int32 mm, int32 mm, int16 mrad)，底盘位姿目标(位置+航向闭环) */
 #define PI_CMD_LED           0x0A    /* DATA: brightness(u8, 0~100%) 补光灯亮度（PWM 调光） */
+#define PI_CMD_UNLOCK        0x0B    /* DATA: 无，解除失能锁存（允许重新使能） */
 #define PI_CMD_HEARTBEAT     0x10    /* DATA: 无，1Hz */
 
 /* ============ 遥测码（STM32 → 树莓派） ============ */
@@ -51,6 +52,7 @@ typedef struct
     uint8_t HomeMask;   //回零请求 bit0=yaw bit1=lift bit2=extend（执行后由任务清除）
     uint8_t EnableMask; //电机使能位 bit0-6 = 电机1-7
     uint8_t Estop;      //急停标志（收到即置位，上位机解除前保持）
+    uint8_t SafetyLock; //失能锁存：收到失能(en=0)置1，解锁(PI_CMD_UNLOCK)清0；锁存期间忽略一切使能
 
     uint8_t ReturnHome; //回到坐标零点请求（蓝牙 return 键触发，到达后由底盘任务清除）
 

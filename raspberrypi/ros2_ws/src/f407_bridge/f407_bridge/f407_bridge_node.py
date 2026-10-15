@@ -59,6 +59,8 @@ class F407BridgeNode(Node):
         self.create_subscription(Float32MultiArray, '/cmd_servo', self._cb_cmd_servo, 10)
         # 订阅 /cmd_enable（使能/失能）
         self.create_subscription(Bool, '/cmd_enable', self._cb_cmd_enable, 10)
+        # 订阅 /cmd_unlock（解除失能锁存，使能前必须先发）
+        self.create_subscription(Bool, '/cmd_unlock', self._cb_cmd_unlock, 10)
         # 订阅 /cmd_estop（急停）
         self.create_subscription(Bool, '/cmd_estop', self._cb_cmd_estop, 10)
         # 订阅 /cmd_estop_clear（解除急停）
@@ -113,6 +115,11 @@ class F407BridgeNode(Node):
     def _cb_cmd_enable(self, msg: Bool):
         """收到 /cmd_enable：使能/失能电机。mask=0x7F 表示全部7个电机一起操作。"""
         self._link.send_enable(bool(msg.data), mask=0x7F)
+
+    def _cb_cmd_unlock(self, msg: Bool):
+        """收到 /cmd_unlock：解除 F407 的失能锁存（失能后必须先解锁才能再使能）。"""
+        if bool(msg.data):
+            self._link.send_unlock()
 
     def _cb_cmd_estop(self, msg: Bool):
         """收到 /cmd_estop：只在"变成 true"时发一次急停（避免每收一条消息都重发）。"""

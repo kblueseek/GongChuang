@@ -119,6 +119,7 @@ class GuiRosNode(Node):
         self.pub_load = self.create_publisher(String, '/motion_load', 10)
         self.pub_stop = self.create_publisher(Bool, '/motion_stop', 10)
         self.pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
+        self.pub_unlock = self.create_publisher(Bool, '/cmd_unlock', 10)
         self.pub_estop = self.create_publisher(Bool, '/cmd_estop', 10)
         self.pub_estop_clear = self.create_publisher(Bool, '/cmd_estop_clear', 10)
         # 订阅：里程计 / 状态机进度 / 整车状态
@@ -158,6 +159,9 @@ class GuiRosNode(Node):
         self.pub_stop.publish(b)
 
     def send_enable(self, en: bool):
+        if en:
+            # 失能后 F407 会锁存，使能前必须先解锁
+            self.pub_unlock.publish(Bool(data=True))
         b = Bool()
         b.data = en
         self.pub_enable.publish(b)
