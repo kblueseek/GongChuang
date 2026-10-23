@@ -87,7 +87,7 @@ void BLE_Process(void);
 int BLE_IsOnline(void);
 
 /// @brief 遥控源适配：把蓝牙输入映射到整车指令（树莓派掉线时替代 PiComm 的位置）
-/// @details 摇杆→Vel，按键→EnableMask/Estop，滑杆→舵机/云台目标
+/// @details 摇杆→Vel，按键→Enabled，滑杆→舵机/云台目标
 void BLE_ApplyToCommand(void);
 
 /// @brief 滑杆分发：0~1 映射到对应执行器（由 BLE_Process 内部调用，亦可外部直接调）

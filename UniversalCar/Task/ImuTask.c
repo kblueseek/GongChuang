@@ -5,7 +5,7 @@
  *              本任务把模块数据取到 Imu_t 中，并预留：
  *                TODO 1: 加速度/角速度卡尔曼滤波（UserLibrary 可加 KalmanFilter）
  *                TODO 2: 加速度积分速度估计（漂移大，需与电机编码器/OPS9 里程计融合）
- *                TODO 3: OPS9 光流里程计接入（UART4 预留）
+ *               （UART4 已改为 LoRa 遥测下行，不再预留 OPS9）
  */
 
 #include "header.h"

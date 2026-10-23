@@ -57,11 +57,6 @@ typedef struct
 /* 电机注册表（下标 = CAN 地址），由各电机 Init 时注册 */
 extern ZdtMotor_t* ZdtMotorList[8];
 
-/* 调试计数（Keil Watch 观察 CAN 发送是否成功） */
-extern volatile uint32_t ZdtCan_TxCount;    /* 成功发送帧数 */
-extern volatile uint32_t ZdtCan_TxErr;      /* 发送失败次数 */
-extern volatile uint32_t ZdtCan_TxLastRet;  /* 最后一次 HAL_CAN_AddTxMessage 返回值 */
-
 /* ============ 电机实例维护 ============ */
 
 /// @brief 注册电机（在任务初始化阶段调用一次），清零所有字段

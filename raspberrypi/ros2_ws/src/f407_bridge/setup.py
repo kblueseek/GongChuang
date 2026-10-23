@@ -17,12 +17,14 @@ setup(
     zip_safe=True,
     maintainer='kblue',
     maintainer_email='kblueseek@users.noreply.github.com',
-    description='F407 PiComm 串口桥接',
+    description='F407 PiComm 无线桥接（蓝牙上行 + LoRa 下行）与状态屏',
     license='MIT',
     entry_points={
         'console_scripts': [
             # 命令名 f407_bridge_node -> 调用 f407_bridge.f407_bridge_node 里的 main()
             'f407_bridge_node = f407_bridge.f407_bridge_node:main',
+            # 状态屏：把整车状态画到树莓派上的 I2C OLED（I2C-1，GPIO2/3）
+            'status_display_node = f407_bridge.status_display_node:main',
         ],
     },
 )

@@ -24,12 +24,12 @@ static void Gimbal_SetAxisTarget(ZdtMotor_t* motor, uint8_t axis, float deg)
     ZdtMotor_SetPosition(motor, motor->Position.Set, ZDT_POS_ABS);
 }
 
-/* 云台三轴停车 */
+/* 云台三轴失能：发当前位置锁定（不松轴，位置模式平滑保持） */
 static void Gimbal_Disable(void)
 {
-    ZdtCan_Stop(ZDT_MOTOR_YAW);
-    ZdtCan_Stop(ZDT_MOTOR_LIFT);
-    ZdtCan_Stop(ZDT_MOTOR_EXTEND);
+    ZdtMotor_SetPosition(&Gimbal.Yaw.Motor,    Gimbal.Yaw.Motor.Position.Real,    ZDT_POS_ABS);
+    ZdtMotor_SetPosition(&Gimbal.Lift.Motor,   Gimbal.Lift.Motor.Position.Real,   ZDT_POS_ABS);
+    ZdtMotor_SetPosition(&Gimbal.Extend.Motor, Gimbal.Extend.Motor.Position.Real, ZDT_POS_ABS);
 }
 #endif
 
@@ -55,11 +55,8 @@ void GimbalTask(void const* argument)
         osDelayUntil(&PreviousWakeTime, GIMBAL_TASK_UPDATE_TICK);
 
 #if GIMBAL_MOTOR_INSTALLED
-        /* ---- 使能判定：bit4-6（电机5-7）全置位 且 有指令源（树莓派/蓝牙）在线 且 无急停 ---- */
-        uint8_t GimbalEnable = (PiCommand.EnableMask & 0x70) == 0x70;
-        uint8_t GimbalCmdOnline = PiComm_IsOnline() || BLE_IsOnline();
-
-        if (GimbalEnable && GimbalCmdOnline && !PiCommand.Estop)
+        /* ---- 使能判定：单一使能状态 PiCommand.Enabled（手柄 start=使能 / B=失能，Pi 离线自主失能） ---- */
+        if (PiCommand.Enabled)
         {
             if (!Gimbal.isEnable) {
                 ZdtCan_Enable(Gimbal.Yaw.Motor.Addr,    1);
@@ -70,17 +67,12 @@ void GimbalTask(void const* argument)
         }
         else
         {
-            if (Gimbal.isEnable) {
-                ZdtCan_Enable(Gimbal.Yaw.Motor.Addr,    0);
-                ZdtCan_Enable(Gimbal.Lift.Motor.Addr,   0);
-                ZdtCan_Enable(Gimbal.Extend.Motor.Addr, 0);
-            }
             Gimbal.isEnable = 0;
         }
 
         if (!Gimbal.isEnable)
         {
-            Gimbal_Disable();
+            Gimbal_Disable();   /* 失能：发当前位置锁定（不松轴，平滑保持） */
         }
         else
         {
@@ -109,8 +101,10 @@ void GimbalTask(void const* argument)
         }
 #endif
 
-        /* ---- 夹爪 / 摄像头舵机 ---- */
-        Servo_SetAngle(&Gimbal.GripperServo, PiCommand.Gripper);
-        Servo_SetAngle(&Gimbal.CamServo,     PiCommand.Cam);
+        /* ---- 夹爪 / 摄像头舵机（仅使能时更新，失能保持末值） ---- */
+        if (PiCommand.Enabled) {
+            Servo_SetAngle(&Gimbal.GripperServo, PiCommand.Gripper);
+            Servo_SetAngle(&Gimbal.CamServo,     PiCommand.Cam);
+        }
     }
 }

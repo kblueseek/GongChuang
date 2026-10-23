@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """树莓派 <-> F407 通信（PiComm 协议，串口 USART6，波特率 115200）。
 
+⚠️ 这是**有线**链路的副本，只给 scripts/test_move.py 这类单点测试用。
+   整车现在走无线（蓝牙上行 + LoRa 下行），带 BleLink/LoRa 的完整版本在
+   ros2_ws/src/f407_bridge/f407_bridge/pi_comm.py，两边协议部分完全一致。
+
 ================ 用大白话讲清楚这个文件在干什么 ================
 
 这个文件负责一件事：把"命令"变成一串字节，通过串口发给 F407（STM32 单片机），
@@ -50,11 +54,9 @@ CMD_HOME = 0x03       # 云台回零（回原点）
 CMD_GRIPPER = 0x04    # 夹爪舵机
 CMD_PLATE = 0x05      # 托盘舵机
 CMD_CAM = 0x06        # 相机舵机
-CMD_ENABLE = 0x07     # 电机使能（上电/断电）
-CMD_ESTOP = 0x08      # 急停（不带内容=置急停；带一个字节 0=解除急停）
+CMD_ENABLE = 0x07     # 整车使能/失能（单一状态，1=使能 0=失能）
 CMD_POSE = 0x09       # 位姿目标（走到世界系 (x,y) 并转到朝向 yaw，底盘位置+航向闭环）
 CMD_LED = 0x0A        # 补光灯亮度（0~100%，PWM 调光）
-CMD_UNLOCK = 0x0B     # 解除失能锁存（允许重新使能）
 CMD_HEARTBEAT = 0x10  # 心跳（定期发一次，告诉 F407 "我还活着"）
 
 # ==================== 回传数据编号 ====================
@@ -204,12 +206,9 @@ def encode_led(brightness_percent: float) -> bytes:
     return bytes([int(round(brightness_percent))])   # 四舍五入成整数，塞进 1 个字节
 
 
-def encode_enable(en: bool, mask: int = 0x7F) -> bytes:
-    """使能指令内容：第1字节=是否使能(1/0)，第2字节=哪些电机(bit0~6 对应电机1~7)。
-
-    mask 默认 0x7F = 二进制 0111 1111 = 7 个电机全选。
-    """
-    return bytes([1 if en else 0, mask & 0x7F])
+def encode_enable(en: bool) -> bytes:
+    """使能指令内容：1 字节 = 是否使能(1/0)。"""
+    return bytes([1 if en else 0])
 
 
 # ==================== 回传数据的解析 ====================
@@ -345,17 +344,8 @@ class PiCommLink:
     def send_led(self, brightness_percent: float) -> bool:
         return self._send(CMD_LED, encode_led(brightness_percent))
 
-    def send_unlock(self) -> bool:
-        return self._send(CMD_UNLOCK)   # 解除失能锁存（使能前必须先发）
-
-    def send_enable(self, en: bool, mask: int = 0x7F) -> bool:
-        return self._send(CMD_ENABLE, encode_enable(en, mask))
-
-    def send_estop(self) -> bool:
-        return self._send(CMD_ESTOP)
-
-    def send_estop_clear(self) -> bool:
-        return self._send(CMD_ESTOP, b"\x00")   # 带一个字节 0 = 解除急停
+    def send_enable(self, en: bool) -> bool:
+        return self._send(CMD_ENABLE, encode_enable(en))
 
     def send_heartbeat(self) -> bool:
         return self._send(CMD_HEARTBEAT)

@@ -3,15 +3,23 @@
 <package format="3">
   <name>f407_bridge</name>
   <version>0.1.0</version>
-  <description>ROS2 话题 &lt;-&gt; F407 串口（PiComm）桥接</description>
+  <description>ROS2 话题 &lt;-&gt; F407 无线桥接（蓝牙上行 + LoRa 下行）与 I2C 状态屏</description>
   <maintainer email="kblueseek@users.noreply.github.com">kblue</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>car_interfaces</exec_depend>
+  <!-- 蓝牙上行（BLE）：python3-bleak；经典蓝牙 SPP 走系统 rfcomm，不需要 Python 包 -->
+  <exec_depend>python3-bleak</exec_depend>
+  <!-- 状态屏：luma.oled + Pillow -->
+  <exec_depend>python3-luma.oled</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <!-- LoRa 下行：pyserial -->
+  <exec_depend>python3-serial</exec_depend>
   <export>
     <build_type>ament_python</build_type>
   </export>

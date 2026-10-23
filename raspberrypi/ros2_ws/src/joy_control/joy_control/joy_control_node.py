@@ -11,7 +11,8 @@
 ================ 控制逻辑（select 切换两个模式） ================
 
 【任何模式】
-  start 按一下            → 使能 ↔ 失能（toggle）
+  start 按一下            → 使能
+  B 键 按一下             → 失能/急停
   左方向键 / 右方向键      → 补光灯亮度 + / -（按一下一档）
   上方向键 / 下方向键      → 摄像头舵机 ↑ / ↓（按一下一步）
 
@@ -29,7 +30,6 @@
   X 按一下                → 夹爪夹取/松开（toggle）
   L1 按住                 → 载物盘舵机逆时针
   R1 按住                 → 载物盘舵机顺时针
-  mode 按住               → 急停（松开解除）← 安全兜底，可改参数
 
 ================ 按键/轴编号（实测，联调再核对） ================
 
@@ -61,7 +61,7 @@ class JoyControlNode(Node):
 
         # ================= 按键编号（实测） =================
         self.declare_parameter('btn_select', 8)      # 切换运动/云台模式
-        self.declare_parameter('btn_start', 9)       # 使能/失能（toggle）
+        self.declare_parameter('btn_start', 9)       # 使能（按一下）
         self.declare_parameter('btn_y', 3)           # 云台 lift 上升
         self.declare_parameter('btn_a', 0)           # 云台 lift 下降
         self.declare_parameter('btn_x', 2)           # 夹爪夹取/松开（toggle）
@@ -69,7 +69,7 @@ class JoyControlNode(Node):
         self.declare_parameter('btn_r1', 5)          # 云台=载物盘顺时针
         self.declare_parameter('btn_l2', 6)          # 运动=左转
         self.declare_parameter('btn_r2', 7)          # 运动=右转
-        self.declare_parameter('btn_estop', 12)      # 急停（按住=急停，松开=解除），默认绑 mode 键
+        self.declare_parameter('btn_estop', 1)       # 失能/急停（B 键，按一下触发一次）
 
         # ================= 方向系数（联调发现方向反了改成 -1，不用动别的） =================
         self.declare_parameter('dir_linear', 1.0)    # 左摇杆推上 = 前进（若反了改 -1）
@@ -124,9 +124,6 @@ class JoyControlNode(Node):
         # ================= 发布的话题 =================
         self._pub_vel = self.create_publisher(Twist, '/cmd_vel', 10)
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
-        self._pub_unlock = self.create_publisher(Bool, '/cmd_unlock', 10)
-        self._pub_estop = self.create_publisher(Bool, '/cmd_estop', 10)
-        self._pub_estop_clear = self.create_publisher(Bool, '/cmd_estop_clear', 10)
         self._pub_led = self.create_publisher(Int32, '/cmd_led', 10)
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
         self._pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)
@@ -141,7 +138,6 @@ class JoyControlNode(Node):
         self._prev_dpad_lr = 0                 # 上一拍方向键左右（-1/0/+1）
         self._prev_dpad_ud = 0                 # 上一拍方向键上下
         self._mode = 'drive'                   # 当前模式：drive=运动 / gimbal=云台
-        self._enabled = False                  # 电机使能状态
         self._led = 0                          # 补光灯亮度 %
         self._gimbal = [0.0, 0.0, 0.0]         # 云台目标 [yaw, lift, extend] °
         self._servo = [90.0, 0.0, 90.0]        # 舵机目标 [夹爪, 载物盘, 摄像头] °（和 F407 上电默认一致）
@@ -149,7 +145,7 @@ class JoyControlNode(Node):
 
         # 定时器：10Hz 持续发运动/步进指令（摇杆回中发 0，避免车保持最后速度继续跑）
         self._timer = self.create_timer(0.1, self._tick)
-        self.get_logger().info('joy_control 就绪（select 切换模式 / start 使能），等待 /joy')
+        self.get_logger().info('joy_control 就绪（select 切模式 / start 使能 / B 失能），等待 /joy')
 
     # ---------------- 摇杆/按键回调 ----------------
 
@@ -187,12 +183,11 @@ class JoyControlNode(Node):
             self._mode = 'gimbal' if self._mode == 'drive' else 'drive'
             self.get_logger().info(f'模式 -> {"云台" if self._mode == "gimbal" else "运动"}')
         elif i == self.btn_start:
-            self._enabled = not self._enabled
-            if self._enabled:
-                # 失能后 F407 会锁存，重新使能前必须先解锁
-                self._pub_unlock.publish(Bool(data=True))
-            self._pub_enable.publish(Bool(data=self._enabled))
-            self.get_logger().info(f'使能 -> {self._enabled}')
+            self._pub_enable.publish(Bool(data=True))   # start = 使能（点动按键，按一下触发一次）
+            self.get_logger().info('使能')
+        elif i == self.btn_estop:
+            self._pub_enable.publish(Bool(data=False))  # B 键 = 失能/急停（点动按键，按一下触发一次）
+            self.get_logger().info('失能')
         elif i == self.btn_x:
             self._gripper_closed = not self._gripper_closed
             self._servo[0] = self.gripper_close_deg if self._gripper_closed else self.gripper_open_deg
@@ -203,16 +198,6 @@ class JoyControlNode(Node):
 
     def _tick(self):
         """每 0.1s 执行一次。"""
-        # 急停：按住 btn_estop 发 true，松开发 false 解除（只在状态变化时发，避免刷屏）
-        estop = self._is_pressed(self.btn_estop)
-        if estop != getattr(self, '_last_estop', None):
-            if estop:
-                self._pub_estop.publish(Bool(data=True))
-            else:
-                self._pub_estop_clear.publish(Bool(data=True))
-            self._last_estop = estop
-            self.get_logger().info(f'急停 -> {estop}')
-
         # 按当前模式分发
         if self._mode == 'gimbal':
             self._tick_gimbal()

@@ -93,18 +93,31 @@ enum
 #define GIMBAL_EXTEND_MIN   0.0f
 #define GIMBAL_EXTEND_MAX   200.0f
 
-/* ==================== 树莓派指令（USART6） ==================== */
+/* ==================== 树莓派链路（无线） ==================== */
+/* 上行：树莓派 --BLE--> F407（USART2 / PA2 PA3，二进制 PiComm 帧）
+   下行：F407 --LoRa--> 树莓派（UART4 / PC10=TX PC11=RX，只发不收） */
+#define BLE_UPLINK_ENABLE    1      /* 1=USART2 作为 PiComm 指令上行 0=关闭 */
+#define LORA_DOWNLINK_ENABLE 1      /* 1=UART4 作为 PiComm 遥测下行 0=关闭（回落 USART6 有线） */
+#define LORA_UART_BAUD       115200 /* 必须与两块 LoRa 模组的串口波特率一致（本项目实测 115200） */
 
 #define PI_CMD_TIMEOUT_MS   500     /* 超过此时长收不到指令 → 底盘停车、云台保持 */
-#define PI_RPT_FREQ_HZ      50      /* 遥测回传频率 */
+
+/* 无线遥测频率：115200 下一帧 17B 约 1.5ms，20Hz 占空比很低。
+   真正的上限是空中速率（LEVEL7 ≈ 62500bps），不要再往上翻倍。 */
+#define PI_RPT_FREQ_HZ      20      /* 里程计回传频率 */
+#define PI_STATUS_FREQ_MS   200     /* 状态回传周期（5Hz） */
 
 /* ==================== JY901S 陀螺仪（USART3） ==================== */
 
 #define JY901S_OFFLINE_MS   200     /* 陀螺仪失联判定 */
 
-/* ==================== 蓝牙遥控（USART2，类比 DBUS） ==================== */
+/* ==================== 旧版小程序蓝牙遥控（USART2，已停用） ==================== */
+/* 这个是早期的微信小程序文本协议（[joystick,...]）。现在 USART2 已经用作
+   BLE_UPLINK_ENABLE 的二进制 PiComm 上行，两者互斥：BLE_UPLINK_ENABLE=1 时本开关无效。 */
 
-#define BLE_OFFLINE_MS      500     /* 蓝牙失联判定（遥控包频率低，阈值放宽） */
+#define BLE_CONTROL_ENABLE  0       /* 1=启用小程序文本协议 0=关闭 */
+
+#define BLE_OFFLINE_MS      500     /* 小程序蓝牙失联判定（遥控包频率低，阈值放宽） */
 
 /* ==================== 调试输出（USART1） ==================== */
 

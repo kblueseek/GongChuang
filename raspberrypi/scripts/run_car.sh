@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 只启动控制链路（f407_bridge + motion_planner），不含雷达/视觉。
+# 只启动控制链路：f407_bridge（蓝牙上行+LoRa下行）+ 状态屏 + motion_planner + 手柄。
+# 不含激光雷达/障碍检测。手柄插上就能用，不需要另开终端。
 # 用法：bash scripts/run_car.sh
 # 不用 set -u：ROS2 的 setup.bash 会引用未定义的 AMENT_TRACE_SETUP_FILES，-u 会导致 source 失败
 set -eo pipefail

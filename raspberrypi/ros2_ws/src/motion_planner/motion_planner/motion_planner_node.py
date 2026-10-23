@@ -61,7 +61,6 @@ class MotionPlannerNode(Node):
         self._pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)        # 舵机 [夹爪,托盘,相机]
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)      # 云台 [yaw,lift,extend]
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)                   # 使能
-        self._pub_unlock = self.create_publisher(Bool, '/cmd_unlock', 10)                   # 解除失能锁存
         self._pub_state = self.create_publisher(String, '/motion_state', 10)                # 进度状态(给上位机/屏幕看)
 
         # ---- 订阅的话题（其他节点 -> 本节点） ----
@@ -225,8 +224,6 @@ class MotionPlannerNode(Node):
         elif name == 'enable':        # 使能/失能
             b = Bool()
             b.data = bool(cmd.get('en', True))
-            if b.data:
-                self._pub_unlock.publish(Bool(data=True))   # 使能前先解除失能锁存
             self._pub_enable.publish(b)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 使能={b.data}')
         elif name == 'calibrate':     # 视觉校准钩子（占位）

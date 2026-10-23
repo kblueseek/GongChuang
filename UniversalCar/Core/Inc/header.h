@@ -39,7 +39,9 @@
 #include "Led.h"
 #include "JY901S.h"
 #include "PiComm.h"
+#if BLE_CONTROL_ENABLE
 #include "BleControl.h"
+#endif
 
 //软件
 #include "Universal.h"

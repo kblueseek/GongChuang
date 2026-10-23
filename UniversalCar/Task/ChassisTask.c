@@ -80,7 +80,14 @@ static void Chassis_WheelRpmLimit(float* rpm)
     }
 }
 
-/* 底盘停车（清速度；电机由失能边沿的 Stop 命令立即停止并保持锁轴） */
+#if CHASSIS_HEADING_ENABLE
+/* 航向目标：手动模式下由转向指令积分得到，位姿模式下来自 POSE 指令 */
+static uint8_t  s_HeadingValid  = 0;
+static float    s_HeadingTarget = 0.0f;
+static uint32_t s_HeadingTick   = 0;
+#endif
+
+/* 底盘停车（清内部状态；电机靠失能分支周期发的速度 0 平滑减速并锁轴） */
 static void Chassis_Disable(void)
 {
     Chassis.Move.Vx = 0;
@@ -90,6 +97,9 @@ static void Chassis_Disable(void)
     PID_Clear(&Chassis.PosPidX);
     PID_Clear(&Chassis.PosPidY);
     PiCommand.ReturnHome = 0;         /* 失能时取消未完成的回零 */
+#if CHASSIS_HEADING_ENABLE
+    s_HeadingValid = 0;               /* 下次使能重新锁存当前朝向，不往回拧 */
+#endif
 }
 
 /* 航向 PID 初始化（度域：误差 ° → 输出 °/s） */
@@ -263,13 +273,9 @@ void ChassisTask(void const* argument)
             }
         }
 
-        /* ---- 使能判定：bit0-3（电机1-4）全置位 且 无急停 ----
-           不做蓝牙失联门控：BLE 小程序空闲时不发任何数据，BLE_IsOnline()
-           （近500ms收到过数据）会把车误判离线 → 停底盘 → 清航向 PID。
-           树莓派失联由 PiComm_TimeoutCheck() 清速度兜底，不在这里关使能。 */
-        uint8_t ChassisEnable = (PiCommand.EnableMask & 0x0F) == 0x0F;
-
-        if (ChassisEnable && !PiCommand.Estop)
+        /* ---- 使能判定：单一使能状态 PiCommand.Enabled（手柄 start=使能 / B=失能，Pi 离线自主失能） ----
+           失能不松轴：周期发 4 轮速度 0，走加速度曲线平滑减速并保持锁轴静止。 */
+        if (PiCommand.Enabled)
         {
             if (!Chassis.isEnable) {
                 for (int i = 0; i < 4; i++)
@@ -280,15 +286,15 @@ void ChassisTask(void const* argument)
         else
         {
             if (Chassis.isEnable) {
-                for (int i = 0; i < 4; i++)
-                    ZdtCan_Stop(Chassis.Wheel[i].Addr);    /* 立即停止，保持锁轴（电机上电默认锁轴，不松轴） */
+                Chassis_Disable();   /* 使能→失能边沿：清 PID/回零，仅一次 */
             }
             Chassis.isEnable = 0;
-        }
 
-        if (!Chassis.isEnable)
-        {
-            Chassis_Disable();
+            /* 失能仍周期发速度 0：平滑减速并锁轴，电机侧保持使能不松轴 */
+            ZdtCan_MultiBegin();
+            for (int i = 0; i < 4; i++)
+                ZdtMotor_MultiAddSpeed(&Chassis.Wheel[i], 0);
+            ZdtCan_MultiSend();
             continue;
         }
 
@@ -297,20 +303,47 @@ void ChassisTask(void const* argument)
         Chassis.Move.Vy = PiCommand.Vel.Vy;
 
 #if CHASSIS_HEADING_ENABLE
-        /* ---- 航向修正：IMU Yaw → PID → 自旋速度 Wz ----
-           目标航向由 spin 滑杆给出；还没收到过滑杆指令时锁存当前朝向（不做修正）。
+        /* ---- 航向控制：目标航向 + 转向输入积分 ----
+           目标航向 s_HeadingTarget 这样维护：
+             · 位姿模式（PosTarget.Valid）：直接采用 POSE 指令里的目标航向；
+             · 手动模式有转向输入（Wz≠0）：把 Wz 积分进目标航向 —— 推着转，
+               松手就停在当前朝向（等价于"转到哪保持到哪"）；
+             · 手动模式没转向输入：保持上次目标 → 走直线时自动纠偏。
+           旧逻辑在手动模式下每周期把目标设成当前朝向，误差恒为 0，
+           等于完全没有航向保持，手柄的 L2/R2 转向也会被吃掉。
            IMU 离线时清 PID 并放弃修正，免得拿陈旧角度把车转飞。 */
         if (Imu.LastOnlineTick != 0 &&
             (HAL_GetTick() - Imu.LastOnlineTick) < JY901S_OFFLINE_MS)
         {
-            float TargetYaw = PiCommand.TargetYawValid ? PiCommand.TargetYaw : Imu.Yaw;
-            PID_AngleCalc(&Chassis.HeadingPid, Imu.Yaw, TargetYaw);
+            uint32_t Now = HAL_GetTick();
+            float dt = (Now - s_HeadingTick) / 1000.0f;
+            s_HeadingTick = Now;
+
+            if (!s_HeadingValid)
+            {
+                /* 首次进入 / IMU 恢复：锁存当前朝向（或已有的 POSE 目标） */
+                s_HeadingTarget = PiCommand.TargetYawValid ? PiCommand.TargetYaw : Imu.Yaw;
+                s_HeadingValid = 1;
+            }
+            else if (PiCommand.PosTarget.Valid)
+            {
+                s_HeadingTarget = PiCommand.TargetYaw;
+            }
+            else if (fabsf(PiCommand.Vel.Wz) > 0.001f && dt < 0.5f)
+            {
+                s_HeadingTarget += PiCommand.Vel.Wz * dt * (180.0f / PI);   /* rad/s → °/s */
+                while (s_HeadingTarget >  180.0f) s_HeadingTarget -= 360.0f;
+                while (s_HeadingTarget < -180.0f) s_HeadingTarget += 360.0f;
+            }
+
+            PID_AngleCalc(&Chassis.HeadingPid, Imu.Yaw, s_HeadingTarget);
             Chassis.Move.Wz = CHASSIS_HEADING_YAW_DIR * Chassis.HeadingPid.Output * PI / 180.0f;   /* °/s → rad/s */
         }
         else
         {
             PID_Clear(&Chassis.HeadingPid);
             Chassis.Move.Wz = 0;
+            s_HeadingValid = 0;     /* IMU 恢复后重新锁存朝向 */
         }
 #else
         Chassis.Move.Wz = PiCommand.Vel.Wz;   /* 手动自旋指令（原逻辑，宏关闭时生效） */

@@ -21,17 +21,25 @@ void DebugTask(void const* argument)
     while (1)
     {
         osDelayUntil(&PreviousWakeTime, DEBUG_TASK_UPDATE_TICK);
-        DebugData.Value[0] = PiCommand.EnableMask;   // 0~127，0x7F=按过key1全使能
+        DebugData.Value[0] = PiCommand.Enabled;      // 0=失能 1=使能
         DebugData.Value[1] = JY901S.Angle[2];
         DebugData.Value[2] = Chassis.HeadingPid.Output;
         DebugData.Value[3] = PiCommand.Gripper;
         DebugData.Value[4] = Chassis.Wheel[0].Position.Real;
         DebugData.Value[5] = Chassis.Wheel[1].Position.Real;
+#if BLE_CONTROL_ENABLE
         DebugData.Value[6] = BleRemote.Joy.Lx;       // 左摇杆横向值（原始）
         DebugData.Value[7] = BleRemote.Joy.Ly;       // 左摇杆纵向值（原始）
         DebugData.Value[8] = BleRemote.Joy.Rx;       // 右摇杆横向值（原始）
         DebugData.Value[9] = BleRemote.Joy.Ry;       // 右摇杆纵向值（原始）
         DebugData.Value[10] = BLE_RxByteCount;       // USART2 收到的字节数（0=完全没收到）
+#else
+        DebugData.Value[6] = 0;
+        DebugData.Value[7] = 0;
+        DebugData.Value[8] = 0;
+        DebugData.Value[9] = 0;
+        DebugData.Value[10] = 0;
+#endif
         DebugData.Value[11] = Receive.ErrorFlag;
 
         HAL_UART_Transmit_DMA(&huart1, (uint8_t*)&DebugData, sizeof(DebugData));

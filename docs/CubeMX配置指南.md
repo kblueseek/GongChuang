@@ -15,6 +15,7 @@
 | USART2_TX / RX | **PA2 / PA3** | 蓝牙遥控（115200，类比 DBUS） |
 | USART3_TX / RX | **PB10 / PB11** | JY901S 陀螺仪（默认 9600，可改 115200） |
 | USART6_TX / RX | **PC6 / PC7** | 树莓派（双向，115200） |
+| UART4_TX / RX | **PC10 / PC11** | LoRa 遥测下行（115200，只发不收） |
 | TIM3_CH1 | **PA6** | 夹爪舵机（180°） |
 | TIM3_CH2 | **PA7** | 载物盘舵机（180°） |
 | TIM3_CH3 | **PB0** | 摄像头舵机（180°） |
@@ -110,17 +111,26 @@ Mode = Asynchronous，PC6/PC7。参数：**115200** 8N1，Overrun Disable。NVIC
 
 > 后续遥测量大可升 460800（APB2=84MHz，460800 误差 0.02%，可用）。
 
-## 7. USART2（蓝牙遥控，类比 DBUS）
+## 7. UART4（LoRa 遥测下行，只发不收）
+
+Mode = Asynchronous，**PC10 = UART4_TX，PC11 = UART4_RX**（AF8）。参数：**115200** 8N1，
+且必须与两块 DX-LR22 模组用 AT 设的串口波特率完全一致。NVIC 勾选 **UART4 global interrupt**
+（遥测用 `HAL_UART_Transmit_IT` 中断发送，不阻塞 5ms 底盘任务）。
+
+> 只把 PC10 接模组 RXD 即可；PC11 留空或接模组 TXD 都行，固件当前不解析 LoRa 回包。
+> 代码里波特率取自 `RobotConfig.h` 的 `LORA_UART_BAUD`，改宏即可，不必回 CubeMX 改。
+
+## 8. USART2（蓝牙遥控，类比 DBUS）
 
 Mode = Asynchronous，PA2/PA3。参数：**115200** 8N1。NVIC 勾选 **USART2 global interrupt**。
 
 > 微信小程序端发送 `[joystick,...]` / `[key,...]` / `[slider,...]` 数据包，树莓派不在场时接管整车（详见《工程结构与模块说明》）。
 
-## 8. USART3（JY901S 陀螺仪）
+## 9. USART3（JY901S 陀螺仪）
 
 Mode = Asynchronous，PB10/PB11。参数：**9600** 8N1（JY901S 出厂默认；用上位机改成 115200 后此处同步改）。NVIC 勾选 **USART3 global interrupt**。
 
-## 9. USART1（调试输出，DMA）
+## 10. USART1（调试输出，DMA）
 
 Mode = Asynchronous，PA9/PA10。参数：**115200** 8N1。
 
@@ -138,7 +148,7 @@ NVIC 勾选 USART1 global interrupt（可不勾，发送不用中断）。
 
 > DebugTask 用 `HAL_UART_Transmit_DMA(&huart1, ...)` 每 10ms 发一帧 DebugData，无阻塞。
 
-## 10. TIM3（3 路舵机 PWM，50Hz）
+## 11. TIM3（3 路舵机 PWM，50Hz）
 
 `Timers → TIM3`，Clock Source = Internal Clock，Channel1/2/3 都选 **PWM Generation CHx**，引脚 PA6/PA7/PB0。
 
@@ -154,11 +164,11 @@ NVIC 勾选 USART1 global interrupt（可不勾，发送不用中断）。
 > 脉宽 500~2500us ↔ 0~180°，1 tick = 1µs。
 > ⚠️ **PSC 千万别填 F103 时代的 71**，F407 TIM3 时钟是 84MHz。
 
-## 11. GPIO
+## 12. GPIO
 
 PC13 = GPIO_Output（初始高，板载 LED 低电平亮）。急停按钮如需硬件接入，选空闲 GPIO 配 GPIO_EXTI + 下拉。
 
-## 12. Project Manager
+## 13. Project Manager
 
 - Toolchain / IDE = **MDK-ARM**，Min Version V5
 - Code Generator：Copy only the necessary library files ✅ / Generate peripheral initialization as a pair of '.c/.h' files ✅ / Keep User Code when re-generating ✅
@@ -167,7 +177,7 @@ PC13 = GPIO_Output（初始高，板载 LED 低电平亮）。急停按钮如需
 
 ---
 
-## 13. 生成后要做的（关键，按顺序）
+## 14. 生成后要做的（关键，按顺序）
 
 ### 13.1 加入源码文件
 
@@ -287,7 +297,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 ---
 
-## 14. 常见坑
+## 15. 常见坑
 
 | 现象 | 原因 | 解决 |
 |---|---|---|

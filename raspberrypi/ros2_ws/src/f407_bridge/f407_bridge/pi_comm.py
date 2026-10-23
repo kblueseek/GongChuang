@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""树莓派 <-> F407 通信（PiComm 协议，串口 USART6，波特率 115200）。
+"""树莓派 <-> F407 通信（PiComm 协议）。
+
+================ 两条无线链路 ================
+
+  上行（树莓派 → F407）：蓝牙。指令量小、对延迟敏感，BLE 自带链路层重传，
+                        树莓派用 BleLink（BLE GATT）或 RfcommLink（经典蓝牙 SPP）。
+  下行（F407 → 树莓派）：LoRa。遥测可以容忍丢包，而且 LoRa 只发不收，
+                        天然避开半双工切换；树莓派直接用 PiCommLink 当串口读。
+
+两条链路跑的是同一套 PiComm 二进制帧，所以编解码代码完全复用。
+（下面 PiCommLink 的说明仍以原来的有线串口为背景，代码本身对 LoRa 串口一字不用改。）
 
 ================ 用大白话讲清楚这个文件在干什么 ================
 
@@ -30,7 +40,10 @@
 # 下面这行是固定写法：让 Python 把类型提示（比如 -> int 这种）推迟处理，避免一些加载顺序问题。
 from __future__ import annotations
 
+import asyncio  # bleak 是异步库，蓝牙收发都要在 asyncio 事件循环里做
+import queue    # 线程安全队列：ROS 回调只往里丢帧，蓝牙线程负责真正写出去
 import struct   # struct 用来做"数字 <-> 字节"的转换（打包/解包），是二进制协议的核心工具
+import threading
 import time     # 提供计时功能，用来做串口断线后的"过几秒再重连"
 from typing import Callable, Optional
 
@@ -41,6 +54,13 @@ try:
 except ImportError:
     serial = None
 
+# 蓝牙库 bleak（树莓派上的 BLE 中央设备）。同样允许缺失：只用 LoRa/串口时不需要它。
+try:
+    from bleak import BleakClient, BleakScanner
+except ImportError:
+    BleakClient = None
+    BleakScanner = None
+
 
 # ==================== 命令编号 ====================
 # 这些数字是"命令的名字"，和 F407 侧 PiComm.h 里的定义一一对应，改这里必须改那边。
@@ -50,11 +70,9 @@ CMD_HOME = 0x03       # 云台回零（回原点）
 CMD_GRIPPER = 0x04    # 夹爪舵机
 CMD_PLATE = 0x05      # 托盘舵机
 CMD_CAM = 0x06        # 相机舵机
-CMD_ENABLE = 0x07     # 电机使能（上电/断电）
-CMD_ESTOP = 0x08      # 急停（不带内容=置急停；带一个字节 0=解除急停）
+CMD_ENABLE = 0x07     # 整车使能/失能（单一状态，1=使能 0=失能）
 CMD_POSE = 0x09       # 位姿目标（走到世界系 (x,y) 并转到朝向 yaw，底盘位置+航向闭环）
 CMD_LED = 0x0A        # 补光灯亮度（0~100%，PWM 调光）
-CMD_UNLOCK = 0x0B     # 解除失能锁存（允许重新使能）
 CMD_HEARTBEAT = 0x10  # 心跳（定期发一次，告诉 F407 "我还活着"）
 
 # ==================== 回传数据编号 ====================
@@ -204,12 +222,9 @@ def encode_led(brightness_percent: float) -> bytes:
     return bytes([int(round(brightness_percent))])   # 四舍五入成整数，塞进 1 个字节
 
 
-def encode_enable(en: bool, mask: int = 0x7F) -> bytes:
-    """使能指令内容：第1字节=是否使能(1/0)，第2字节=哪些电机(bit0~6 对应电机1~7)。
-
-    mask 默认 0x7F = 二进制 0111 1111 = 7 个电机全选。
-    """
-    return bytes([1 if en else 0, mask & 0x7F])
+def encode_enable(en: bool) -> bytes:
+    """使能指令内容：1 字节 = 是否使能(1/0)。"""
+    return bytes([1 if en else 0])
 
 
 # ==================== 回传数据的解析 ====================
@@ -345,17 +360,8 @@ class PiCommLink:
     def send_led(self, brightness_percent: float) -> bool:
         return self._send(CMD_LED, encode_led(brightness_percent))
 
-    def send_unlock(self) -> bool:
-        return self._send(CMD_UNLOCK)   # 解除失能锁存（使能前必须先发）
-
-    def send_enable(self, en: bool, mask: int = 0x7F) -> bool:
-        return self._send(CMD_ENABLE, encode_enable(en, mask))
-
-    def send_estop(self) -> bool:
-        return self._send(CMD_ESTOP)
-
-    def send_estop_clear(self) -> bool:
-        return self._send(CMD_ESTOP, b"\x00")   # 带一个字节 0 = 解除急停
+    def send_enable(self, en: bool) -> bool:
+        return self._send(CMD_ENABLE, encode_enable(en))
 
     def send_heartbeat(self) -> bool:
         return self._send(CMD_HEARTBEAT)
@@ -422,6 +428,313 @@ class PiCommLink:
                 pass
         self._port = None
         self._rx.clear()
+
+
+# ==================== 蓝牙上行链路 ====================
+#
+# 为什么不能直接用 BleakClient 发？
+#   bleak 是"异步"库，所有收发都必须在一个 asyncio 事件循环里进行；而 ROS2 的回调
+#   是普通同步函数，直接调用会报错、或者把节点卡住。所以这里的做法是：
+#     1. 单独开一个后台线程，里面跑一个 asyncio 事件循环，负责连接/重连/写数据；
+#     2. ROS 回调只把"要发的帧"塞进一个线程安全队列（queue.Queue），立刻返回；
+#     3. 后台线程从队列取帧，写进 BLE 特征值。
+#   队列满时丢最旧的帧——遥测/心跳这类周期命令丢一帧没关系，最新值才重要。
+
+# 常见的"串口透传"BLE 模组的特征值 UUID：
+#   NUS（Nordic UART Service）：很多国产模组（JDY 系列、AT-09 改写版）用这个
+BLE_NUS_WRITE_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # 中央设备写入
+BLE_NUS_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # 模组 notify 给中央设备
+#   FFE1：老牌 HC-08 / CC2541 透传模组常用
+BLE_FFE1_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
+# 广播里出现这些片段，说明这台设备大概率是串口透传模组
+_BLE_SERIAL_MARKS = ("6e400001", "0000ffe0", "0000ffe1", "0000fff0")
+
+
+def _ble_device_uuids(device) -> set[str]:
+    """从 bleak 扫到的设备对象里，尽量把广播中的服务 UUID 抠出来。
+
+    不同版本/不同平台的 bleak 把广播数据放在不同位置（metadata 或 details），
+    所以这里两种都试一遍，取不到就返回空集合（不影响后续按名字匹配）。
+    """
+    uuids: set[str] = set()
+    metadata = getattr(device, "metadata", None) or {}
+    if isinstance(metadata, dict):
+        for item in metadata.get("uuids", []) or []:
+            uuids.add(str(item).lower())
+    details = getattr(device, "details", None) or {}
+    if isinstance(details, dict):
+        props = details.get("props", {}) or {}
+        for item in props.get("UUIDs", []) or []:
+            uuids.add(str(item).lower())
+    return uuids
+
+
+def _ble_looks_like_serial(device) -> bool:
+    """这台设备的广播里有没有"串口透传"服务的痕迹。"""
+    for uuid in _ble_device_uuids(device):
+        for mark in _BLE_SERIAL_MARKS:
+            if mark in uuid:
+                return True
+    return False
+
+
+def scan_ble_devices(timeout: float = 8.0) -> list[tuple[str, str, list[str]]]:
+    """同步扫描附近 BLE 设备，返回 [(地址, 名称, 广播服务UUID列表), ...]。
+
+    主要给调试脚本用：先看清 F407 上的蓝牙模组叫什么名字、地址是多少，
+    再把 ble_address / ble_name 填进桥接节点，就不用每次盲扫了。
+    """
+    if BleakScanner is None:
+        raise PiCommError("未安装 bleak，无法扫描蓝牙（sudo apt install python3-bleak）")
+
+    async def _scan():
+        return await BleakScanner.discover(timeout=timeout)
+
+    found = asyncio.run(_scan())
+    result = []
+    for dev in found:
+        result.append((
+            getattr(dev, "address", "") or "",
+            getattr(dev, "name", "") or "",
+            sorted(_ble_device_uuids(dev)),
+        ))
+    return result
+
+
+class BleLink:
+    """BLE 上行链路：把 PiComm 帧写进蓝牙模组的串口透传特征值。
+
+    和 PiCommLink 提供同名接口（send_vel / send_pose / send_heartbeat ...），
+    上层节点可以无差别替换。区别：
+      * 只有发送，没有 poll()（遥测走 LoRa，不占蓝牙）；
+      * 连接是异步的，构造后立刻返回，后台线程自己连、断了自动重连；
+      * connected 只是"最近一次连接状态"，发不出去不会抛异常（只丢帧 + 记录 last_error）。
+    """
+
+    def __init__(
+        self,
+        address: str = "",              # 模组 MAC 地址（Linux 上是 AA:BB:CC:DD:EE:FF）；空=自动扫描
+        name: str = "",                 # 按名字关键字匹配（比如 "JDY"、"BLE"）；空=不限
+        write_uuid: str = "",           # 写入特征值 UUID；空=自动探测 NUS/FFE1/第一个可写特征
+        scan_timeout: float = 8.0,      # 扫描多久找设备
+        reconnect_interval_s: float = 2.0,  # 断线后隔多久重连
+        queue_size: int = 64,           # 待发帧队列长度
+        log: Optional[Callable[[str], None]] = None,   # 日志输出（节点传 get_logger().info 进来）
+    ):
+        if BleakClient is None:
+            raise PiCommError(
+                "未安装 bleak，无法使用蓝牙链路（sudo apt install python3-bleak）"
+            )
+        self.address = str(address or "")
+        self.name = str(name or "")
+        self.write_uuid = str(write_uuid or "")
+        self.scan_timeout = float(scan_timeout)
+        self.reconnect_interval_s = float(reconnect_interval_s)
+        self.last_error = ""
+        self.last_scan_report = ""
+
+        self._log_fn = log
+        self._frames: "queue.Queue[bytes]" = queue.Queue(maxsize=max(4, int(queue_size)))
+        self._stop = threading.Event()
+        self._connected = threading.Event()
+        self._seq = 0
+
+        self._thread = threading.Thread(target=self._thread_main, name="ble-link", daemon=True)
+        self._thread.start()
+
+    # ---------- 对外状态 ----------
+    @property
+    def connected(self) -> bool:
+        return self._connected.is_set()
+
+    def _log(self, text: str) -> None:
+        if self._log_fn is not None:
+            try:
+                self._log_fn(text)
+            except Exception:
+                pass
+
+    # ---------- 发送（ROS 回调里调用，必须立刻返回） ----------
+    def _send(self, cmd: int, data: bytes = b"") -> bool:
+        frame = build_frame(cmd, data, self._seq)
+        self._seq = (self._seq + 1) & 0xFF
+        if not self.connected:
+            # 没连上就丢掉，别攒着——重连后一次性灌一堆旧指令反而危险
+            return False
+        try:
+            self._frames.put_nowait(frame)
+        except queue.Full:
+            try:
+                self._frames.get_nowait()   # 丢最旧的
+            except queue.Empty:
+                pass
+            try:
+                self._frames.put_nowait(frame)
+            except queue.Full:
+                return False
+        return True
+
+    def send_vel(self, vx_m_s: float, vy_m_s: float, wz_rad_s: float) -> bool:
+        return self._send(CMD_VEL, encode_vel(vx_m_s, vy_m_s, wz_rad_s))
+
+    def send_pose(self, x_m: float, y_m: float, yaw_rad: float) -> bool:
+        return self._send(CMD_POSE, encode_pose(x_m, y_m, yaw_rad))
+
+    def send_gimbal(self, axis: int, deg: float) -> bool:
+        return self._send(CMD_GIMBAL, encode_gimbal(axis, deg))
+
+    def send_home(self, mask: int) -> bool:
+        return self._send(CMD_HOME, encode_home(mask))
+
+    def send_gripper(self, deg: float) -> bool:
+        return self._send(CMD_GRIPPER, encode_servo(deg))
+
+    def send_plate(self, deg: float) -> bool:
+        return self._send(CMD_PLATE, encode_servo(deg))
+
+    def send_cam(self, deg: float) -> bool:
+        return self._send(CMD_CAM, encode_servo(deg))
+
+    def send_led(self, brightness_percent: float) -> bool:
+        return self._send(CMD_LED, encode_led(brightness_percent))
+
+    def send_enable(self, en: bool) -> bool:
+        return self._send(CMD_ENABLE, encode_enable(en))
+
+    def send_heartbeat(self) -> bool:
+        return self._send(CMD_HEARTBEAT)
+
+    def poll(self) -> list[tuple[int, bytes]]:
+        """蓝牙只做上行（遥测走 LoRa），所以这里永远返回空。保留接口是为了和 PiCommLink 通用。"""
+        return []
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    # ---------- 后台线程：asyncio 连接 / 重连 / 发送 ----------
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run_forever())
+        finally:
+            self._connected.clear()
+            loop.close()
+
+    async def _run_forever(self) -> None:
+        while not self._stop.is_set():
+            try:
+                address = self.address or await self._discover_address()
+                if not address:
+                    self.last_error = "没有找到可用的蓝牙模组（可用 scripts/ble_scan.py 查看）"
+                    await asyncio.sleep(self.reconnect_interval_s)
+                    continue
+                self.address = address
+
+                async with BleakClient(address, timeout=10.0) as client:
+                    uuid = await self._resolve_write_uuid(client)
+                    if uuid is None:
+                        raise RuntimeError("连上了但找不到可写特征值，请用 ble_write_uuid 指定")
+                    self.write_uuid = uuid
+                    self._drain()
+                    self._connected.set()
+                    self.last_error = ""
+                    self._log(f"蓝牙已连接 {address}，写入特征值 {uuid}")
+                    await self._pump(client, uuid)
+            except Exception as error:      # 任何异常都当作断线，统一重连
+                self.last_error = str(error)
+                self._log(f"蓝牙断开：{error}（{self.reconnect_interval_s:.0f}s 后重连）")
+            finally:
+                self._connected.clear()
+
+            if not self._stop.is_set():
+                await asyncio.sleep(self.reconnect_interval_s)
+
+    async def _pump(self, client, uuid: str) -> None:
+        """连接期间一直从队列取帧写出去；连接掉了就退出，交给外层重连。"""
+        while not self._stop.is_set():
+            if not client.is_connected:
+                raise RuntimeError("蓝牙连接已断开")
+            try:
+                frame = await asyncio.to_thread(self._frames.get, True, 0.5)
+            except queue.Empty:
+                continue
+            try:
+                await client.write_gatt_char(uuid, frame, response=False)
+            except Exception:
+                # 有些模组只支持"带响应"的写
+                await client.write_gatt_char(uuid, frame, response=True)
+
+    def _drain(self) -> None:
+        """清空待发队列（刚连上时把断线期间积累的旧帧扔掉）。"""
+        while True:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                return
+
+    async def _discover_address(self) -> str:
+        """扫描附近设备，挑出 F407 上的蓝牙模组。"""
+        devices = await BleakScanner.discover(timeout=self.scan_timeout)
+        lines = []
+        candidates = []
+        for dev in devices:
+            dev_name = getattr(dev, "name", "") or ""
+            dev_addr = getattr(dev, "address", "") or ""
+            uuids = sorted(_ble_device_uuids(dev))
+            lines.append(f"  {dev_addr}  {dev_name or '(无名)'}  {','.join(uuids[:3])}")
+            if self.name and self.name.lower() in dev_name.lower():
+                self.last_scan_report = "\n".join(lines)
+                return dev_addr
+            if _ble_looks_like_serial(dev):
+                candidates.append(dev_addr)
+        self.last_scan_report = "\n".join(lines) or "  (没有扫到任何 BLE 设备)"
+
+        if len(candidates) == 1:
+            return candidates[0]
+        if not self.name:
+            # 没有指定名字时，退一步：只认有名字的设备（避免连到一堆无名信标）
+            named = [getattr(d, "address", "") for d in devices if (getattr(d, "name", "") or "")]
+            if len(named) == 1:
+                return named[0]
+        self.last_error = (
+            "扫描到多台设备，无法自动确定哪台是 F407 的蓝牙模组：\n"
+            + self.last_scan_report
+            + "\n请用 ble_address 或 ble_name 参数指定。"
+        )
+        self._log(self.last_error)
+        return ""
+
+    async def _resolve_write_uuid(self, client) -> Optional[str]:
+        """在已连接的 GATT 表里找到"能把数据写进模组串口"的那个特征值。"""
+        if self.write_uuid:
+            return self.write_uuid
+
+        writable = []
+        for service in client.services:
+            for char in service.characteristics:
+                props = {p.lower() for p in char.properties}
+                if "write" in props or "write-without-response" in props:
+                    writable.append(str(char.uuid).lower())
+
+        for preferred in (BLE_NUS_WRITE_UUID, BLE_FFE1_UUID):
+            if preferred in writable:
+                return preferred
+        return writable[0] if writable else None
+
+
+class RfcommLink(PiCommLink):
+    """经典蓝牙 SPP 模组（HC-05 / HC-06 这类）当成串口用。
+
+    经典蓝牙不能走 BLE GATT，得先用系统命令把 /dev/rfcomm0 绑上：
+        sudo rfcomm bind 0 <模组MAC> 1
+    之后它对程序来说就是一个普通串口文件，直接用 PiCommLink 读写的逻辑。
+    """
+
+    def __init__(self, device: str = "/dev/rfcomm0", baudrate: int = 115200, **kwargs):
+        super().__init__(device=device, baudrate=baudrate, **kwargs)
+        self.write_uuid = ""    # 和 BleLink 保持同样的属性，方便上层统一处理
 
 
 if __name__ == "__main__":

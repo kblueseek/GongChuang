@@ -7,11 +7,18 @@
 
 PiCommand_t PiCommand;
 
-/* 接收状态机 */
+/* 接收状态机：每条链路一套上下文（蓝牙上行 / USART6 有线），避免字节交织时互相打断 */
 #define PI_RX_BUF_SIZE  64
-static uint8_t  s_RxBuf[PI_RX_BUF_SIZE];
-static uint8_t  s_RxCnt = 0;
-static uint8_t  s_RxLen = 0;
+
+typedef struct
+{
+    uint8_t Buf[PI_RX_BUF_SIZE];
+    uint8_t Cnt;
+    uint8_t Len;
+} PiCommRxCtx_t;
+
+static PiCommRxCtx_t s_RxWired;     /* USART6：有线链路（调试/备用） */
+static PiCommRxCtx_t s_RxBle;       /* USART2：蓝牙上行 */
 
 /* ============ CRC16-MODBUS ============ */
 static uint16_t PiComm_CRC16(const uint8_t* data, uint8_t len)
@@ -30,10 +37,64 @@ static uint16_t PiComm_CRC16(const uint8_t* data, uint8_t len)
 }
 
 /* ============ 发送 ============ */
+#define PI_TX_BUF_SIZE  24      /* 最长帧 = 7 + 10(里程计) = 17B，留余量 */
+
+#if LORA_DOWNLINK_ENABLE
+/* 遥测帧用中断发送而不是阻塞发送：即使波特率降下来，也不会把调用它的任务卡住
+   任务里只把帧丢进待发槽，UART4 中断发完再取下一帧。遥测是周期性的，
+   来不及发就覆盖旧帧（最新值才有意义），不排队、不阻塞。 */
+static uint8_t  s_TxBuf[PI_TX_BUF_SIZE];        /* 中断正在发送的帧 */
+static uint8_t  s_TxPending[PI_TX_BUF_SIZE];    /* 等待发送的最新帧 */
+static volatile uint8_t s_TxPendingLen = 0;
+static volatile uint8_t s_TxBusy = 0;
+volatile uint32_t PiComm_TxDropCount = 0;       /* 被覆盖/启动失败的帧数（调试用） */
+
+static void PiComm_TxPump(void)
+{
+    uint32_t primask;
+    uint8_t  len;
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_TxBusy || s_TxPendingLen == 0) {
+        if (!primask) __enable_irq();
+        return;
+    }
+    len = s_TxPendingLen;
+    memcpy(s_TxBuf, s_TxPending, len);
+    s_TxPendingLen = 0;
+    s_TxBusy = 1;
+    if (!primask) __enable_irq();
+
+    if (HAL_UART_Transmit_IT(&huart4, s_TxBuf, len) != HAL_OK) {
+        s_TxBusy = 0;               /* 启动失败：下一帧还会触发 Pump，不至于卡死 */
+        PiComm_TxDropCount++;
+    }
+}
+
+static void PiComm_TxEnqueue(const uint8_t* frame, uint8_t len)
+{
+    uint32_t primask;
+
+    if (len > PI_TX_BUF_SIZE)
+        return;
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_TxPendingLen != 0)
+        PiComm_TxDropCount++;       /* 旧帧还没发出去就被新帧覆盖 */
+    memcpy(s_TxPending, frame, len);
+    s_TxPendingLen = len;
+    if (!primask) __enable_irq();
+
+    PiComm_TxPump();
+}
+#endif
+
 static void PiComm_SendFrame(uint8_t cmd, const uint8_t* data, uint8_t dataLen)
 {
     static uint8_t s_Seq = 0;
-    uint8_t frame[PI_RX_BUF_SIZE];
+    uint8_t frame[PI_TX_BUF_SIZE];
 
     frame[0] = 0xAA;
     frame[1] = 0x55;
@@ -46,8 +107,30 @@ static void PiComm_SendFrame(uint8_t cmd, const uint8_t* data, uint8_t dataLen)
     frame[5 + dataLen] = crc & 0xFF;
     frame[6 + dataLen] = crc >> 8;
 
-    HAL_UART_Transmit(&huart6, frame, 7 + dataLen, 100);
+#if LORA_DOWNLINK_ENABLE
+    PiComm_TxEnqueue(frame, 7 + dataLen);                   /* 非阻塞：LoRa / UART4 */
+#else
+    HAL_UART_Transmit(&huart6, frame, 7 + dataLen, 100);    /* 回落：USART6 有线 */
+#endif
 }
+
+#if LORA_DOWNLINK_ENABLE
+void PiComm_TxCpltCallback(void)
+{
+    s_TxBusy = 0;
+    PiComm_TxPump();                /* 立刻接上被覆盖等待的那一帧 */
+}
+
+void PiComm_ErrorCallback(void)
+{
+    /* UART4 只发不收，出错时清掉发送状态即可，下一帧自动重新启动 */
+    s_TxBusy = 0;
+    s_TxPendingLen = 0;
+}
+#else
+void PiComm_TxCpltCallback(void) { }
+void PiComm_ErrorCallback(void)  { }
+#endif
 
 /* ============ 接收解析 ============ */
 static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
@@ -103,31 +186,15 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
         if (dLen >= 1)
             PiCommand.Cam = d[0];
         break;
-    case PI_CMD_LED:                /* 补光灯亮度 %（0~100），收到即执行（PWM 无闭环） */
-        if (dLen >= 1) {
+    case PI_CMD_LED:                /* 补光灯亮度 %（0~100），仅使能时执行（PWM 无闭环） */
+        if (dLen >= 1 && PiCommand.Enabled) {
             PiCommand.Led = d[0];
             Led_SetBrightness((float)d[0]);
         }
         break;
-    case PI_CMD_ENABLE:
-        if (dLen >= 2) {
-            uint8_t mask = d[1] & 0x7F;
-            if (d[0]) {
-                /* 失能锁存期间：使能一律无效，防止失控节点把车重新顶起来 */
-                if (!PiCommand.SafetyLock)
-                    PiCommand.EnableMask |= mask;
-            } else {
-                PiCommand.EnableMask &= ~mask;   /* 失能 */
-                PiCommand.SafetyLock = 1;        /* 立刻锁存，之后必须显式解锁才能再使能 */
-            }
-        }
-        break;
-    case PI_CMD_UNLOCK:             /* 解除失能锁存（使能前必须先发） */
-        PiCommand.SafetyLock = 0;
-        break;
-    case PI_CMD_ESTOP:
-        PiCommand.Estop = (dLen >= 1 && d[0] == 0) ? 0 : 1;   /* 无数据=置急停；字节0=解除急停 */
-        PiCommand.Vel.Vx = PiCommand.Vel.Vy = PiCommand.Vel.Wz = 0;
+    case PI_CMD_ENABLE:             /* 整车单一使能状态：en 直接决定使能/失能 */
+        if (dLen >= 1)
+            PiCommand.Enabled = d[0] ? 1 : 0;
         break;
     case PI_CMD_HEARTBEAT:
         break;
@@ -142,54 +209,56 @@ void PiComm_Init(void)
 {
     /* 只清状态；UART 接收由 usart.c 的 RX 中断统一管理 */
     memset(&PiCommand, 0, sizeof(PiCommand));
-    s_RxCnt = 0;
-    s_RxLen = 0;
+    PiCommand.Enabled = 1;      /* 上电默认使能 */
+    memset(&s_RxWired, 0, sizeof(s_RxWired));
+    memset(&s_RxBle, 0, sizeof(s_RxBle));
+}
+
+/* 单条链路的字节级帧同步（中断上下文） */
+static void PiComm_RxByteCtx(PiCommRxCtx_t* ctx, uint8_t data)
+{
+    /* 帧头同步 */
+    if (ctx->Cnt == 0) {
+        if (data != 0xAA)
+            return;
+    } else if (ctx->Cnt == 1) {
+        if (data != 0x55) {
+            ctx->Cnt = (data == 0xAA) ? 1 : 0;
+            return;
+        }
+    }
+
+    ctx->Buf[ctx->Cnt++] = data;
+
+    if (ctx->Cnt == 3) {                /* LEN */
+        ctx->Len = data;
+        if (ctx->Len + 4 > PI_RX_BUF_SIZE) {    /* 帧总长 = SOF(2) + LEN(1) + SEQ(1) + LEN，异常则重新同步 */
+            ctx->Cnt = 0;
+            return;
+        }
+    }
+
+    if (ctx->Cnt == ctx->Len + 4) {     /* 收满：SOF(2) + LEN + SEQ + LEN 字节 */
+        uint16_t crc = (uint16_t)(ctx->Buf[ctx->Cnt - 1] << 8) | ctx->Buf[ctx->Cnt - 2];
+        if (PiComm_CRC16(&ctx->Buf[2], ctx->Len) == crc)
+            PiComm_ParseFrame(ctx->Buf, ctx->Len);
+        ctx->Cnt = 0;
+    }
 }
 
 void PiComm_RxByte(uint8_t data)
 {
-    /* 帧头同步 */
-    if (s_RxCnt == 0) {
-        if (data != 0xAA)
-            return;
-    } else if (s_RxCnt == 1) {
-        if (data != 0x55) {
-            s_RxCnt = (data == 0xAA) ? 1 : 0;
-            return;
-        }
-    }
+    PiComm_RxByteCtx(&s_RxWired, data);
+}
 
-    s_RxBuf[s_RxCnt++] = data;
-
-    if (s_RxCnt == 3) {                 /* LEN */
-        s_RxLen = data;
-        if (s_RxLen + 4 > PI_RX_BUF_SIZE) {     /* 帧总长 = SOF(2) + LEN(1) + SEQ(1) + LEN，异常则重新同步 */
-            s_RxCnt = 0;
-            return;
-        }
-    }
-
-    if (s_RxCnt == s_RxLen + 4) {       /* 收满：SOF(2) + LEN + SEQ + LEN 字节 */
-        uint16_t crc = (uint16_t)(s_RxBuf[s_RxCnt - 1] << 8) | s_RxBuf[s_RxCnt - 2];
-        if (PiComm_CRC16(&s_RxBuf[2], s_RxLen) == crc)
-            PiComm_ParseFrame(s_RxBuf, s_RxLen);
-        s_RxCnt = 0;
-    }
+void PiComm_RxBleByte(uint8_t data)
+{
+    PiComm_RxByteCtx(&s_RxBle, data);
 }
 
 int PiComm_IsOnline(void)
 {
     return (HAL_GetTick() - PiCommand.LastOnlineTick) < PI_CMD_TIMEOUT_MS;
-}
-
-void PiComm_TimeoutCheck(void)
-{
-    if (!PiComm_IsOnline()) {
-        /* 树莓派掉线：底盘停车（云台保持，防掉落） */
-        PiCommand.Vel.Vx = 0;
-        PiCommand.Vel.Vy = 0;
-        PiCommand.Vel.Wz = 0;
-    }
 }
 
 /* ============ 遥测 ============ */

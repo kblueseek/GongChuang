@@ -6,6 +6,8 @@
 
 #include "header.h"
 
+#if BLE_CONTROL_ENABLE
+
 BLE_Remote_t BleRemote;
 
 /* ============ 接收缓冲（中断写入，任务消费） ============ */
@@ -170,18 +172,16 @@ void BLE_ApplyToCommand(void)
 
     /* ---- 按键边沿 ---- */
     if (BleRemote.Key[BLE_KEY_ENABLE].Pressed) {
-        PiCommand.EnableMask = (PiCommand.EnableMask == 0x7F) ? 0 : 0x7F;   /* 全 7 电机 toggle */
+        PiCommand.Enabled = PiCommand.Enabled ? 0 : 1;   /* 使能/失能 toggle */
         BleRemote.Key[BLE_KEY_ENABLE].Pressed = 0;
     }
     if (BleRemote.Key[BLE_KEY_ESTOP].Pressed) {
-        PiCommand.Estop = 1;
-        PiCommand.EnableMask = 0;
+        PiCommand.Enabled = 0;
         PiCommand.Vel.Vx = PiCommand.Vel.Vy = PiCommand.Vel.Wz = 0;
         BleRemote.Key[BLE_KEY_ESTOP].Pressed = 0;
     }
     if (BleRemote.Key[BLE_KEY_RELEASE].Pressed) {
-        PiCommand.Estop = 0;
-        PiCommand.EnableMask = 0x7F;
+        PiCommand.Enabled = 1;
         BleRemote.Key[BLE_KEY_RELEASE].Pressed = 0;
     }
     if (BleRemote.Key[BLE_KEY_RETURN].Pressed) {
@@ -277,3 +277,5 @@ void BLE_RxCallback(uint8_t data)
         }
     }
 }
+
+#endif /* BLE_CONTROL_ENABLE */

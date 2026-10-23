@@ -3,8 +3,11 @@
 # 大白话：运行 ros2 launch lidar_bringup system.launch.py 就等于同时启动下面 4 个程序：
 #   1. 雷达驱动      -> 产出 /scan
 #   2. 障碍检测      -> /scan 变成 /obstacles
-#   3. F407 桥接     -> 话题和串口互转
+#   3. F407 桥接     -> 话题和无线链路互转（蓝牙上行 + LoRa 下行）
 #   4. 运动规划      -> /obstacles 变成 /cmd_vel
+#   5. 手柄驱动      -> /joy
+#   6. 手柄控制      -> /joy 变成整车控制话题
+#   7. 状态屏        -> I2C OLED 显示在线状态/坐标/朝向
 # 它们靠"话题"串成一条流水线。
 
 from launch import LaunchDescription
@@ -29,12 +32,18 @@ def generate_launch_description():
             name='obstacle_detect',
             output='screen',
         ),
-        # 3. F407 桥接节点（串口翻译官）
+        # 3. F407 桥接节点（无线翻译官：蓝牙上行 + LoRa 下行）
         Node(
             package='f407_bridge',
             executable='f407_bridge_node',
             name='f407_bridge',
             output='screen',
+            parameters=[{
+                'uplink': 'ble',
+                'downlink': 'lora',
+                'lora_device': '/dev/ttyAMA2',
+                'lora_baudrate': 115200,
+            }],
         ),
         # 4. 运动规划节点（避障）
         Node(
@@ -57,5 +66,13 @@ def generate_launch_description():
             executable='joy_control_node',
             name='joy_control',
             output='screen',
+        ),
+        # 7. 状态屏（I2C OLED：在线状态 / 坐标 / 朝向 / 电机掩码）
+        Node(
+            package='f407_bridge',
+            executable='status_display_node',
+            name='status_display',
+            output='screen',
+            parameters=[{'width': 128, 'height': 64}],   # 160x80 的屏改成 160 / 80
         ),
     ])

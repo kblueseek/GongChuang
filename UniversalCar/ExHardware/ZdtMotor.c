@@ -11,11 +11,6 @@
 
 ZdtMotor_t* ZdtMotorList[8] = { NULL };
 
-/* 调试计数（Keil Watch 里观察，判断 CAN 到底发没发、发没发成功） */
-volatile uint32_t ZdtCan_TxCount   = 0;   /* 成功发送的 CAN 帧数 */
-volatile uint32_t ZdtCan_TxErr     = 0;   /* HAL_CAN_AddTxMessage 返回非 HAL_OK 的次数 */
-volatile uint32_t ZdtCan_TxLastRet = 0;   /* 最后一次 AddTxMessage 返回值 */
-
 /* 发送一帧（单包），扩展帧 ID = (地址<<8)|包序号 */
 static void Zdt_SendFrame(uint8_t addr, uint8_t packet, const uint8_t* d, uint8_t n)
 {
@@ -30,17 +25,12 @@ static void Zdt_SendFrame(uint8_t addr, uint8_t packet, const uint8_t* d, uint8_
     /* CAN1 只有 3 个 TX 邮箱，全满时 HAL_CAN_AddTxMessage 会直接丢帧（返回 HAL_ERROR）。
        底盘/云台都是背靠背连发 4~6 帧，必须轮询等空闲邮箱，否则后几帧被静默丢弃。
        500k 下一帧约 250us，本循环最坏阻塞约 1ms，对 5ms 周期任务可接受。 */
-    ZdtCan_TxLastRet = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
-    while (ZdtCan_TxLastRet != HAL_OK && retry < 10000)
+    HAL_StatusTypeDef ret = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
+    while (ret != HAL_OK && retry < 10000)
     {
         retry++;
-        ZdtCan_TxLastRet = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
+        ret = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
     }
-
-    if (ZdtCan_TxLastRet == HAL_OK)
-        ZdtCan_TxCount++;
-    else
-        ZdtCan_TxErr++;
 }
 
 /* 低层发送：cmd[0] 为功能码，追加校验码后拆包发送。

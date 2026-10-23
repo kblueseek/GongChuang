@@ -8,6 +8,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO="${ROS_DISTRO:-lyrical}"
 
 source "/opt/ros/${ROS_DISTRO}/setup.bash"
+
+# 修复 ament_python 可执行文件路径：本环境 colcon 装到 bin/，Lyrical 只在 lib/<pkg>/ 里找。
+# 幂等，colcon build 之后 / ros2 launch 报 libexec 不存在时也靠它自愈。
+bash "$REPO_ROOT/scripts/mk_libexec.sh"
+
 source "$REPO_ROOT/ros2_ws/install/setup.bash"
 
 exec ros2 launch lidar_bringup system.launch.py
