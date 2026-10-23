@@ -682,6 +682,31 @@ class MaterialPickupDetector:
         )
 
 
+def down_zone_region(
+    result: MaterialPickupDetection, config: dict
+) -> MaterialRegion | None:
+    """挑出落在 down 区的那件物料，返回 MaterialRegion，没有则返回 None。
+
+    为什么需要这个函数：``_assign_slots()`` 内部已经算出了 region 与抓取区的
+    对应关系（``assignments``），但只把 ``color_id`` 返回出去，**坐标被丢掉了**。
+    所以外部想用 down 区物料的中心坐标时，得自己再判一遍。
+
+    这里复用 ``_point_in_rectangle`` 并读取同一个 ``slot_interior_margin_px``，
+    保证判据与检测器内部**完全一致**（含内缩边距），不会出现
+    "``slot_colors`` 说 down 区有料、但这里挑不出来" 的情况。
+    """
+
+    regions = config.get("regions") or {}
+    if "down" not in regions:
+        return None
+    margin = float(config.get("detection", {}).get("slot_interior_margin_px", 0.0))
+    for region in result.regions:
+        if _point_in_rectangle(region.center_x_px, region.center_y_px,
+                               regions["down"], margin):
+            return region
+    return None
+
+
 def draw_material_pickup_detection(
     frame: np.ndarray, result: MaterialPickupDetection, config: dict
 ) -> np.ndarray:
@@ -729,5 +754,27 @@ def draw_material_pickup_detection(
     cv2.putText(
         frame, status, (20, 89), cv2.FONT_HERSHEY_SIMPLEX,
         0.63, (255, 255, 255), 2, cv2.LINE_AA,
+    )
+
+    # down 区**那件物料**的质心坐标（不是 down 区框的中心！）：
+    # 物料上画准星，下面单独一行显示坐标。
+    # 坐标用整数像素 —— 云台要伸到哪儿就按这个走。
+    down_region = down_zone_region(result, config)
+    if down_region is None:
+        down_text = "DOWN material: (no material)"
+        down_color = (150, 150, 150)
+    else:
+        center_x = int(round(down_region.center_x_px))
+        center_y = int(round(down_region.center_y_px))
+        down_color = (180, 0, 255)          # 与 down 区框同色
+        cv2.drawMarker(frame, (center_x, center_y), down_color,
+                       cv2.MARKER_CROSS, 44, 3)
+        cv2.circle(frame, (center_x, center_y), 10, down_color, 2)
+        down_text = (f"DOWN material: ({center_x}, {center_y})  "
+                     f"{down_region.name}")
+    cv2.rectangle(frame, (10, 102), (1060, 136), (0, 0, 0), -1)
+    cv2.putText(
+        frame, down_text, (20, 127), cv2.FONT_HERSHEY_SIMPLEX,
+        0.63, down_color, 2, cv2.LINE_AA,
     )
     return frame

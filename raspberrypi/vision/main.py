@@ -78,6 +78,7 @@ class Mode(Enum):
     RING_STATION = "ring_station"
     RING_STACKING = "ring_stacking"
     TURNTABLE = "turntable"
+    QRCODE = "qrcode"
 
 
 # 模式和检测器：initialize()创建检测器，set_mode()清理历史。
@@ -381,6 +382,92 @@ def process_material_pickup(frame, timestamp):
             material_cycle_pending = False
             material_reported = True
     return result
+
+
+# ---------- 二维码模式：只识别并显示，不涉及串口和上报策略 ----------
+qr_detector = None
+last_qr_text = ""
+qr_stable_frames = 0
+QR_REQUIRED_STABLE_FRAMES = 3
+
+
+def draw_qrcode(frame, text, confirmed, points, stable_frames):
+    """绘制二维码位置框、原始文本和去抖进度。"""
+
+    if points is not None:
+        polygon = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+        if polygon.shape[0] >= 3:
+            cv2.polylines(
+                frame,
+                [np.rint(polygon).astype(np.int32)],
+                True,
+                (0, 255, 0) if confirmed else (0, 200, 255),
+                2,
+            )
+
+    lines = [
+        f"QR: {confirmed if confirmed else 'SEARCHING'}",
+        f"Raw: {text if text else '--'}   "
+        f"Stable={stable_frames}/{QR_REQUIRED_STABLE_FRAMES}",
+        "E : QR code mode    I : Idle    Q / Esc : Quit",
+    ]
+    cv2.rectangle(frame, (10, 65), (880, 175), (0, 0, 0), -1)
+    for index, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (20, 92 + index * 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.66,
+            (80, 255, 80) if (index == 0 and confirmed) else (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    return frame
+
+
+def process_qrcode(frame):
+    """识别画面里的二维码并显示结果；不发送任何串口帧。"""
+
+    global qr_detector, last_qr_text, qr_stable_frames
+
+    if qr_detector is None:
+        qr_detector = cv2.QRCodeDetector()
+
+    text = ""
+    points = None
+    try:
+        text, points, _ = qr_detector.detectAndDecode(frame)
+    except (cv2.error, AttributeError):
+        text, points = "", None
+
+    if not text:
+        # 单码解不出来时退到多码接口，画面里有多个码时更稳。
+        try:
+            ok, texts, multi_points, _ = qr_detector.detectAndDecodeMulti(frame)
+            if ok:
+                for candidate, candidate_points in zip(texts, multi_points):
+                    if candidate:
+                        text, points = candidate, candidate_points
+                        break
+        except (cv2.error, AttributeError):
+            pass
+
+    text = text.strip()
+    # 同一个串连续出现若干帧才确认，滤掉QRCodeDetector的偶发误读。
+    if text:
+        if text == last_qr_text:
+            qr_stable_frames += 1
+        else:
+            last_qr_text, qr_stable_frames = text, 1
+    else:
+        last_qr_text, qr_stable_frames = "", 0
+
+    confirmed = (
+        last_qr_text if qr_stable_frames >= QR_REQUIRED_STABLE_FRAMES else ""
+    )
+    draw_qrcode(frame, text, confirmed, points, qr_stable_frames)
+    return None
 
 
 # ---------- 4. 配置读取和摄像头 ----------
@@ -731,6 +818,7 @@ def draw_status(frame, mode, measured_fps, frame_count):
             "M : Material pickup",
             "R : Three-ring alignment",
             "S : Middle ring + lines (stacking)",
+            "E : QR code",
             "I : Idle",
             "Q / Esc : Quit",
         )
@@ -891,6 +979,8 @@ def handle_key(key):
         set_mode(Mode.RING_STACKING)
     elif key in (ord("m"), ord("M")):
         enter_material_pickup()
+    elif key in (ord("e"), ord("E")):
+        set_mode(Mode.QRCODE)
     elif key in (ord("i"), ord("I")):
         set_mode(Mode.IDLE)
     return True
@@ -1226,6 +1316,8 @@ def run(args):
                 result = process_ring_station(frame)
             elif current_mode == Mode.RING_STACKING:
                 result = process_ring_stacking(frame)
+            elif current_mode == Mode.QRCODE:
+                process_qrcode(frame)
 
             # 5. 更新帧率、显示画面，每秒打印一次状态。
             frame_count += 1

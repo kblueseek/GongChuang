@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <!--
+    只启动视觉节点。模式由外部通过 /vision/mode 话题驱动，例如：
+        ros2 topic pub -1 /vision/mode std_msgs/String "{data: ring}"
+    可选值：idle / qr / turntable / ring / stacked / material
+
+    相机按设备名匹配，不看节点号：节点号会随上电顺序漂移，设备名不会。
+        top_match   = DECXIN,DECKXIN   （俯视：转盘 / 圆环 / 物料）
+        front_match = icspring         （平视：二维码）
+    匹配词支持逗号分隔的多个候选，大小写不敏感，写短子串即可。
+
+    想钉死某个节点，就用 top_device / front_device 参数填 /dev/videoN。
+    注意 OpenCV 的 V4L2 后端不认 /dev/v4l/by-id 软链接，只能填真实节点。
+
+    vision_dir 不必写死：节点会自己按源码树相对位置去找上级的 vision 目录。
+  -->
+  <node pkg="vision_node" exec="vision_node" name="vision_node" output="screen">
+    <param name="top_match" value="DECXIN,DECKXIN"/>
+    <param name="front_match" value="icspring"/>
+    <param name="width" value="1280"/>
+    <param name="height" value="720"/>
+    <param name="fps" value="30.0"/>
+    <param name="rate_hz" value="30.0"/>
+    <param name="undistort" value="true"/>
+    <!-- 调参期建议开着：每 2 秒把画面存到 /tmp/vision_node/<模式>.jpg -->
+    <param name="debug_dump" value="true"/>
+    <param name="debug_dump_dir" value="/tmp/vision_node"/>
+    <!-- 两路相机挂在同一个 USB 控制器上时，改成 true 可以只让一路开流 -->
+    <param name="close_inactive_cameras" value="false"/>
+  </node>
+</launch>

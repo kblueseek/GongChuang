@@ -361,7 +361,28 @@ def _raw_detection(image, config):
     candidates = _cluster_observations(observations, config)
     selection = _select_triple(candidates, image.shape[1], config)
     if selection is None:
-        return None
+        # 不满足三环共线时**不丢弃**，各自报各自的环：把聚出来的候选全部输出，
+        # 按 x 升序（与参考环心顺序一致）。因为没有共线关系，方向无从计算，
+        # 所以 yaw / perspective / residual 全部留 None —— 下游据此知道不能判对准。
+        if not candidates:
+            return None
+        ordered = tuple(sorted(candidates, key=lambda item: item.center[0]))
+        support = min(item.support for item in ordered) / 10.0
+        bands = min(item.diameter_bands for item in ordered) / 6.0
+        return {
+            "centers": tuple(
+                tuple(float(v) for v in item.center) for item in ordered),
+            "ellipses": tuple((
+                tuple(float(v) for v in item.ellipse.center),
+                tuple(float(v) for v in item.ellipse.axes),
+                float(item.ellipse.angle_deg),
+            ) for item in ordered),
+            "confidence": min(
+                1.0, 0.55 * min(support, 1.0) + 0.30 * min(bands, 1.0)),
+            "yaw": None,
+            "perspective": None,
+            "residual": None,
+        }
     _, ordered, collinearity, _ = selection
     spacing_12 = float(np.linalg.norm(ordered[1].center - ordered[0].center))
     spacing_23 = float(np.linalg.norm(ordered[2].center - ordered[1].center))
@@ -493,19 +514,28 @@ class RingStationDetector:
             )
 
         config = self.config
-        self._tracking_roi = self._make_roi(raw, frame.shape)
-        # 2. 置信度、仿射残差和透视比例共同决定能否累计稳定帧。
+        count = len(raw["centers"])
+        # ⚠ 单环时**绝不能收窄 ROI**：ROI 一旦缩到那一个环周围，后续每帧就只搜那一小块，
+        #   另外两个环永远进不了搜索范围 —— 三环会被永久锁死成单环。
+        #   所以只有凑齐三环时才启用局部跟踪，单环仍然每帧全图搜索。
+        if count >= 3:
+            self._tracking_roi = self._make_roi(raw, frame.shape)
+        # 2. 只有**三环共线**这条路径才做完整质量门槛（置信度 / 仿射残差 / 透视比）。
+        #    不共线或单环时这三项都无从评估：置信度只能由 support/bands 得出（最高 0.85），
+        #    拿 0.9 的线去卡会每帧都被判"置信度不足"，稳定窗口永远填不满 ——
+        #    表现就是"能画出圆，但永远 STABLE=False"，等于白检。
         quality_detail = None
-        if raw["confidence"] < config.minimum_confidence:
-            quality_detail = "三圆环识别置信度不足"
-        elif raw["residual"] > config.maximum_affine_residual:
-            quality_detail = "局部仿射模型残差过大"
-        elif not (
-            config.perspective_ratio_range[0]
-            <= raw["perspective"]
-            <= config.perspective_ratio_range[1]
-        ):
-            quality_detail = "圆环透视比超出标定适用范围"
+        if raw["yaw"] is not None and count >= 3:
+            if raw["confidence"] < config.minimum_confidence:
+                quality_detail = "三圆环识别置信度不足"
+            elif raw["residual"] > config.maximum_affine_residual:
+                quality_detail = "局部仿射模型残差过大"
+            elif not (
+                config.perspective_ratio_range[0]
+                <= raw["perspective"]
+                <= config.perspective_ratio_range[1]
+            ):
+                quality_detail = "圆环透视比超出标定适用范围"
 
         if quality_detail is not None:
             self._samples.clear()
@@ -514,18 +544,25 @@ class RingStationDetector:
                 confidence=raw["confidence"],
                 centers_px=raw["centers"],
                 ellipses=raw["ellipses"],
-                station_yaw_deg=raw["yaw"],
-                affine_residual=raw["residual"],
-                perspective_ratio=raw["perspective"],
+                station_yaw_deg=(raw["yaw"] if raw["yaw"] is not None
+                                 else config.reference_yaw_deg),
+                affine_residual=(raw["residual"] if raw["residual"] is not None
+                                 else math.inf),
+                perspective_ratio=(raw["perspective"]
+                                   if raw["perspective"] is not None
+                                   else math.inf),
                 processing_ms=elapsed_ms,
                 detection_scope=scope,
                 detail=quality_detail,
             )
 
+        # 可见环数一变，稳定窗口要重来（1 环和 3 环的中值不能混算）。
+        if self._samples and len(self._samples[-1]["centers"]) != count:
+            self._samples.clear()
         self._samples.append(raw)
         # 连续帧中，每个圆心的X/Y分别取中值；坐标单位为原图像素。
         centers = []
-        for ring_index in range(3):
+        for ring_index in range(count):
             xs = [sample["centers"][ring_index][0] for sample in self._samples]
             ys = [sample["centers"][ring_index][1] for sample in self._samples]
             centers.append((float(np.median(xs)), float(np.median(ys))))
@@ -533,7 +570,7 @@ class RingStationDetector:
 
         maximum_jitter = 0.0
         for sample in self._samples:
-            for ring_index in range(3):
+            for ring_index in range(count):
                 dx = sample["centers"][ring_index][0] - centers[ring_index][0]
                 dy = sample["centers"][ring_index][1] - centers[ring_index][1]
                 maximum_jitter = max(maximum_jitter, math.hypot(dx, dy))
@@ -541,24 +578,51 @@ class RingStationDetector:
             len(self._samples) == config.stable_frame_count
             and maximum_jitter <= config.maximum_center_jitter_px
         )
-        yaw_errors = [
-            _normalize_angle(sample["yaw"] - config.reference_yaw_deg)
-            for sample in self._samples
-        ]
-        angle_error = float(np.median(yaw_errors))
-        yaw = _normalize_angle(config.reference_yaw_deg + angle_error)
+        # 单环没有方向可言：航向误差记 0 但不可信（within_tolerance 会因 count<2 恒为 False）。
+        if raw["yaw"] is None:
+            angle_error = 0.0
+            yaw = config.reference_yaw_deg
+        else:
+            yaw_errors = [
+                _normalize_angle(sample["yaw"] - config.reference_yaw_deg)
+                for sample in self._samples
+            ]
+            angle_error = float(np.median(yaw_errors))
+            yaw = _normalize_angle(config.reference_yaw_deg + angle_error)
 
         affine = np.asarray(config.image_to_station_affine)
         # 图像像素偏差乘2x2标定矩阵，得到工位平面上的毫米偏差。
+        # 三环共线时按顺序对参考环心（中间那个就是环 2）。
+        # 不共线 / 单环时不知道每个环是第几号，逐个按"离哪个参考环心最近"配对；
+        # error 取"最像环 2 的那个"，否则环 2 会被拿去和环 1 的参考比，平白差 150mm。
+        if raw["yaw"] is not None and count >= 3:
+            references = config.reference_centers_px
+            error_index = 1
+        else:
+            references = tuple(
+                config.reference_centers_px[int(np.argmin([
+                    float(np.linalg.norm(
+                        np.asarray(center) - np.asarray(reference)))
+                    for reference in config.reference_centers_px
+                ]))]
+                for center in centers
+            )
+            distances = [
+                float(np.linalg.norm(
+                    np.asarray(center) - np.asarray(config.reference_centers_px[1])))
+                for center in centers
+            ]
+            error_index = int(np.argmin(distances))
         metric_errors = []
-        for center, reference in zip(centers, config.reference_centers_px):
+        for center, reference in zip(centers, references):
             pixel_error = np.asarray(center) - np.asarray(reference)
             metric_errors.append(affine @ pixel_error)
         metric_errors = tuple(metric_errors)
-        error_x, error_y = (float(v) for v in metric_errors[1])
+        error_x, error_y = (float(v) for v in metric_errors[error_index])
         position_error = max(float(np.linalg.norm(error)) for error in metric_errors)
         within = bool(
             stable
+            and raw["yaw"] is not None   # 没有方向（不共线/单环）就不能判"对准"
             and position_error <= config.maximum_position_error_mm
             and abs(angle_error) <= config.maximum_angle_error_deg
         )
@@ -570,6 +634,8 @@ class RingStationDetector:
             )
         if not stable:
             detail = f"等待稳定观测（{len(self._samples)}/{config.stable_frame_count}）"
+        elif raw["yaw"] is None:
+            detail = f"见到 {count} 个环但不共线：位置可用，但航向未知，不能判对准"
         elif within:
             detail = "工位视觉残差已达到验收精度"
         else:
@@ -588,8 +654,12 @@ class RingStationDetector:
             correction_body_x_mm=None if correction is None else float(correction[0]),
             correction_body_y_mm=None if correction is None else float(correction[1]),
             correction_yaw_deg=None if correction is None else float(correction[2]),
-            affine_residual=float(np.median([s["residual"] for s in self._samples])),
-            perspective_ratio=float(np.median([s["perspective"] for s in self._samples])),
+            affine_residual=float(np.median([
+                s["residual"] for s in self._samples
+                if s["residual"] is not None] or [math.inf])),
+            perspective_ratio=float(np.median([
+                s["perspective"] for s in self._samples
+                if s["perspective"] is not None] or [math.inf])),
             within_tolerance=within,
             processing_ms=elapsed_ms,
             detection_scope=scope,
@@ -624,9 +694,11 @@ def draw_ring_station_detection(frame, result: RingStationDetection):
     cv2.rectangle(frame, (10, 65), (820, 145), (0, 0, 0), -1)
     cv2.putText(
         frame,
+        f"Rings={len(result.centers_px)}  "
         f"Ring: {'STABLE' if result.stable else 'WAITING'}  "
         f"dX={result.error_x_mm:+.2f}mm dY={result.error_y_mm:+.2f}mm "
-        f"dYaw={result.angle_error_deg:+.2f}deg",
+        f"dYaw={result.angle_error_deg:+.2f}deg"
+        f"{'  (single ring: yaw n/a)' if len(result.centers_px) < 2 else ''}",
         (20, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.66,
         (80, 255, 80) if result.within_tolerance else (255, 255, 255),
         2, cv2.LINE_AA,

@@ -10,6 +10,10 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Pose2D.msg"
+  "msg/VisionMaterial.msg"
+  "msg/VisionRing.msg"
+  "msg/VisionTaskCode.msg"
+  "msg/VisionTurntable.msg"
 )
 
 ament_export_dependencies(rosidl_default_runtime)
