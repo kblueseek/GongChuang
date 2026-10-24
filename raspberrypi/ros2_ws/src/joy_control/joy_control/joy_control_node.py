@@ -44,6 +44,7 @@
 【两种模式通用】
   start 按一下      → 使能 / 失能（切换）
   B 按一下          → 立即失能（安全键）
+  R1 按一下         → 底盘归位（回坐标原点，保持当前航向）
   左 / 右方向键     → 补光灯亮度 + / -
   上 / 下方向键     → 摄像头舵机 ↑ / ↓
 
@@ -53,11 +54,15 @@
 坐标系约定：车正前方 +x（前进），左侧 +y（左平移），逆时针 +wz（左转）。
 """
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool, Float32MultiArray, Int32
+from nav_msgs.msg import Odometry
+from car_interfaces.msg import Pose2D
 
 
 class JoyControlNode(Node):
@@ -89,11 +94,11 @@ class JoyControlNode(Node):
         self.declare_parameter('btn_y', 3)            # 云台 Z 轴上升
         self.declare_parameter('btn_a', 0)            # 云台 Z 轴下降
         self.declare_parameter('btn_l1', 4)           # 载物盘顺时针（云台模式）
-        self.declare_parameter('btn_r1', 5)           # 预留（当前不用）
+        self.declare_parameter('btn_r1', 5)           # 底盘归位（回坐标原点）
 
         # ================= 方向系数（反了改 ±1，不用动别的） =================
-        self.declare_parameter('dir_linear', -1.0)    # 左摇杆推上(-1) = 前进
-        self.declare_parameter('dir_strafe', 1.0)     # 右摇杆推右(+1) = 右移
+        self.declare_parameter('dir_linear', 1.0)     # 左摇杆推上(-1) = 前进（实测 +Vx 是后退，故取 +1）
+        self.declare_parameter('dir_strafe', 1.0)     # 右摇杆推右(+1) = 右移（实测 +Vy 与直觉相反，取 +1 翻转）
         self.declare_parameter('dir_turn', 1.0)       # L2 = 左转(+wz)，R2 = 右转(-wz)
         self.declare_parameter('dir_yaw', 1.0)        # 左摇杆推右 = yaw 增
         self.declare_parameter('dir_extend', -1.0)    # 右摇杆推上(-1) = extend 增
@@ -104,8 +109,8 @@ class JoyControlNode(Node):
         # ================= 运动/步进参数 =================
         self.declare_parameter('max_vx', 1.0)             # 前进满量程 m/s
         self.declare_parameter('max_vy', 1.0)             # 平移满量程 m/s
-        self.declare_parameter('turn_wz', 1.0)            # L2/R2 转向角速度 rad/s
-        self.declare_parameter('deadzone', 0.08)          # 摇杆死区
+        self.declare_parameter('turn_wz', 0.3)            # L2/R2 转向角速度 rad/s（≈17°/s，太快容易转过头）
+        self.declare_parameter('deadzone', 0.0)           # 摇杆死区（摇杆本身自带死区，这里不再加）
         self.declare_parameter('led_step', 20)            # 补光灯每按一下增减 %
         self.declare_parameter('gimbal_step_deg', 2.0)    # 云台每 tick 步进 °
         self.declare_parameter('servo_step_deg', 5.0)     # 载物盘每 tick 步进 °
@@ -164,9 +169,11 @@ class JoyControlNode(Node):
         self._pub_led = self.create_publisher(Int32, '/cmd_led', 10)
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
         self._pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)
+        self._pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)
 
         # ================= 订阅 =================
         self.create_subscription(Joy, '/joy', self._cb_joy, 10)
+        self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
 
         # ================= 内部状态 =================
         self._axes = [0.0] * 8                 # 最新轴值
@@ -180,6 +187,9 @@ class JoyControlNode(Node):
         self._gimbal = [0.0, 0.0, 0.0]         # 云台目标 [yaw, lift, extend] °
         self._servo = [90.0, 0.0, 90.0]        # 舵机目标 [夹爪, 载物盘, 摄像头] °
         self._gripper_closed = False           # 夹爪是否处于"夹紧"档
+        self._yaw = 0.0                        # 当前航向 rad（来自 /odom，归位时保持航向用）
+        self._homing = False                   # 是否正在底盘归位（归位期间持续发 POSE，不发 VEL）
+        self._home_yaw = 0.0                   # 归位时锁存的航向，防止归位过程中被 /odom 带着转
 
         # 定时器：10Hz 持续发运动/步进指令（摇杆回中发 0，避免车保持最后速度）
         self._timer = self.create_timer(0.1, self._tick)
@@ -222,6 +232,11 @@ class JoyControlNode(Node):
         )
 
     # ---------------- 摇杆/按键回调 ----------------
+
+    def _cb_odom(self, msg: Odometry):
+        """收到 /odom：只记航向（从朝向四元数取绕 Z 轴的 yaw），归位时用来保持朝向。"""
+        q = msg.pose.pose.orientation
+        self._yaw = 2.0 * math.atan2(q.z, q.w)
 
     def _cb_joy(self, msg: Joy):
         """收到 /joy：记录轴值、做按键和方向键的上升沿检测（只触发一次）。"""
@@ -322,6 +337,21 @@ class JoyControlNode(Node):
             self.get_logger().info(
                 f'夹爪 -> {"夹紧" if self._gripper_closed else "松开"} ({self._servo[0]:.0f}°)'
             )
+        elif i == self.btn_r1:
+            # 底盘归位：走 F407 位置闭环回到坐标原点 (0,0)，保持当前航向不转。
+            if self._mode != 'drive':
+                self.get_logger().info('R1 归位只在运动模式生效')
+            elif not self._enabled:
+                self.get_logger().warn('未使能，R1 归位无效，先按 start 使能')
+            else:
+                self._homing = not self._homing
+                if self._homing:
+                    self._home_yaw = self._yaw
+                    self.get_logger().info(
+                        f'归位 -> 原点(0,0)，保持航向 {math.degrees(self._home_yaw):.1f}°'
+                    )
+                else:
+                    self.get_logger().info('取消归位')
 
     # ---------------- 定时器：运动/云台 ----------------
 
@@ -334,8 +364,21 @@ class JoyControlNode(Node):
     def _tick_drive(self):
         """运动模式：左摇杆上下→vx，右摇杆左右→vy，L2/R2→左右转。"""
         if not self._enabled:                     # 未使能时只发 0，绝不输出速度
+            self._homing = False
             self._pub_vel.publish(Twist())
             return
+        # 归位期间：持续发 POSE（不发 VEL，否则 VEL 会清掉 F407 的位置目标）。
+        # 摇杆或 L2/R2 有输入就退出归位，恢复手动。
+        if self._homing:
+            moving = (abs(self._axis(self.axis_linear)) > 0.01
+                      or abs(self._axis(self.axis_strafe)) > 0.01
+                      or self._l2() or self._r2())
+            if moving:
+                self._homing = False
+                self.get_logger().info('有摇杆输入，退出归位')
+            else:
+                self._pub_pose.publish(Pose2D(x=0.0, y=0.0, theta=self._home_yaw))
+                return
         vx = self.dir_linear * self._axis(self.axis_linear) * self.max_vx
         vy = self.dir_strafe * self._axis(self.axis_strafe) * self.max_vy
         wz = 0.0
