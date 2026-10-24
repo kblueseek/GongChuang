@@ -49,9 +49,17 @@ from std_msgs.msg import Bool, Int32MultiArray
 
 # luma.oled 是树莓派上常用的 OLED 驱动库。没装也不让它把节点搞崩——只打日志、不显示。
 try:
+    import smbus2
     from luma.core.interface.serial import i2c
-    from luma.oled.device import ssd1306, ssd1315, sh1106
+    from luma.oled.device import ssd1306, sh1106
+    # 新版 luma.oled（3.x）没有独立的 ssd1315 模块。SSD1315 与 SSD1306 寄存器兼容，
+    # 找不到就复用 ssd1306 —— 不能因为一个名字缺失就让整个 import 失败、误报"缺库"。
+    try:
+        from luma.oled.device import ssd1315
+    except ImportError:
+        ssd1315 = ssd1306
 except ImportError:
+    smbus2 = None
     i2c = None
     ssd1306 = ssd1315 = sh1106 = None
 
@@ -92,8 +100,8 @@ class StatusDisplayNode(Node):
         self._small = None
         if i2c is None or Image is None:
             self.get_logger().error(
-                '缺少 luma.oled / Pillow，屏幕不可用。请安装：'
-                'sudo apt install python3-luma.oled python3-pil'
+                '缺少 luma.oled / Pillow / smbus2，屏幕不可用。请安装：'
+                'sudo apt install python3-luma.oled python3-pil python3-smbus'
             )
         else:
             try:
@@ -103,8 +111,16 @@ class StatusDisplayNode(Node):
                 controller = {'ssd1306': ssd1306, 'ssd1315': ssd1315, 'sh1106': sh1106}.get(name)
                 if controller is None:
                     raise ValueError(f'不认识的屏幕型号 {name}')
-                serial = i2c(port=port, address=address)
-                self._device = controller(serial, width=self._width, height=self._height)
+                # 自己开 smbus2 总线再传给 luma：这样 luma 走"非托管"模式，
+                # 显示数据按 32 字节分块写。本机 RP1 的 I2C 单次 i2c_rdwr
+                # 超过约 128 字节会回 EREMOTEIO，整页 128B 一次发必然失败。
+                bus = smbus2.SMBus(port)
+                try:
+                    serial = i2c(bus=bus, address=address)
+                    self._device = controller(serial, width=self._width, height=self._height)
+                except Exception:
+                    bus.close()
+                    raise
                 self._font = self._load_font(max(9, self._height // 6))
                 self._small = self._load_font(max(7, self._height // 8))
                 self.get_logger().info(

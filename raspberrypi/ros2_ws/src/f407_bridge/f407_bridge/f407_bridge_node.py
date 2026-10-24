@@ -102,6 +102,10 @@ class F407BridgeNode(Node):
         self._last_rx_s = 0.0          # 最近一次收到 F407 回传的时间
         self._last_online = None       # 上一次发布的在线状态（避免重复打印日志）
         self._last_ble = None
+        # 记住最新的使能状态，心跳时一起重发。使能话题只在按键时来一次，
+        # 那一帧如果赶上蓝牙没连上（或丢包）就被丢掉了，F407 会永远停在
+        # "未使能"——表现正是"蓝牙连着，但摇杆怎么推车都不动"。
+        self._enable_state = False
 
         self.get_logger().info(f'桥接节点就绪：上行={type(self._up).__name__}，下行={self._down.device}')
 
@@ -163,8 +167,9 @@ class F407BridgeNode(Node):
             self._up.send_cam(msg.data[2])
 
     def _cb_cmd_enable(self, msg: Bool):
-        """收到 /cmd_enable：整车使能/失能。"""
-        self._up.send_enable(bool(msg.data))
+        """收到 /cmd_enable：整车使能/失能（状态由心跳周期重发，见 _on_heartbeat）。"""
+        self._enable_state = bool(msg.data)
+        self._up.send_enable(self._enable_state)
 
     def _cb_cmd_pose(self, msg: Pose2D):
         """收到 /cmd_pose：把目标位姿发给 F407，位置+航向闭环在 F407 上执行。"""
@@ -193,8 +198,13 @@ class F407BridgeNode(Node):
     # ---------------- 定时器回调 ----------------
 
     def _on_heartbeat(self):
-        """5Hz 心跳：告诉 F407 "树莓派还在"，否则它 500ms 就自主失能。"""
+        """5Hz 心跳：告诉 F407 "树莓派还在"，否则它 500ms 就自主失能。
+
+        顺便重发当前使能状态：F407 上电/掉线恢复后是失能的，使能帧只在按键时
+        发一次，晚到的重连会让那一帧永远补不上。周期重发等于给使能状态买了保险。
+        """
         self._up.send_heartbeat()
+        self._up.send_enable(self._enable_state)
 
     def _on_poll(self):
         """20Hz 从 LoRa 串口收数据，可能一次收到多帧。"""
@@ -220,7 +230,7 @@ class F407BridgeNode(Node):
             if online:
                 self.get_logger().info('F407 回传正常（LoRa 链路通了）')
             else:
-                self.get_logger().warn('F407 无回传：检查 LoRa 供电/波特率/接线')
+                self.get_logger().warning('F407 无回传：检查 LoRa 供电/波特率/接线')
         if ble != self._last_ble:
             self._last_ble = ble
             err = getattr(self._up, 'last_error', '')

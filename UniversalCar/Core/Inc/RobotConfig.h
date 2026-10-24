@@ -98,7 +98,10 @@ enum
    下行：F407 --LoRa--> 树莓派（UART4 / PC10=TX PC11=RX，只发不收） */
 #define BLE_UPLINK_ENABLE    1      /* 1=USART2 作为 PiComm 指令上行 0=关闭 */
 #define LORA_DOWNLINK_ENABLE 1      /* 1=UART4 作为 PiComm 遥测下行 0=关闭（回落 USART6 有线） */
-#define LORA_UART_BAUD       115200 /* 必须与两块 LoRa 模组的串口波特率一致（本项目实测 115200） */
+/* 必须与两块 LoRa 模组的串口波特率一致（本项目实测 115200）。
+   ⚠️ 改这个宏之后，如果再从 CubeMX 重新生成代码，usart.c 里那行会被 .ioc 的值覆盖回去，
+   所以 .ioc 的 UART4.BaudRate 必须同步改（当前已设为 115200）。 */
+#define LORA_UART_BAUD       115200
 
 #define PI_CMD_TIMEOUT_MS   500     /* 超过此时长收不到指令 → 底盘停车、云台保持 */
 

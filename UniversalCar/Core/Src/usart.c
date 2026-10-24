@@ -49,7 +49,7 @@ void MX_UART4_Init(void)
 
   /* USER CODE END UART4_Init 1 */
   huart4.Instance = UART4;
-  huart4.Init.BaudRate = LORA_UART_BAUD;   /* LoRa 透明传输：必须与模组串口波特率一致 */
+  huart4.Init.BaudRate = LORA_UART_BAUD;   /* LoRa 透明传输：必须与模组串口波特率一致（115200） */
   huart4.Init.WordLength = UART_WORDLENGTH_8B;
   huart4.Init.StopBits = UART_STOPBITS_1;
   huart4.Init.Parity = UART_PARITY_NONE;
@@ -224,8 +224,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
     __HAL_RCC_GPIOC_CLK_ENABLE();
     /**UART4 GPIO Configuration
-    PC10     ------> UART4_TX   (接 LoRa 模组 RXD)
-    PC11     ------> UART4_RX   (接 LoRa 模组 TXD，当前不用，留作扩展)
+    PC10     ------> UART4_TX
+    PC11     ------> UART4_RX
     */
     GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -234,10 +234,9 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     GPIO_InitStruct.Alternate = GPIO_AF8_UART4;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* UART4 interrupt Init（中断方式发送遥测，不阻塞任务） */
+    /* UART4 interrupt Init */
     HAL_NVIC_SetPriority(UART4_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(UART4_IRQn);
-
   /* USER CODE BEGIN UART4_MspInit 1 */
 
   /* USER CODE END UART4_MspInit 1 */
@@ -425,7 +424,6 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 
     /* UART4 interrupt Deinit */
     HAL_NVIC_DisableIRQ(UART4_IRQn);
-
   /* USER CODE BEGIN UART4_MspDeInit 1 */
 
   /* USER CODE END UART4_MspDeInit 1 */
@@ -576,6 +574,20 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         uart1_tx_err_cnt++;
     else if (huart->Instance == UART4)
         PiComm_ErrorCallback();
+    else if (huart->Instance == USART2)
+    {
+        /* 蓝牙上行：溢出（ORE）会让 HAL 中止接收并关掉 RXNEIE。如果只清标志不重新
+           挂接收，USART2 从此一个字节都收不到——表现为"蓝牙连着，但车完全不动"。
+           ORE 必须按 SR→DR 的顺序读一次才清得掉，否则重新使能中断会立刻再触发。 */
+        if ((huart->ErrorCode & HAL_UART_ERROR_ORE) != RESET)
+        {
+            __HAL_UART_CLEAR_OREFLAG(huart);
+            huart->ErrorCode = HAL_UART_ERROR_NONE;
+#if BLE_UPLINK_ENABLE || BLE_CONTROL_ENABLE
+            HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
+#endif
+        }
+    }
 }
 
 /* USER CODE END 1 */

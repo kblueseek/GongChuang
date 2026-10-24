@@ -232,7 +232,7 @@ class MotionPlannerNode(Node):
         elif name == 'comment':       # 注释，跳过
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 注释: {cmd.get("text", "")}')
         else:
-            self.get_logger().warn(f'未知指令被跳过: {cmd}')
+            self.get_logger().warning(f'未知指令被跳过: {cmd}')
 
     def _calibrate(self):
         """视觉校准占位：以后在这里接入"圆环在画面中的位置 -> 修正 tx/ty/tyaw"。

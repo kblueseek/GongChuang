@@ -26,7 +26,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'uplink': 'ble',
-                'ble_address': '',           # 留空自动扫描；知道 MAC 就填上，启动更快
+                'ble_address': '36:10:00:38:45:F2',  # 已固定 MAC，免现场扫描
                 'ble_name': '',              # 也可以按名字模糊匹配，例如 'JDY'
                 'downlink': 'lora',
                 'lora_device': '/dev/ttyAMA2',

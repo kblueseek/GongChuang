@@ -68,6 +68,7 @@ def main() -> None:
     last_hb = 0.0
     last_vel = 0.0
     last_warn = 0.0
+    enable_sent = 0
     try:
         while True:
             now = time.monotonic()
@@ -92,6 +93,11 @@ def main() -> None:
                         print("[..] 还没连上蓝牙，扫到的设备：")
                         print(up.last_scan_report)
                     up.send_heartbeat()
+                # 连上后先补发几次使能：F407 必须 EnableMask 全置位才驱动轮子，
+                # 只发速度不发使能，轮子是不会动的（命令幂等，多收无副作用）。
+                if args.vel and up.connected and enable_sent < 3:
+                    up.send_enable(True)
+                    enable_sent += 1
                 if args.vel and now - last_vel >= 0.1:
                     last_vel = now
                     up.send_vel(args.vel[0], args.vel[1], args.vel[2])
@@ -106,6 +112,12 @@ def main() -> None:
         print("\n退出")
     finally:
         if up is not None:
+            if args.vel:
+                try:
+                    up.send_vel(0.0, 0.0, 0.0)   # 先停车
+                    up.send_enable(False)        # 再失能
+                except Exception:
+                    pass
             up.close()
         down.close()
 
