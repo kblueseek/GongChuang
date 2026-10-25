@@ -19,6 +19,10 @@
   move     {"cmd":"move",   "dist_m":0.5}      前进(负=后退)
   strafe   {"cmd":"strafe", "dist_m":0.3}      横向平移(正=左)
   turn     {"cmd":"turn",   "deg":90}          原地转(正=逆时针/左转，负=右转)
+  goto     {"cmd":"goto",   "x_m":1.2, "y_m":-0.3, "yaw_deg":45}
+                                               绝对位姿(里程计世界系，米/度)。
+                                               雷达地图导航就用它：上位机把规划出的
+                                               场地路点换算成里程计坐标后下发
   gimbal   {"cmd":"gimbal", "yaw_deg":-30, "lift_deg":50}  云台轴角度(可缺省)
   gripper  {"cmd":"gripper","deg":45}          夹爪舵机
   plate    {"cmd":"plate",  "deg":90}          载物盘舵机
@@ -49,11 +53,15 @@ class MotionPlannerNode(Node):
         # 到位判定阈值：位置误差 < 2cm，朝向误差 < 0.05rad(约3°)
         self.declare_parameter('arrive_tol_xy', 0.02)     # 米
         self.declare_parameter('arrive_tol_yaw', 0.05)    # 弧度
+        # 单个走/转/去指令最多等多久。到位判据很严（2cm/3°），F407 超调后
+        # 可能来回摆很久；不设上限的话状态机会永远卡在这一条。
+        self.declare_parameter('arrive_timeout_s', 20.0)  # 秒
         # 启动时自动加载的序列文件路径（空 = 不加载，等上位机下发）
         self.declare_parameter('sequence_file', '')
 
         self.arrive_tol_xy = float(self.get_parameter('arrive_tol_xy').value)
         self.arrive_tol_yaw = float(self.get_parameter('arrive_tol_yaw').value)
+        self.arrive_timeout_s = float(self.get_parameter('arrive_timeout_s').value)
         sequence_file = str(self.get_parameter('sequence_file').value)
 
         # ---- 发布的话题（本节点 -> 其他节点） ----
@@ -62,6 +70,10 @@ class MotionPlannerNode(Node):
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)      # 云台 [yaw,lift,extend]
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)                   # 使能
         self._pub_state = self.create_publisher(String, '/motion_state', 10)                # 进度状态(给上位机/屏幕看)
+        # 控制权占用标志：True 期间手柄（joy_control）除失能键外全部让位。
+        # 跑序列时按 10Hz 心跳重复发，手柄那边超时 0.6s 没收到就自动恢复手动，
+        # 避免本节点崩溃后把手柄永久锁死。
+        self._pub_active = self.create_publisher(Bool, '/motion_active', 10)
 
         # ---- 订阅的话题（其他节点 -> 本节点） ----
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)          # 里程计：判断到位
@@ -74,6 +86,7 @@ class MotionPlannerNode(Node):
         self.index = -1             # 当前执行到第几条（-1 = 还没开始）
         self.phase = 'idle'         # 状态机状态：idle/moving/waiting/stepping
         self.deadline = 0.0         # delay 指令的到期时间
+        self.move_deadline = 0.0    # 本条走/转/去指令的超时时间
 
         # 绝对位姿目标（世界系）：从"当前里程计"出发，逐条指令累计
         self.tx = 0.0
@@ -106,10 +119,15 @@ class MotionPlannerNode(Node):
         self._load_json(msg.data)
 
     def _cb_stop(self, msg: Bool):
-        """上位机叫停：停在原地（把当前位置设为目标=锁定），状态机回到 idle。"""
-        if bool(msg.data):
+        """上位机叫停 / 手柄 B 键强制停：停在原地（把当前位置设为目标=锁定），状态机回到 idle。
+
+        已经停了就直接返回：手柄 B 键和上位机 stop 可能连着来，
+        重复处理会多发一次 POSE。
+        """
+        if bool(msg.data) and self.phase != 'idle':
             self.phase = 'idle'
             self.index = -1
+            self._pub_active.publish(Bool(data=False))   # 交还控制权给手柄
             self._publish_state('已停止')
             # 把当前位置设为目标位姿发给 F407，让它"锁"在原地不动
             if self.odom is not None:
@@ -151,6 +169,7 @@ class MotionPlannerNode(Node):
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
         self.index = -1
         self.phase = 'stepping'                     # 进入执行循环
+        self._pub_active.publish(Bool(data=True))   # 立刻占控制权，别等到第一个 _tick
         self._publish_state('开始执行')
 
     # ---------------- 状态机主循环 ----------------
@@ -159,8 +178,15 @@ class MotionPlannerNode(Node):
         """每 0.1 秒调一次，推进状态机。"""
         if self.phase == 'idle':
             return
+        self._pub_active.publish(Bool(data=True))   # 占用控制权心跳（手柄靠它判断要不要让位）
         if self.phase == 'moving':
             if not self._arrived():      # 还没到位，继续等
+                if self.move_deadline and self._now() > self.move_deadline:
+                    self._abort_timeout()   # 超时：锁定当前位置，交还控制权
+                    return
+                # 周期重发目标位姿：F407 收到任何 VEL 帧都会清掉 PosTarget.Valid，
+                # 重发能保证偶发的速度帧（比如 B 键失能那一帧）不会让闭环中断。
+                self._publish_pose(self.tx, self.ty, self.tyaw)
                 return
             self.phase = 'stepping'      # 到位了，去取下一条
         elif self.phase == 'waiting':
@@ -175,6 +201,11 @@ class MotionPlannerNode(Node):
                 self._finish()
                 return
             self._execute(self.commands[self.index])
+            if self.phase == 'moving':
+                # 从这一条开始计时。到位后 phase 变 stepping，下一条重新计时。
+                self.move_deadline = self._now() + self.arrive_timeout_s
+            else:
+                self.move_deadline = 0.0
 
     def _execute(self, cmd: dict):
         """执行一条指令。返回后 self.phase 会是：
@@ -201,6 +232,17 @@ class MotionPlannerNode(Node):
             self.tyaw += d
             self._publish_pose(self.tx, self.ty, self.tyaw)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 转向 {cmd.get("deg", 0):+.0f}°')
+            self.phase = 'moving'
+        elif name == 'goto':          # 绝对位姿（里程计世界系，米/度）
+            self.tx = float(cmd.get('x_m', self.tx))
+            self.ty = float(cmd.get('y_m', self.ty))
+            if cmd.get('yaw_deg') is not None:
+                self.tyaw = math.radians(float(cmd['yaw_deg']))
+            self._publish_pose(self.tx, self.ty, self.tyaw)
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 去 '
+                f'({self.tx:+.2f},{self.ty:+.2f})m '
+                f'{math.degrees(self.tyaw):+.0f}°')
             self.phase = 'moving'
         elif name == 'delay':         # 原地等待
             self.deadline = self._now() + float(cmd.get('ms', 0)) / 1000.0
@@ -239,6 +281,23 @@ class MotionPlannerNode(Node):
         现在什么都不做，仅打一条日志。"""
         self.get_logger().info('视觉校准：占位实现，待接入圆环识别')
 
+    def _abort_timeout(self):
+        """一条走/转/去指令超时：别让状态机永远卡住（比如车被顶住、轮子打滑）。
+
+        把当前位置设成目标位姿，让 F407 原地锁住，然后交还控制权给手柄。
+        剩下的指令不再执行——半路停下比硬着头皮跑完安全。
+        """
+        self.phase = 'idle'
+        self.index = -1
+        self.move_deadline = 0.0
+        if self.odom is not None:
+            self.tx, self.ty, self.tyaw = self.odom
+            self._publish_pose(self.odom[0], self.odom[1], self.odom[2])
+        self._pub_active.publish(Bool(data=False))
+        self._publish_state(f'超时停止：{self.arrive_timeout_s:.0f}s 没到位')
+        self.get_logger().warning(
+            f'指令超时（>{self.arrive_timeout_s:.0f}s 未到位），已停止并交还手柄')
+
     # ---------------- 工具函数 ----------------
 
     def _arrived(self) -> bool:
@@ -270,6 +329,7 @@ class MotionPlannerNode(Node):
 
     def _finish(self):
         self.phase = 'idle'
+        self._pub_active.publish(Bool(data=False))       # 交还控制权给手柄
         self._publish_state('全部完成')
 
     @staticmethod

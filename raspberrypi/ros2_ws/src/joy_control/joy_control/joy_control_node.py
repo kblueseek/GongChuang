@@ -48,6 +48,17 @@
   左 / 右方向键     → 补光灯亮度 + / -
   上 / 下方向键     → 摄像头舵机 ↑ / ↓
 
+================ 上位机控制权（和 motion_planner 分离） ================
+motion_planner 跑序列时会以 10Hz 在 /motion_active 上置 True，表示"上位机在开车"。
+这期间本节点**除了 B（立即失能停机）以外，一个指令都不发**：不发光速、不发云台、
+不发舵机、不发补光灯、按键也不响应。这样两套控制逻辑完全隔离，不会互相抢。
+  · 上位机点"■ 停止"或序列跑完 → /motion_active 置 False，手柄立刻恢复。
+  · 按 B → 失能 + 停序列 + 交还控制权，之后按 start 可重新使能手动开。
+  · 上位机崩溃/断线时 /motion_active 心跳会停，本节点 0.6s 后自动恢复手柄控制，
+    不会被永久锁死。
+  · 摇杆回中时本节点不发任何 VEL（只在松手瞬间补一帧零速），
+    否则周期零速帧会清掉 F407 的位置目标（PiComm.c 收到 VEL 就清 PosTarget.Valid）。
+
 方向反了不用改代码，用参数翻（例：左摇杆推上其实是后退就改成 1.0）：
   ros2 run joy_control joy_control_node --ros-args -p dir_linear:=1.0
 
@@ -55,6 +66,7 @@
 """
 
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -170,10 +182,15 @@ class JoyControlNode(Node):
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
         self._pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)
         self._pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)
+        self._pub_motion_stop = self.create_publisher(Bool, '/motion_stop', 10)
 
         # ================= 订阅 =================
         self.create_subscription(Joy, '/joy', self._cb_joy, 10)
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
+        # 使能状态以 /cmd_enable 为准（上位机/状态机也会发），避免两边各记一份、互相打架
+        self.create_subscription(Bool, '/cmd_enable', self._cb_enable, 10)
+        # 上位机是否正在跑序列：True 期间手柄只留 B（失能）可用
+        self.create_subscription(Bool, '/motion_active', self._cb_motion_active, 10)
 
         # ================= 内部状态 =================
         self._axes = [0.0] * 8                 # 最新轴值
@@ -190,8 +207,11 @@ class JoyControlNode(Node):
         self._yaw = 0.0                        # 当前航向 rad（来自 /odom，归位时保持航向用）
         self._homing = False                   # 是否正在底盘归位（归位期间持续发 POSE，不发 VEL）
         self._home_yaw = 0.0                   # 归位时锁存的航向，防止归位过程中被 /odom 带着转
+        self._vel_active = False               # 上一拍是否真的在发非零速度（用来"松手补一帧零速"）
+        self._planner_active = False           # 上位机状态机是否正在跑序列（True 时手柄除 B 外全部让位）
+        self._planner_active_t = 0.0           # 最近一次收到 /motion_active=True 的时刻（做超时自恢复）
 
-        # 定时器：10Hz 持续发运动/步进指令（摇杆回中发 0，避免车保持最后速度）
+        # 定时器：10Hz 推一次（有输入才发速度，见 _tick_drive 的说明）
         self._timer = self.create_timer(0.1, self._tick)
         self.get_logger().info(
             f'joy_control 就绪：layout={self.layout}（收到 /joy 后自动识别 PS2/Xbox 编号）'
@@ -238,6 +258,41 @@ class JoyControlNode(Node):
         q = msg.pose.pose.orientation
         self._yaw = 2.0 * math.atan2(q.z, q.w)
 
+    def _cb_enable(self, msg: Bool):
+        """跟随 /cmd_enable 同步使能状态（自己发的、上位机/状态机发的都走这里）。
+
+        为什么必须同步：状态机序列里可能有 enable 指令，如果本节点不跟随，
+        就会出现"车已使能但手柄以为没使能"（推摇杆不动）或反过来（一按 start
+        反而把车停了）的错位。
+        """
+        en = bool(msg.data)
+        if en == self._enabled:
+            return
+        self._enabled = en
+        if not en:
+            self._homing = False
+            self._release_chassis()    # 被外部失能时补一帧零速，防止残留速度
+        self.get_logger().info(f'使能状态同步 -> {"开" if en else "关"}')
+
+    def _cb_motion_active(self, msg: Bool):
+        """上位机状态机开始/结束跑序列。
+
+        约定：上位机工作时，手柄除了 B（失能）以外一律不响应，
+        两套控制逻辑彻底分开，不会出现"谁抢谁"的问题。
+        上位机发的是 10Hz 心跳，所以这里同时记时间，用来做掉线恢复。
+        """
+        active = bool(msg.data)
+        self._planner_active_t = time.monotonic()
+        if active == self._planner_active:
+            return
+        self._planner_active = active
+        if active:
+            self._homing = False          # 归位让位给上位机
+            self._release_chassis()       # 先补一帧零速，别让残余速度带进上位机控制
+            self.get_logger().info('上位机接管：手柄只保留 B（失能）')
+        else:
+            self.get_logger().info('上位机结束，手柄恢复控制')
+
     def _cb_joy(self, msg: Joy):
         """收到 /joy：记录轴值、做按键和方向键的上升沿检测（只触发一次）。"""
         if self.layout == 'auto':
@@ -264,14 +319,15 @@ class JoyControlNode(Node):
         dy = self._axis_raw(self.axis_dpad_y) * (-1.0 if self.invert_dpad_y else 1.0)
         left, right = dx < -0.5, dx > 0.5
         up, down = dy < -0.5, dy > 0.5
-        if left and not self._prev_dpad['left']:
-            self._led_up()                    # 左方向键：补光灯 +
-        if right and not self._prev_dpad['right']:
-            self._led_down()                  # 右方向键：补光灯 -
-        if up and not self._prev_dpad['up']:
-            self._cam_up()                    # 上方向键：摄像头 ↑
-        if down and not self._prev_dpad['down']:
-            self._cam_down()                  # 下方向键：摄像头 ↓
+        if not self._planner_active:          # 上位机控制中，方向键也不响应
+            if left and not self._prev_dpad['left']:
+                self._led_up()                # 左方向键：补光灯 +
+            if right and not self._prev_dpad['right']:
+                self._led_down()              # 右方向键：补光灯 -
+            if up and not self._prev_dpad['up']:
+                self._cam_up()                # 上方向键：摄像头 ↑
+            if down and not self._prev_dpad['down']:
+                self._cam_down()              # 下方向键：摄像头 ↓
         self._prev_dpad.update(left=left, right=right, up=up, down=down)
 
         self._log_aux_buttons()
@@ -314,22 +370,31 @@ class JoyControlNode(Node):
 
     def _on_button_pressed(self, i: int):
         """某个按键被按下（上升沿），按编号分发。"""
+        # 上位机跑序列期间：手柄只保留 B（失能），其余按键一律不响应
+        if self._planner_active and i != self.btn_b:
+            self.get_logger().info(
+                '上位机控制中，手柄按键不响应（按 B 可失能停机）',
+                throttle_duration_sec=3.0)
+            return
         if i == self.btn_select:
             self._mode = 'gimbal' if self._mode == 'drive' else 'drive'
             if self._mode == 'gimbal':
-                self._pub_vel.publish(Twist())          # 切云台前先让底盘停
+                self._release_chassis()                 # 切云台前先让底盘停
             self.get_logger().info(f'模式 -> {"云台" if self._mode == "gimbal" else "运动"}')
         elif i == self.btn_start:
             self._enabled = not self._enabled
             self._pub_enable.publish(Bool(data=self._enabled))
             if not self._enabled:
-                self._pub_vel.publish(Twist())          # 失能同时停车
+                self._release_chassis()                 # 失能同时停车
             self.get_logger().info('使能' if self._enabled else '失能')
         elif i == self.btn_b:
             self._enabled = False
+            self._homing = False
             self._pub_enable.publish(Bool(data=False))
-            self._pub_vel.publish(Twist())
-            self.get_logger().info('失能（B 安全键）')
+            self._release_chassis()
+            # 上位机正在跑序列时，光失能不够：状态机会一直等"到位"，所以连序列一起停
+            self._pub_motion_stop.publish(Bool(data=True))
+            self.get_logger().info('失能（B 安全键）' + ('，同时停止上位机序列' if self._planner_active else ''))
         elif i == self.btn_x and self._mode == 'gimbal':
             self._gripper_closed = not self._gripper_closed
             self._servo[0] = self.gripper_close_deg if self._gripper_closed else self.gripper_open_deg
@@ -342,10 +407,13 @@ class JoyControlNode(Node):
             if self._mode != 'drive':
                 self.get_logger().info('R1 归位只在运动模式生效')
             elif not self._enabled:
-                self.get_logger().warn('未使能，R1 归位无效，先按 start 使能')
+                self.get_logger().warning('未使能，R1 归位无效，先按 start 使能')
             else:
                 self._homing = not self._homing
                 if self._homing:
+                    self._release_chassis()             # 先停稳，再交给位置闭环
+                    # 归位也是发 /cmd_pose，和 motion_planner 会抢；先让状态机停下
+                    self._pub_motion_stop.publish(Bool(data=True))
                     self._home_yaw = self._yaw
                     self.get_logger().info(
                         f'归位 -> 原点(0,0)，保持航向 {math.degrees(self._home_yaw):.1f}°'
@@ -356,16 +424,40 @@ class JoyControlNode(Node):
     # ---------------- 定时器：运动/云台 ----------------
 
     def _tick(self):
+        # 上位机心跳超时自恢复：状态机崩溃 / 半路退出时不能把手柄永久锁死
+        if self._planner_active and time.monotonic() - self._planner_active_t > 0.6:
+            self._planner_active = False
+            self.get_logger().warning('上位机心跳中断（/motion_active 0.6s 没更新），手柄恢复控制')
+        if self._planner_active:
+            # 上位机控制中：手柄一个动作都不发（B 失能在按键回调里单独处理）
+            self._release_chassis()
+            return
         if self._mode == 'gimbal':
             self._tick_gimbal()
         else:
             self._tick_drive()
 
-    def _tick_drive(self):
-        """运动模式：左摇杆上下→vx，右摇杆左右→vy，L2/R2→左右转。"""
-        if not self._enabled:                     # 未使能时只发 0，绝不输出速度
-            self._homing = False
+    def _release_chassis(self):
+        """松手/失能时补一帧零速，然后静默。
+
+        为什么不能一直发零速：F407 收到任何 VEL 帧都会清掉 PosTarget.Valid
+        （PiComm.c），motion_planner 发的 /cmd_pose 目标 100ms 就没了。
+        为什么又不能干脆不发：F407 没有速度超时，停发 VEL 会保持最后一帧速度，
+        车会一直跑。所以"有输入才发、松手补一帧零速"是唯一安全的做法。
+        """
+        if self._vel_active:
             self._pub_vel.publish(Twist())
+            self._vel_active = False
+
+    def _tick_drive(self):
+        """运动模式：左摇杆上下→vx，右摇杆左右→vy，L2/R2→左右转。
+
+        只有真的有输入时才发 /cmd_vel；摇杆回中就补一帧零速然后停发。
+        这样待机时不会用零速帧把上位机/motion_planner 的位置目标冲掉。
+        """
+        if not self._enabled:                     # 未使能时绝不出速度，且停发
+            self._homing = False
+            self._release_chassis()
             return
         # 归位期间：持续发 POSE（不发 VEL，否则 VEL 会清掉 F407 的位置目标）。
         # 摇杆或 L2/R2 有输入就退出归位，恢复手动。
@@ -386,6 +478,11 @@ class JoyControlNode(Node):
             wz += self.dir_turn * self.turn_wz  # L2 向左转（逆时针为正）
         if self._r2():
             wz -= self.dir_turn * self.turn_wz  # R2 向右转
+        if abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(wz) < 1e-6:
+            self._release_chassis()               # 摇杆回中：补一帧零速后停发
+            return
+        self._vel_active = True
+
         m = Twist()
         m.linear.x = vx
         m.linear.y = vy
@@ -421,8 +518,9 @@ class JoyControlNode(Node):
         if self._servo[1] != old_plate:
             self._send_servo()
 
-        # 云台模式下底盘保持停止（防切模式前最后一帧速度残留）
-        self._pub_vel.publish(Twist())
+        # 云台模式下底盘保持停止：切模式时已经补过零速，这里不要再周期发
+        # （周期发零速会清掉 motion_planner 的位置目标）
+        self._release_chassis()
 
     # ---------------- 方向键动作（补光灯 / 摄像头） ----------------
 
