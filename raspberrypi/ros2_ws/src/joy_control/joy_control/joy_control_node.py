@@ -491,6 +491,17 @@ class JoyControlNode(Node):
 
     def _tick_gimbal(self):
         """云台模式：摇杆控制 yaw/extend，Y/A 控制 lift，X 夹爪，L1/L2 载物盘。"""
+        # 底盘停车统一交给 _release_chassis()（只在 _vel_active 时补一帧零速）。
+        # 这里不能再周期发零速：F407 收到任何 VEL 帧都会清掉 PosTarget.Valid，
+        # 把 motion_planner 发的 /cmd_pose 目标冲掉。
+
+        # 未使能不累加目标：F407 在失能期间不执行云台指令，
+        # 这边要是照常累加，按下 start 使能的瞬间会一次性跳到攒了很久的目标上，容易撞结构。
+        if not self._enabled:
+            return
+
+        old = list(self._gimbal)
+
         # 左摇杆左右 → yaw；右摇杆上下 → extend（X 轴伸缩）
         self._gimbal[0] += self.dir_yaw * self._axis(self.axis_yaw) * self.gimbal_step_deg
         self._gimbal[2] += self.dir_extend * self._axis(self.axis_extend) * self.gimbal_step_deg
@@ -503,9 +514,12 @@ class JoyControlNode(Node):
         self._gimbal[0] = max(-180.0, min(180.0, self._gimbal[0]))
         self._gimbal[1] = max(0.0, min(200.0, self._gimbal[1]))
         self._gimbal[2] = max(0.0, min(200.0, self._gimbal[2]))
-        g = Float32MultiArray()
-        g.data = [float(x) for x in self._gimbal]
-        self._pub_gimbal.publish(g)
+
+        # 目标没变就不发：F407 自己每 20 ms 重发一次绝对位置，不需要这边刷屏
+        if self._gimbal != old:
+            g = Float32MultiArray()
+            g.data = [float(x) for x in self._gimbal]
+            self._pub_gimbal.publish(g)
 
         # 载物盘：L1 顺时针 / L2（扳机）逆时针（步进，变了才发）
         # 注：+/- 代表舵机角度增减，具体"顺/逆"取决于机械安装，反了就改 plate_dir:=-1.0

@@ -81,9 +81,14 @@ enum
 
 /* ==================== 云台 ==================== */
 
-/* 云台三轴电机(5/6/7)是否已安装。未安装时置 0，跳过所有 5/6/7 电机的 CAN 控制，
-   避免向空地址发帧（这些帧无 ACK 会拖累 CAN 总线）。装好云台后改回 1。 */
-#define GIMBAL_MOTOR_INSTALLED   0
+/* 云台电机总开关：0 = 完全不碰 5/6/7（云台整个没装时用）。
+   装好云台后置 1，再按轴单独开关下面的 GIMBAL_YAW_INSTALLED。
+   没装的轴一条帧都不发——向空地址发的帧无 ACK，会抬高 TEC、白占 3 个发送邮箱。 */
+#define GIMBAL_MOTOR_INSTALLED   1
+
+/* Yaw 轴（地址 5）是否已装。Lift/Extend 两轴已装，Yaw 装好前保持 0：
+   Yaw 不动，但云端指令、回零、失能保持这些逻辑照常按行，只是不发地址 5 的帧。 */
+#define GIMBAL_YAW_INSTALLED     0
 
 /* 三轴软限位（绝对角度，单位 °），超限不发命令，防止撞结构 */
 #define GIMBAL_YAW_MIN      -180.0f

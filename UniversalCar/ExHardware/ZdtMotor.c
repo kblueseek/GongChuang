@@ -8,6 +8,7 @@
 #include "header.h"
 
 #define ZDT_CHECKSUM 0x6B
+#define ZDT_TX_TIMEOUT_MS 1   /* 等空闲邮箱的最长时间（ms）：500k 下一帧约 250us，够等 3~4 次 */
 
 ZdtMotor_t* ZdtMotorList[8] = { NULL };
 
@@ -16,19 +17,20 @@ static void Zdt_SendFrame(uint8_t addr, uint8_t packet, const uint8_t* d, uint8_
 {
     CAN_TxHeaderTypeDef tx = { 0 };
     uint32_t mb;
-    uint32_t retry = 0;
     tx.ExtId = ((uint32_t)addr << 8) | packet;
     tx.IDE = CAN_ID_EXT;
     tx.RTR = CAN_RTR_DATA;
     tx.DLC = n;
 
     /* CAN1 只有 3 个 TX 邮箱，全满时 HAL_CAN_AddTxMessage 会直接丢帧（返回 HAL_ERROR）。
-       底盘/云台都是背靠背连发 4~6 帧，必须轮询等空闲邮箱，否则后几帧被静默丢弃。
-       500k 下一帧约 250us，本循环最坏阻塞约 1ms，对 5ms 周期任务可接受。 */
+       底盘/云台都是背靠背连发 4~6 帧，必须等空闲邮箱，否则后几帧被静默丢弃。
+       但不能死等：外设 bus-off 时 HAL 会一直立即返回错误，原来的 10000 次空转
+       能在这个 5ms 任务里卡十几毫秒，把底盘和云台一起拖慢。这里按时间封顶，
+       真丢了也没关系——速度和位置指令都是幂等的，下个周期会重发。 */
     HAL_StatusTypeDef ret = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
-    while (ret != HAL_OK && retry < 10000)
+    uint32_t t0 = HAL_GetTick();
+    while (ret != HAL_OK && (HAL_GetTick() - t0) < ZDT_TX_TIMEOUT_MS)
     {
-        retry++;
         ret = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
     }
 }

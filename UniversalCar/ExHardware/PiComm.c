@@ -49,6 +49,8 @@ static volatile uint8_t s_TxPendingLen = 0;
 static volatile uint8_t s_TxBusy = 0;
 volatile uint32_t PiComm_TxDropCount = 0;       /* 被覆盖/启动失败的帧数（调试用） */
 
+/// @brief lora发送函数
+/// @param  
 static void PiComm_TxPump(void)
 {
     uint32_t primask;
@@ -209,7 +211,10 @@ void PiComm_Init(void)
 {
     /* 只清状态；UART 接收由 usart.c 的 RX 中断统一管理 */
     memset(&PiCommand, 0, sizeof(PiCommand));
-    PiCommand.Enabled = 1;      /* 上电默认使能 */
+    /* 上电默认「失能」：树莓派端 _enabled 也初始为 False，两边状态才对得上。
+       原来默认使能，Pi 侧却以为自己是失能的，要按两次 start 才真正切换一次，
+       而且 407 单独上电（没接树莓派）时电机会直接带电锁轴。 */
+    PiCommand.Enabled = 0;
     memset(&s_RxWired, 0, sizeof(s_RxWired));
     memset(&s_RxBle, 0, sizeof(s_RxBle));
 }

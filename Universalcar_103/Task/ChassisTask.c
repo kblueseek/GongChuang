@@ -252,7 +252,47 @@ void ChassisTask(void const* argument)
     while (1)
     {
         osDelayUntil(&PreviousWakeTime, CHASSIS_TASK_UPDATE_TICK);
+				
+			
+        /* 自测：上电就按 100RPM 连续发帧（电机没使能不会转）。
+           ⚠️ MultiBegin 必须留着：它把发送缓冲长度清零，漏掉的话每轮累加 32 字节，
+             8 轮（40ms）后就越界写坏 s_MultiBuf 后面的内存。 */
+        ZdtCan_MultiBegin();
+        for (int i = 0; i < 4; i++)
+            ZdtMotor_MultiAddSpeed(&Chassis.Wheel[i],100.f);
+        ZdtCan_MultiSend();
 
+        /* ============ CAN 收发器自检打印（临时，测完删） ============
+           接线：PA9(USART1_TX) → USB-TTL 的 RX，GND 共地，115200 8N1。
+           每 500ms 打一行状态，用来看 CAN 控制器到底在干什么：
+             TEC/REC = 发送/接收错误计数，LEC = 最近一次错误类型
+             TSR 位26~28(TME0~2)=1 表示三个发送邮箱都是空的
+             MSR bit0=INAK(初始化状态) bit1=SLAK(睡眠)
+           判读：
+             TEC 一直是 0、TME 一直为 1
+               → 帧根本没交给总线：CAN 没 Start，或者代码没跑到这里
+             TEC 一直涨到 255，LEC=3(ACK 错)
+               → 帧发出去了，但总线上没人给 ACK：收发器没工作 / TXD-RXD 接反 /
+                 PCAN 没接到同一对 CANH/CANL 上
+             LEC=2(格式错) / 4(位错) / 6(填充错)
+               → 信号层不对：CANH/CANL 接反、没共地、没终端电阻
+           ============================================================ */
+        {
+            static uint32_t s_DiagTick = 0;
+            if (HAL_GetTick() - s_DiagTick >= 500) {
+                uint32_t esr = CAN1->ESR, tsr = CAN1->TSR, msr = CAN1->MSR;
+                char b[96];
+                s_DiagTick = HAL_GetTick();
+                int n = snprintf(b, sizeof(b),
+                    "ESR TEC=%lu REC=%lu LEC=%lu | TSR=%08lX | MSR=%08lX INAK=%lu SLAK=%lu\r\n",
+                    (unsigned long)((esr >> 16) & 0xFF),
+                    (unsigned long)((esr >> 24) & 0xFF),
+                    (unsigned long)((esr >> 4) & 0x7),
+                    (unsigned long)tsr, (unsigned long)msr,
+                    (unsigned long)(msr & 1), (unsigned long)((msr >> 1) & 1));
+                HAL_UART_Transmit(&huart1, (uint8_t*)b, (uint16_t)n, 50);
+            }
+        }
         /* ---- 周期性重发 4 轮定时返回配置（1s 一次）：防止个别电机上电慢/漏收
                导致没有编码器反馈(0x36)。配置命令幂等，重复发无害。 ---- */
         {
