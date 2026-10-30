@@ -1,15 +1,14 @@
 # 只启动「F407 桥接 + 状态屏 + 运动规划 + 手柄」，不含激光雷达/障碍检测。
 #
 # 用于：还没接雷达（或雷达联调先放一边），只想用手柄 / 上位机 / 序列控制小车。
-# 数据链路：
-#   手柄 -> joy_node -> joy_control -> /cmd_vel -> f407_bridge --蓝牙--> F407
-#   F407 --LoRa--> f407_bridge -> /odom -> motion_planner / 状态屏
+# 数据链路（有线，全双工 USART6 <-> /dev/ttyAMA0，务必两边共地）：
+#   手柄 -> joy_node -> joy_control -> /cmd_vel -> f407_bridge --串口--> F407
+#   F407 --串口--> f407_bridge -> /odom -> motion_planner / 状态屏
 #
 # 运行：ros2 launch lidar_bringup car_only.launch.py
 #
 # 需要改的常见参数：
-#   ble_address    F407 蓝牙模组 MAC（留空=自动扫描；用 scripts/ble_scan.py 查地址）
-#   lora_device    LoRa 串口（Pi5 加了 dtoverlay=uart2-pi5 后一般是 /dev/ttyAMA2）
+#   wire_device    F407 有线串口（默认 /dev/ttyAMA0，GPIO14=TX / GPIO15=RX）
 #   width/height   状态屏分辨率：1.96 寸多半是 160x80，128x64 就保持默认
 
 from launch import LaunchDescription
@@ -18,19 +17,16 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        # F407 桥接：蓝牙上行 + LoRa 下行
+        # F407 桥接：有线串口（上行 + 下行共用一条全双工 USART6）
         Node(
             package='f407_bridge',
             executable='f407_bridge_node',
             name='f407_bridge',
             output='screen',
             parameters=[{
-                'uplink': 'ble',
-                'ble_address': '36:10:00:38:45:F2',  # 已固定 MAC，免现场扫描
-                'ble_name': '',              # 也可以按名字模糊匹配，例如 'JDY'
-                'downlink': 'lora',
-                'lora_device': '/dev/ttyAMA2',
-                'lora_baudrate': 115200,
+                'uplink': 'wire',
+                'wire_device': '/dev/ttyAMA0',
+                'downlink': 'wire',
             }],
         ),
         # 状态屏：I2C OLED（GPIO2/3），显示在线状态、坐标、朝向

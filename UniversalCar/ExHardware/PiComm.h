@@ -26,6 +26,7 @@
 #define PI_CMD_PLATE         0x05    /* DATA: pos(u8, 0~180°) */
 #define PI_CMD_CAM           0x06    /* DATA: pos(u8, 0~180°) */
 #define PI_CMD_ENABLE        0x07    /* DATA: en(u8, 0=失能 1=使能)，整车单一使能状态 */
+#define PI_CMD_GIMBAL_VEL    0x08    /* DATA: axis(u8 0=yaw/1=lift/2=extend) + deg/s(int16，整数 °/s) */
 #define PI_CMD_POSE          0x09    /* DATA: x y yaw (int32 mm, int32 mm, int16 mrad)，底盘位姿目标(位置+航向闭环) */
 #define PI_CMD_LED           0x0A    /* DATA: brightness(u8, 0~100%) 补光灯亮度（PWM 调光） */
 #define PI_CMD_HEARTBEAT     0x10    /* DATA: 无，1Hz */
@@ -49,6 +50,12 @@ typedef struct
         float Deg;      //目标角度 °
         uint8_t Mask;   //bit0=yaw bit1=lift bit2=extend，本次下发了哪个轴
     } GimbalTarget[3];
+
+    struct
+    {
+        float    DegPerSec; //目标角速度 °/s（PI_CMD_GIMBAL_VEL 下发，速度模式用）
+        uint32_t Tick;      //最后一次收到该轴速度指令的时刻，0 = 从没收到过
+    } GimbalVel[3];
 
     uint8_t HomeMask;   //回零请求 bit0=yaw bit1=lift bit2=extend（执行后由任务清除）
     uint8_t Enabled;    //整车使能状态：1=使能 0=失能（唯一状态，无急停/锁存区分）

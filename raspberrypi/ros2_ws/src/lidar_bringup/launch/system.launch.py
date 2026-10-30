@@ -3,7 +3,7 @@
 # 大白话：运行 ros2 launch lidar_bringup system.launch.py 就等于同时启动下面 4 个程序：
 #   1. 雷达驱动      -> 产出 /scan
 #   2. 障碍检测      -> /scan 变成 /obstacles
-#   3. F407 桥接     -> 话题和无线链路互转（蓝牙上行 + LoRa 下行）
+#   3. F407 桥接     -> 话题和有线串口互转（上行 + 下行共用 USART6）
 #   4. 运动规划      -> /obstacles 变成 /cmd_vel
 #   5. 手柄驱动      -> /joy
 #   6. 手柄控制      -> /joy 变成整车控制话题
@@ -32,17 +32,16 @@ def generate_launch_description():
             name='obstacle_detect',
             output='screen',
         ),
-        # 3. F407 桥接节点（无线翻译官：蓝牙上行 + LoRa 下行）
+        # 3. F407 桥接节点（有线串口：上行 + 下行共用 USART6）
         Node(
             package='f407_bridge',
             executable='f407_bridge_node',
             name='f407_bridge',
             output='screen',
             parameters=[{
-                'uplink': 'ble',
-                'downlink': 'lora',
-                'lora_device': '/dev/ttyAMA2',
-                'lora_baudrate': 115200,
+                'uplink': 'wire',
+                'wire_device': '/dev/ttyAMA0',
+                'downlink': 'wire',
             }],
         ),
         # 4. 运动规划节点（避障）

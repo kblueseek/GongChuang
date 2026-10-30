@@ -21,8 +21,8 @@ enum
     ZDT_MOTOR_EXTEND = 7, /* 云台 X 伸缩轴 */
 };
 
-#define ZDT_ACC_DEFAULT     245    /* 云台位置模式加速度档位（0-255，越大越快，0=无曲线） */
-#define ZDT_POS_SPEED_MAX   50     /* 云台位置模式速度上限，单位 RPM（整数） */
+#define ZDT_ACC_DEFAULT     222    /* 云台位置模式加速度档位（0-255，越大越快，0=无曲线） */
+#define ZDT_POS_SPEED_MAX   400     /* 云台位置模式速度上限，单位 RPM（整数） */
 /* 底盘轮加速度档位（0-255）。Emm 固件曲线加减速公式：
      每隔 (256-acc)*50us 变化 1 RPM  =>  加速度 = 20000/(256-acc) RPM/s
    加速、减速、反向共用此档位，固件自动走曲线，无法分开设置。
@@ -90,19 +90,21 @@ enum
    Yaw 不动，但云端指令、回零、失能保持这些逻辑照常按行，只是不发地址 5 的帧。 */
 #define GIMBAL_YAW_INSTALLED     0
 
-/* 三轴软限位（绝对角度，单位 °），超限不发命令，防止撞结构 */
-#define GIMBAL_YAW_MIN      -180.0f
-#define GIMBAL_YAW_MAX      180.0f
-#define GIMBAL_LIFT_MIN     0.0f
-#define GIMBAL_LIFT_MAX     200.0f
-#define GIMBAL_EXTEND_MIN   0.0f
-#define GIMBAL_EXTEND_MAX   200.0f
+/* 三轴软限位（绝对角度，单位 °），超限不发命令，防止撞结构。
+   ⚠️ 当前 ±1000° 是「实测限位」用的临时值：限位放得这么大等于没有保护，
+   速度模式下推到底会直接顶到机械结构上。测出真实行程后必须改回实测值。 */
+#define GIMBAL_YAW_MIN      -1000.0f
+#define GIMBAL_YAW_MAX      1000.0f
+#define GIMBAL_LIFT_MIN     -1000.0f
+#define GIMBAL_LIFT_MAX     1000.0f
+#define GIMBAL_EXTEND_MIN   -1000.0f
+#define GIMBAL_EXTEND_MAX   +1000.0f
 
 /* ==================== 树莓派链路（无线） ==================== */
 /* 上行：树莓派 --BLE--> F407（USART2 / PA2 PA3，二进制 PiComm 帧）
    下行：F407 --LoRa--> 树莓派（UART4 / PC10=TX PC11=RX，只发不收） */
-#define BLE_UPLINK_ENABLE    1      /* 1=USART2 作为 PiComm 指令上行 0=关闭 */
-#define LORA_DOWNLINK_ENABLE 1      /* 1=UART4 作为 PiComm 遥测下行 0=关闭（回落 USART6 有线） */
+#define BLE_UPLINK_ENABLE    0      /* 1=USART2 作为 PiComm 指令上行 0=关闭 */
+#define LORA_DOWNLINK_ENABLE 0      /* 1=UART4 作为 PiComm 遥测下行 0=关闭（回落 USART6 有线） */
 /* 必须与两块 LoRa 模组的串口波特率一致（本项目实测 115200）。
    ⚠️ 改这个宏之后，如果再从 CubeMX 重新生成代码，usart.c 里那行会被 .ioc 的值覆盖回去，
    所以 .ioc 的 UART4.BaudRate 必须同步改（当前已设为 115200）。 */

@@ -7,7 +7,7 @@
 小车上没有显示器，调试时想知道"F407 活着吗、车现在在哪、朝向多少"，就得插电脑。
 这个节点用一块 I2C 小屏把这些信息实时画出来，抬头就能看：
 
-    F407 ONLINE   BLE OK PAD
+    F407 ONLINE   LINK OK PAD
     X  +1.234 m
     Y  -0.056 m
     YAW +45.3 deg
@@ -212,7 +212,7 @@ class StatusDisplayNode(Node):
         # 第 1 行：链路状态
         draw.text((0, 0),
                   f'F407 {"ON " if f407_ok else "OFF"}'
-                  f'  BLE {"OK" if ble_ok else "--"}'
+                  f'  LINK {"OK" if ble_ok else "--"}'
                   f'  {"PAD" if pad_ok else "---"}',
                   fill='white', font=self._small)
 

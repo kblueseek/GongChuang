@@ -1,8 +1,10 @@
 /**
  * @attention   采用UTF-8字符集编码
  * @brief       云台控制任务
- * @details     三轴 ZDT 电机内部闭环，STM32 只下发绝对位置指令 0xFD（ZDT_POS_ABS，周期重发，幂等），
- *              从不发速度指令，保证三轴始终工作在位置模式。
+ * @details     三轴 ZDT 电机内部闭环，STM32 按轴在两种模式间切换：
+ *              · 有新速度指令（PI_CMD_GIMBAL_VEL，150ms 内）→ 速度模式 0xF6（手柄摇杆用）；
+ *              · 否则 → 绝对位置模式 0xFD（ZDT_POS_ABS，周期重发，幂等）。
+ *              速度模式下目标位置跟着实时位置走，超时/切回位置模式时原地接住，不会跳回旧目标。
  *              首次使能后 20 ms 把当前位置设为零点（上电位置 = 0），之后一切绝对角度都以它为准。
  *              回零请求（PiCommand.HomeMask）在本任务执行，执行后清位。
  *              夹爪/摄像头舵机直接跟随树莓派指令。
@@ -14,6 +16,9 @@
 #define GIMBAL_FEEDBACK_MS      20    /* 各轴位置回传周期（ms）：50 Hz，压低总线负载 */
 #define GIMBAL_ENABLE_RETRY_MS  500   /* 使能重发周期（ms）：CAN1 关了自动重传，漏一次要等下次使能才补 */
 #define GIMBAL_ZERO_SETTLE_MS   20    /* 使能后等多久再设零点（ms）：让电机的使能帧先被处理完 */
+#define GIMBAL_VEL_TIMEOUT_MS  150   /* 速度模式超时：这么久没收到该轴新速度指令就退回位置保持（手柄掉线/切模式兜底）。
+                                        手柄按 20Hz 发，单轴 50ms 一帧，150ms = 3 帧余量：
+                                        丢一两帧不致于抖，真掉线 150ms 内必停（300°/s 最多空转 45°）。 */
 
 Gimbal_t Gimbal;
 
@@ -47,6 +52,24 @@ static void Gimbal_SetAxisTarget(ZdtMotor_t* motor, uint8_t axis, float deg)
     ZdtMotor_SetPosition(motor, motor->Position.Set, ZDT_POS_ABS);
 }
 
+/* 速度模式：把 °/s 限幅后下发 F6 速度帧。接近软限位时按停车带强制减速到 0，
+   防止速度模式把轴推出限位撞结构。 */
+static void Gimbal_SetAxisSpeed(ZdtMotor_t* motor, uint8_t axis, float degPerSec)
+{
+    const float stopBand = 5.0f;    /* 离限位多近（°）就开始强制停 */
+    float now = motor->Position.Real;
+
+    if ((degPerSec > 0.0f && now >= s_MaxDeg[axis] - stopBand) ||
+        (degPerSec < 0.0f && now <= s_MinDeg[axis] + stopBand))
+        degPerSec = 0.0f;
+
+    ZdtMotor_SetSpeed(motor, degPerSec / 6.0f);   /* °/s → RPM（1 RPM = 6°/s） */
+
+    /* 速度模式期间让绝对目标跟着实时位置走：速度超时/切回位置模式时，
+       位置模式从"当前位置"原地接住，而不是跳回速度模式开始前的旧目标。 */
+    motor->Position.Set = now;
+}
+
 /* 开定时返回：让已装的轴每 GIMBAL_FEEDBACK_MS(20ms) 主动回一帧实时位置(0x36)。
    不发这条命令，Position.Real 永远是 0、ZdtMotor_IsOnline() 永远为假，
    状态帧的在线掩码、失能时的原位保持、绝对位置的方向判断全都会失效。 */
@@ -57,14 +80,36 @@ static void Gimbal_SetupFeedback(void)
             ZdtCan_SetTimedReturn(s_Axis[i]->Addr, 0x36, GIMBAL_FEEDBACK_MS);
 }
 
-/* 云台三轴失能：发当前位置锁定（不松轴，位置模式平滑保持）。
-   只对在线轴发——离线时 Real 还停在 0，拿它当锚点等于命令轴"回绝对零点"，
-   一按失能云台就会自己往零点跑。 */
+/* 云台三轴失能：速度模式下的轴先无条件发速度 0 停住，在线时再锁到当前位置做
+   位置保持（不松轴，平滑保持）。
+   · 速度 0 不能按"在线"才发：反馈抖动时 IsOnline 变假，一条停止帧都发不出去，
+     速度模式下的轴会按最后速度一直转——这正是"云台没有失能逻辑"。
+     速度帧是单帧、不依赖位置反馈，任何情况下都发得出去。
+   · 只对"之前确实在速度模式"（Tick 非 0）的轴发速度 0：位置模式轴发速度 0 会
+     把它切成速度环，保持力反而比位置保持弱，重轴会慢慢往下掉。
+   · 离线时 Real 还停在 0，拿它当锚点等于命令轴"回绝对零点"，一按失能云台就会
+     自己往零点跑——所以离线只停速度、不发位置。 */
 static void Gimbal_Disable(void)
 {
     for (uint8_t i = 0; i < 3; i++)
-        if (s_AxisInstalled[i] && ZdtMotor_IsOnline(s_Axis[i]))
+    {
+        if (!s_AxisInstalled[i]) {
+            PiCommand.GimbalVel[i].Tick = 0;
+            continue;
+        }
+
+        if (PiCommand.GimbalVel[i].Tick != 0)      /* 这一轴之前处于速度模式 → 先停住 */
+            ZdtMotor_SetSpeed(s_Axis[i], 0.0f);
+
+        if (ZdtMotor_IsOnline(s_Axis[i])) {
             ZdtMotor_SetPosition(s_Axis[i], s_Axis[i]->Position.Real, ZDT_POS_ABS);
+            s_Axis[i]->Position.Set = s_Axis[i]->Position.Real;
+        }
+
+        /* 失能时把速度指令一起作废：否则超时内重新使能，会拿失能前的旧速度
+           接着往下转（手柄那边此时可能根本没人按）。 */
+        PiCommand.GimbalVel[i].Tick = 0;
+    }
 }
 #endif
 
@@ -160,9 +205,16 @@ void GimbalTask(void const* argument)
                 PiCommand.GimbalTarget[i].Mask = 0;
             }
 
-            for (uint8_t i = 0; i < 3; i++)
-                if (s_AxisInstalled[i])
+            /* 三轴模式分支：有新鲜速度指令 → 速度模式；否则位置模式周期重发（幂等） */
+            for (uint8_t i = 0; i < 3; i++) {
+                if (!s_AxisInstalled[i])
+                    continue;
+                uint32_t tick = PiCommand.GimbalVel[i].Tick;
+                if (tick && (HAL_GetTick() - tick) < GIMBAL_VEL_TIMEOUT_MS)
+                    Gimbal_SetAxisSpeed(s_Axis[i], i, PiCommand.GimbalVel[i].DegPerSec);
+                else
                     ZdtMotor_SetPosition(s_Axis[i], s_Axis[i]->Position.Set, ZDT_POS_ABS);
+            }
         }
 #endif
 

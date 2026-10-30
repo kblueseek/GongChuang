@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 """树莓派 <-> F407 通信（PiComm 协议）。
 
-================ 两条无线链路 ================
+================ 链路 ================
 
-  上行（树莓派 → F407）：蓝牙。指令量小、对延迟敏感，BLE 自带链路层重传，
-                        树莓派用 BleLink（BLE GATT）或 RfcommLink（经典蓝牙 SPP）。
-  下行（F407 → 树莓派）：LoRa。遥测可以容忍丢包，而且 LoRa 只发不收，
-                        天然避开半双工切换；树莓派直接用 PiCommLink 当串口读。
+  当前默认：有线。F407 USART6（全双工）<-> 树莓派 /dev/ttyAMA0，收发共用一条
+            PiCommLink（send_xxx 发指令 + poll 收遥测），务必两边共地。
+  保留可选：上行 BleLink（BLE GATT）/ RfcommLink（经典蓝牙 SPP）；下行 LoRa 串口。
 
-两条链路跑的是同一套 PiComm 二进制帧，所以编解码代码完全复用。
-（下面 PiCommLink 的说明仍以原来的有线串口为背景，代码本身对 LoRa 串口一字不用改。）
+所有链路跑的是同一套 PiComm 二进制帧，所以编解码代码完全复用。
 
 ================ 用大白话讲清楚这个文件在干什么 ================
 
@@ -65,8 +63,9 @@ except ImportError:
 # ==================== 命令编号 ====================
 # 这些数字是"命令的名字"，和 F407 侧 PiComm.h 里的定义一一对应，改这里必须改那边。
 CMD_VEL = 0x01        # 速度指令（前进/后退/旋转）
-CMD_GIMBAL = 0x02     # 云台转到某个角度
+CMD_GIMBAL = 0x02     # 云台转到某个角度（绝对位置模式，上位机/序列用）
 CMD_HOME = 0x03       # 云台回零（回原点）
+CMD_GIMBAL_VEL = 0x08 # 云台速度模式（°/s，手柄摇杆用）
 CMD_GRIPPER = 0x04    # 夹爪舵机
 CMD_PLATE = 0x05      # 托盘舵机
 CMD_CAM = 0x06        # 相机舵机
@@ -204,6 +203,20 @@ def encode_gimbal(axis: int, deg: float) -> bytes:
     return struct.pack(">Bi", axis, int(round(deg * 100.0)))  # B=1字节无符号, i=4字节整数
 
 
+def encode_gimbal_vel(axis: int, deg_per_s: float) -> bytes:
+    """云台速度指令内容：轴编号(1字节) + 角速度(2字节 int16，单位 °/s)。
+
+    电机 F6 速度模式本来就是整数 RPM（1RPM=6°/s），所以 1°/s 的整数精度已经
+    足够，比电机的分辨率还细。
+    """
+    if axis not in (0, 1, 2):
+        raise PiCommError(f"云台轴越界：{axis}")
+    spd = int(round(deg_per_s))
+    if not -32768 <= spd <= 32767:
+        raise PiCommError(f"云台速度超出 int16：{spd}")
+    return struct.pack(">Bh", axis, spd)  # B=1字节无符号, h=2字节 int16
+
+
 def encode_home(mask: int) -> bytes:
     """云台回零指令内容：一个字节，每一位代表一个轴要不要回零。"""
     return bytes([mask & 0x07])   # 只保留低 3 位（3 个轴）
@@ -304,12 +317,15 @@ class PiCommLink:
         if self._clock() < self._next_reconnect_s:   # 还没到重连时间，别急着连
             return False
         try:
-            # 打开串口。timeout=0 和 write_timeout=0 表示"非阻塞"——读写立即返回，不等待。
+            # 读用 timeout=0（非阻塞，靠 in_waiting 判断有没有数据）；
+            # 写必须给一个正超时：write_timeout=0 时若系统发送缓冲满，write() 只写入一部分，
+            # 下面会判定"帧被截断"→ 断开重连（1s 内上下行全停）。云台速度模式下上行帧变多，
+            # 这个截断更容易发生，表现就是状态屏 F407 在 ON/OFF 之间快速闪。
             self._port = self._serial_factory(
                 port=self.device,
                 baudrate=self.baudrate,
                 timeout=0,
-                write_timeout=0,
+                write_timeout=0.1,
             )
         except Exception as error:
             self._disconnect(str(error))
@@ -345,6 +361,9 @@ class PiCommLink:
 
     def send_gimbal(self, axis: int, deg: float) -> bool:
         return self._send(CMD_GIMBAL, encode_gimbal(axis, deg))
+
+    def send_gimbal_vel(self, axis: int, deg_per_s: float) -> bool:
+        return self._send(CMD_GIMBAL_VEL, encode_gimbal_vel(axis, deg_per_s))
 
     def send_home(self, mask: int) -> bool:
         return self._send(CMD_HOME, encode_home(mask))
@@ -583,6 +602,9 @@ class BleLink:
 
     def send_gimbal(self, axis: int, deg: float) -> bool:
         return self._send(CMD_GIMBAL, encode_gimbal(axis, deg))
+
+    def send_gimbal_vel(self, axis: int, deg_per_s: float) -> bool:
+        return self._send(CMD_GIMBAL_VEL, encode_gimbal_vel(axis, deg_per_s))
 
     def send_home(self, mask: int) -> bool:
         return self._send(CMD_HOME, encode_home(mask))

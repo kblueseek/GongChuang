@@ -157,6 +157,9 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
                 int32_t deg = (int32_t)((d[1] << 24) | (d[2] << 16) | (d[3] << 8) | d[4]);
                 PiCommand.GimbalTarget[axis].Deg = deg / 100.f;            /* ×100 → ° */
                 PiCommand.GimbalTarget[axis].Mask = 1;
+                /* 位置指令立即接管：清掉速度模式时间戳，否则这一轴还要在速度模式里
+                   再等 GIMBAL_VEL_TIMEOUT_MS 才切回位置，上位机发来的目标被晾着。 */
+                PiCommand.GimbalVel[axis].Tick = 0;
             }
         }
         break;
@@ -197,6 +200,22 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
     case PI_CMD_ENABLE:             /* 整车单一使能状态：en 直接决定使能/失能 */
         if (dLen >= 1)
             PiCommand.Enabled = d[0] ? 1 : 0;
+        break;
+    case PI_CMD_GIMBAL_VEL:         /* axis(u8) + deg/s(int16 大端，整数 °/s) */
+        if (dLen >= 3) {
+            uint8_t axis = d[0];
+            if (axis < 3) {
+                int16_t spd = (int16_t)((d[1] << 8) | d[2]);
+                PiCommand.GimbalVel[axis].DegPerSec = (float)spd;
+                PiCommand.GimbalVel[axis].Tick = HAL_GetTick();   /* 刷新时间戳 = 该轴进入速度模式 */
+
+                /* 云台速度模式 = 底盘待机：无条件把底盘速度清零。
+                   否则最后一次非零 /cmd_vel 会一直保留——GIMBAL_VEL 帧本身会刷新
+                   LastOnlineTick，让 ReceiveTask 的"离线清速度"永远不触发，
+                   结果就是"云台模式下左摇杆还能开动车"。 */
+                PiCommand.Vel.Vx = PiCommand.Vel.Vy = PiCommand.Vel.Wz = 0;
+            }
+        }
         break;
     case PI_CMD_HEARTBEAT:
         break;

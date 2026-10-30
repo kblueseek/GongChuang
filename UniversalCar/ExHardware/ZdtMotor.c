@@ -244,8 +244,8 @@ void ZdtMotor_MultiAddSpeed(ZdtMotor_t* motor, float rpm)
 void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode)
 {
     /* 方向按目标与当前实时位置的差自动取 */
-    uint8_t dir = (deg >= motor->Position.Real) ? 0 : 1;
-    uint32_t pulse = (uint32_t)(fabsf(deg) * ZDT_PULSE_PER_REV / 360.0f);   /* ° → 脉冲 */
+    uint8_t dir = (deg < 0.0f) ? 1 : 0;
+    uint32_t pulse = (uint32_t)(fabsf(deg) * ZDT_PULSE_PER_REV / 360.0f);
 
     uint8_t c[] = {
         0xFD, dir,

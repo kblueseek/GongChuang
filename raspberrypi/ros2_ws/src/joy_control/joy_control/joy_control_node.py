@@ -124,7 +124,9 @@ class JoyControlNode(Node):
         self.declare_parameter('turn_wz', 0.3)            # L2/R2 转向角速度 rad/s（≈17°/s，太快容易转过头）
         self.declare_parameter('deadzone', 0.0)           # 摇杆死区（摇杆本身自带死区，这里不再加）
         self.declare_parameter('led_step', 20)            # 补光灯每按一下增减 %
-        self.declare_parameter('gimbal_step_deg', 2.0)    # 云台每 tick 步进 °
+        self.declare_parameter('gimbal_step_deg', 20.0)    # 云台每 tick 步进 °（位置模式遗留，已不用）
+        self.declare_parameter('gimbal_max_speed', 300.0)  # 摇杆满量程角速度 °/s（速度模式，yaw/extend）
+        self.declare_parameter('gimbal_lift_speed', 200.0) # Y/A 按住升降角速度 °/s（速度模式）
         self.declare_parameter('servo_step_deg', 5.0)     # 载物盘每 tick 步进 °
         self.declare_parameter('cam_step_deg', 5.0)       # 摄像头每按一下步进 °
         self.declare_parameter('gripper_close_deg', 40.0)  # 夹爪"夹紧"角度
@@ -170,6 +172,8 @@ class JoyControlNode(Node):
         self.deadzone = float(self.get_parameter('deadzone').value)
         self.led_step = int(self.get_parameter('led_step').value)
         self.gimbal_step_deg = float(self.get_parameter('gimbal_step_deg').value)
+        self.gimbal_max_speed = float(self.get_parameter('gimbal_max_speed').value)
+        self.gimbal_lift_speed = float(self.get_parameter('gimbal_lift_speed').value)
         self.servo_step_deg = float(self.get_parameter('servo_step_deg').value)
         self.cam_step_deg = float(self.get_parameter('cam_step_deg').value)
         self.gripper_close_deg = float(self.get_parameter('gripper_close_deg').value)
@@ -180,6 +184,7 @@ class JoyControlNode(Node):
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
         self._pub_led = self.create_publisher(Int32, '/cmd_led', 10)
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
+        self._pub_gimbal_vel = self.create_publisher(Float32MultiArray, '/cmd_gimbal_vel', 10)
         self._pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)
         self._pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)
         self._pub_motion_stop = self.create_publisher(Bool, '/motion_stop', 10)
@@ -208,11 +213,14 @@ class JoyControlNode(Node):
         self._homing = False                   # 是否正在底盘归位（归位期间持续发 POSE，不发 VEL）
         self._home_yaw = 0.0                   # 归位时锁存的航向，防止归位过程中被 /odom 带着转
         self._vel_active = False               # 上一拍是否真的在发非零速度（用来"松手补一帧零速"）
+        self._gimbal_stop_ticks = 0            # 退出云台模式后还需补发零速的 tick 数（防单帧丢失导致云台继续跑）
         self._planner_active = False           # 上位机状态机是否正在跑序列（True 时手柄除 B 外全部让位）
         self._planner_active_t = 0.0           # 最近一次收到 /motion_active=True 的时刻（做超时自恢复）
 
         # 定时器：10Hz 推一次（有输入才发速度，见 _tick_drive 的说明）
-        self._timer = self.create_timer(0.1, self._tick)
+        # 20Hz：云台速度模式单轴 50ms 一帧，给 F407 的 150ms 超时留 3 帧余量，
+        # 丢一两帧不会让云台退回位置模式发抖；底盘 VEL 也顺带更平滑。
+        self._timer = self.create_timer(0.05, self._tick)
         self.get_logger().info(
             f'joy_control 就绪：layout={self.layout}（收到 /joy 后自动识别 PS2/Xbox 编号）'
         )
@@ -271,7 +279,8 @@ class JoyControlNode(Node):
         self._enabled = en
         if not en:
             self._homing = False
-            self._release_chassis()    # 被外部失能时补一帧零速，防止残留速度
+            self._stop_chassis_now()   # 被外部失能时无条件补一帧零速，防止残留速度
+            self._release_gimbal()     # 云台也立即停（速度模式发零速，不等 300ms 超时）
         self.get_logger().info(f'使能状态同步 -> {"开" if en else "关"}')
 
     def _cb_motion_active(self, msg: Bool):
@@ -289,6 +298,7 @@ class JoyControlNode(Node):
         if active:
             self._homing = False          # 归位让位给上位机
             self._release_chassis()       # 先补一帧零速，别让残余速度带进上位机控制
+            self._release_gimbal()        # 云台也补一帧零速，别让残余速度带进上位机的位置模式
             self.get_logger().info('上位机接管：手柄只保留 B（失能）')
         else:
             self.get_logger().info('上位机结束，手柄恢复控制')
@@ -379,19 +389,23 @@ class JoyControlNode(Node):
         if i == self.btn_select:
             self._mode = 'gimbal' if self._mode == 'drive' else 'drive'
             if self._mode == 'gimbal':
-                self._release_chassis()                 # 切云台前先让底盘停
+                self._stop_chassis_now()                # 切云台前无条件让底盘停（不依赖 _vel_active）
+            else:
+                self._release_gimbal()                  # 切回运动模式：云台立即停（并持续补零 1s）
             self.get_logger().info(f'模式 -> {"云台" if self._mode == "gimbal" else "运动"}')
         elif i == self.btn_start:
             self._enabled = not self._enabled
             self._pub_enable.publish(Bool(data=self._enabled))
             if not self._enabled:
-                self._release_chassis()                 # 失能同时停车
+                self._stop_chassis_now()                # 失能同时停车
+                self._release_gimbal()                  # 云台也立即停
             self.get_logger().info('使能' if self._enabled else '失能')
         elif i == self.btn_b:
             self._enabled = False
             self._homing = False
             self._pub_enable.publish(Bool(data=False))
-            self._release_chassis()
+            self._stop_chassis_now()
+            self._release_gimbal()                      # 云台立即停（B 是安全键，必须什么都不动）
             # 上位机正在跑序列时，光失能不够：状态机会一直等"到位"，所以连序列一起停
             self._pub_motion_stop.publish(Bool(data=True))
             self.get_logger().info('失能（B 安全键）' + ('，同时停止上位机序列' if self._planner_active else ''))
@@ -436,6 +450,7 @@ class JoyControlNode(Node):
             self._tick_gimbal()
         else:
             self._tick_drive()
+            self._gimbal_stop_burst()   # 刚退出云台：继续补发几帧零速，防止单帧丢失导致云台继续跑
 
     def _release_chassis(self):
         """松手/失能时补一帧零速，然后静默。
@@ -448,6 +463,17 @@ class JoyControlNode(Node):
         if self._vel_active:
             self._pub_vel.publish(Twist())
             self._vel_active = False
+
+    def _stop_chassis_now(self):
+        """无条件补一帧零速（切模式 / 失能时用）。
+
+        和 _release_chassis 的区别：不依赖 _vel_active。F407 的底盘每 5ms 无条件
+        应用 PiCommand.Vel，只要最后一次非零 VEL 没被零速覆盖，车就会一直跑；
+        而 GIMBAL_VEL 帧会让 F407 一直"在线"，500ms 的离线清速度永远不触发。
+        所以切云台/失能时必须**无条件**发一帧零速，把底盘按停。
+        """
+        self._pub_vel.publish(Twist())
+        self._vel_active = False
 
     def _tick_drive(self):
         """运动模式：左摇杆上下→vx，右摇杆左右→vy，L2/R2→左右转。
@@ -490,36 +516,34 @@ class JoyControlNode(Node):
         self._pub_vel.publish(m)
 
     def _tick_gimbal(self):
-        """云台模式：摇杆控制 yaw/extend，Y/A 控制 lift，X 夹爪，L1/L2 载物盘。"""
-        # 底盘停车统一交给 _release_chassis()（只在 _vel_active 时补一帧零速）。
-        # 这里不能再周期发零速：F407 收到任何 VEL 帧都会清掉 PosTarget.Valid，
-        # 把 motion_planner 发的 /cmd_pose 目标冲掉。
+        """云台模式（速度模式）：摇杆直接出角速度，松手即停；Y/A 按住匀速升/降。
 
-        # 未使能不累加目标：F407 在失能期间不执行云台指令，
-        # 这边要是照常累加，按下 start 使能的瞬间会一次性跳到攒了很久的目标上，容易撞结构。
+        为什么不用位置模式：手柄推摇杆时值一直在变，等于 407 收到的绝对目标也
+        一直在变，电机还没到位下一条目标又来了，云台表现为一顿一顿甚至跟不上。
+        改成速度模式后，摇杆位移 → 角速度(°/s)，回中 → 0，F407 上按软限位在
+        Position.Real 处把速度 clamp 到 0（撞限位前自动减速停），不再累加位置。
+        """
+        # 云台模式下底盘保持停止（只在 _vel_active 时补一帧零速，不周期发）
+        self._release_chassis()
+
+        # 失能期间停云台：发零速让电机立即停（F407 另有 150ms 速度超时兜底）
         if not self._enabled:
+            self._release_gimbal()
             return
 
-        old = list(self._gimbal)
-
-        # 左摇杆左右 → yaw；右摇杆上下 → extend（X 轴伸缩）
-        self._gimbal[0] += self.dir_yaw * self._axis(self.axis_yaw) * self.gimbal_step_deg
-        self._gimbal[2] += self.dir_extend * self._axis(self.axis_extend) * self.gimbal_step_deg
-        # Y/A 按住 → lift 升/降
+        # 左摇杆左右 → yaw；右摇杆上下 → extend（X 轴伸缩），满摇杆 = gimbal_max_speed
+        yaw = self.dir_yaw * self._axis(self.axis_yaw) * self.gimbal_max_speed
+        extend = self.dir_extend * self._axis(self.axis_extend) * self.gimbal_max_speed
+        # Y/A 按住 → lift 匀速升/降
+        lift = 0.0
         if self._is_pressed(self.btn_y):
-            self._gimbal[1] += self.gimbal_step_deg
+            lift += self.gimbal_lift_speed
         if self._is_pressed(self.btn_a):
-            self._gimbal[1] -= self.gimbal_step_deg
-        # 软限位（和 RobotConfig.h 一致，防撞结构）
-        self._gimbal[0] = max(-180.0, min(180.0, self._gimbal[0]))
-        self._gimbal[1] = max(0.0, min(200.0, self._gimbal[1]))
-        self._gimbal[2] = max(0.0, min(200.0, self._gimbal[2]))
+            lift -= self.gimbal_lift_speed
 
-        # 目标没变就不发：F407 自己每 20 ms 重发一次绝对位置，不需要这边刷屏
-        if self._gimbal != old:
-            g = Float32MultiArray()
-            g.data = [float(x) for x in self._gimbal]
-            self._pub_gimbal.publish(g)
+        g = Float32MultiArray()
+        g.data = [float(yaw), float(lift), float(extend)]
+        self._pub_gimbal_vel.publish(g)
 
         # 载物盘：L1 顺时针 / L2（扳机）逆时针（步进，变了才发）
         # 注：+/- 代表舵机角度增减，具体"顺/逆"取决于机械安装，反了就改 plate_dir:=-1.0
@@ -532,9 +556,21 @@ class JoyControlNode(Node):
         if self._servo[1] != old_plate:
             self._send_servo()
 
-        # 云台模式下底盘保持停止：切模式时已经补过零速，这里不要再周期发
-        # （周期发零速会清掉 motion_planner 的位置目标）
-        self._release_chassis()
+    def _release_gimbal(self):
+        """云台停：立即发一帧零速，并让接下来 1s 继续补发零速。
+
+        为什么不能只发一帧：这一帧如果赶上串口丢包，F407 会保留最后的速度，
+        要等它自己的速度超时（GIMBAL_VEL_TIMEOUT_MS）才停——云台会"失控"跑一段。
+        连发 20 帧（20Hz 共 1s）保证至少有一帧到达，同时不等超时也能立刻停。
+        """
+        self._pub_gimbal_vel.publish(Float32MultiArray(data=[0.0, 0.0, 0.0]))
+        self._gimbal_stop_ticks = 20        # 20Hz × 20 拍 = 1s
+
+    def _gimbal_stop_burst(self):
+        """退出云台模式后的补发零速（在 _tick 的运动模式下调用）。"""
+        if self._gimbal_stop_ticks > 0:
+            self._pub_gimbal_vel.publish(Float32MultiArray(data=[0.0, 0.0, 0.0]))
+            self._gimbal_stop_ticks -= 1
 
     # ---------------- 方向键动作（补光灯 / 摄像头） ----------------
 

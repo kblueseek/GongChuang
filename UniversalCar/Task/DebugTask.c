@@ -34,9 +34,10 @@ void DebugTask(void const* argument)
         DebugData.Value[9] = BleRemote.Joy.Ry;       // 右摇杆纵向值（原始）
         DebugData.Value[10] = BLE_RxByteCount;       // USART2 收到的字节数（0=完全没收到）
 #else
-        DebugData.Value[6] = 0;
-        DebugData.Value[7] = 0;
-        DebugData.Value[8] = 0;
+        /* 云台三轴实时角度（°）：实测行程时看这三个通道，手动推到机械限位读刻度 */
+        DebugData.Value[6] = Gimbal.Yaw.Motor.Position.Real;
+        DebugData.Value[7] = Gimbal.Lift.Motor.Position.Real;
+        DebugData.Value[8] = Gimbal.Extend.Motor.Position.Real;
         DebugData.Value[9] = 0;
         DebugData.Value[10] = 0;
 #endif
