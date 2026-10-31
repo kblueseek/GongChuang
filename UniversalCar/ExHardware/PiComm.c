@@ -207,15 +207,30 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
             if (axis < 3) {
                 int16_t spd = (int16_t)((d[1] << 8) | d[2]);
                 PiCommand.GimbalVel[axis].DegPerSec = (float)spd;
-                PiCommand.GimbalVel[axis].Tick = HAL_GetTick();   /* 刷新时间戳 = 该轴进入速度模式 */
-
-                /* 云台速度模式 = 底盘待机：无条件把底盘速度清零。
-                   否则最后一次非零 /cmd_vel 会一直保留——GIMBAL_VEL 帧本身会刷新
-                   LastOnlineTick，让 ReceiveTask 的"离线清速度"永远不触发，
-                   结果就是"云台模式下左摇杆还能开动车"。 */
-                PiCommand.Vel.Vx = PiCommand.Vel.Vy = PiCommand.Vel.Wz = 0;
+                PiCommand.GimbalVel[axis].Tick = HAL_GetTick();   /* 刷新时间戳 = 该轴的新速度 */
             }
         }
+        break;
+    case PI_CMD_GIMBAL_LIMIT:       /* axis(u8) + min(int16 ×0.1°) + max(int16 ×0.1°) */
+        if (dLen >= 5) {
+            uint8_t axis = d[0];
+            if (axis < 3) {
+                int16_t lo = (int16_t)((d[1] << 8) | d[2]);
+                int16_t hi = (int16_t)((d[3] << 8) | d[4]);
+                if (lo > hi) {          /* 示教时先碰到哪一端都行，这里统一成 min < max */
+                    int16_t tmp = lo;
+                    lo = hi;
+                    hi = tmp;
+                }
+                PiCommand.GimbalLimit[axis].Min = lo / 10.f;
+                PiCommand.GimbalLimit[axis].Max = hi / 10.f;
+                PiCommand.GimbalLimit[axis].Valid = 1;
+            }
+        }
+        break;
+    case PI_CMD_GIMBAL_RELEASE:     /* en(u8)：1=松轴（电机控制板失能） 0=恢复 */
+        if (dLen >= 1)
+            PiCommand.GimbalRelease = d[0] ? 1 : 0;
         break;
     case PI_CMD_HEARTBEAT:
         break;
@@ -304,4 +319,24 @@ void PiComm_SendStatus(uint8_t state, uint8_t err, uint8_t motorOnlineMask)
 {
     uint8_t d[3] = { state, err, motorOnlineMask };
     PiComm_SendFrame(PI_RPT_STATUS, d, sizeof(d));
+}
+
+/* 角度 → int16（×0.1°），带限幅：限位示教时人手拨动不会越界，但树莓派收到的
+   值必须始终落在 int16 里，否则强转会把 3276.8° 变成负数、示教点直接错乱。 */
+static int16_t PiComm_DegToInt16x10(float deg)
+{
+    float v = deg * 10.0f;
+    if (v >  32767.0f) v =  32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    return (int16_t)v;
+}
+
+void PiComm_SendGimbalPose(float yawDeg, float liftDeg, float extendDeg)
+{
+    int16_t y = PiComm_DegToInt16x10(yawDeg);
+    int16_t l = PiComm_DegToInt16x10(liftDeg);
+    int16_t e = PiComm_DegToInt16x10(extendDeg);
+
+    uint8_t d[6] = { y >> 8, y, l >> 8, l, e >> 8, e };
+    PiComm_SendFrame(PI_RPT_GIMBAL, d, sizeof(d));
 }

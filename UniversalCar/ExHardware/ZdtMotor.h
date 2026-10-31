@@ -71,6 +71,7 @@ void ZdtCan_Init(void);                             /* 配置过滤器 + 启动 
 void ZdtCan_Enable(uint8_t addr, uint8_t en);       /* en: 1 使能锁轴 / 0 去使能松轴 */
 void ZdtCan_Stop(uint8_t addr);                     /* 立即停止 */
 void ZdtCan_SetZero(uint8_t addr);                  /* 当前位置清零 */
+void ZdtCan_ClearStall(uint8_t addr);               /* 解除堵转保护（堵转后保护锁存，电机在线但不动，必须清） */
 void ZdtCan_Home(uint8_t addr, uint8_t mode);       /* 触发回零 */
 void ZdtCan_SyncAll(void);                          /* 广播触发多机同步 */
 void ZdtCan_ReadPos(uint8_t addr);                  /* 读取实时位置(0x36) */
@@ -78,18 +79,37 @@ void ZdtCan_ReadStatus(uint8_t addr);               /* 读取回零+电机状态
 void ZdtCan_SetTimedReturn(uint8_t addr, uint8_t func, uint16_t interval_ms);  /* 定时返回信息命令 */
 
 /* ============ 多电机命令 (0xAA)：一条广播帧发多个电机命令，同时执行 ============ */
+/* 组帧上下文：由发送方任务持有。全总线只能有一个发送者——两条 0xAA 序列共用
+   CAN ID 0x000/0x001…，电机按包序号重组时会互相串包（0x6B 是固定字节、不是真校验，
+   串出来的错帧照样会被执行）；而且 CAN1 只有 3 个发送邮箱，两个任务抢会把多包
+   广播挤掉一包、整帧作废。现在只有底盘任务发帧，每 10ms：一条 4 轮速度的 0xAA
+   广播（37 字节 / 6 包）+ 云台三轴各一条 F6 单机帧 + 云台的一次性命令
+   （Gimbal_TxService 发的单机帧）。7 条子命令的广播（61 字节 / 9 包）实测电机不执行，
+   别再把云台塞进广播里。 */
 
-void ZdtCan_MultiBegin(void);                                   /* 清空多电机缓冲，开始组帧 */
-void ZdtCan_MultiAdd(uint8_t addr, const uint8_t* cmd, uint8_t len);   /* 追加一条子命令（不含地址/校验码） */
-void ZdtCan_MultiSend(void);                                    /* 广播发送 00 AA 长度 + 各子命令 + 校验码 */
+#define ZDT_MULTI_BUF_MAX  128      /* 子命令缓冲（4 轮速度 32B，留足余量） */
+
+typedef struct
+{
+    uint8_t  Buf[ZDT_MULTI_BUF_MAX];            /* 子命令：地址 + 命令 + 校验码 */
+    uint16_t Len;
+    uint8_t  Tx[ZDT_MULTI_BUF_MAX + 8];         /* 组好的广播帧：不占任务栈（两个任务栈都只有 1KB） */
+} ZdtMulti_t;
+
+void ZdtCan_MultiBegin(ZdtMulti_t* ctx);                                               /* 清空缓冲，开始组帧 */
+void ZdtCan_MultiAdd(ZdtMulti_t* ctx, uint8_t addr, const uint8_t* cmd, uint8_t len);  /* 追加一条子命令（不含地址/校验码） */
+void ZdtCan_MultiSend(ZdtMulti_t* ctx);                                                /* 广播发送 AA 长度 + 各子命令 + 校验码 */
 
 /* ============ 电机级命令（操作 ZdtMotor_t 句柄，内部转协议） ============ */
 
 /// @brief 速度模式：speed 单位 RPM（整数，方向自动）
 void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm);
 
-/// @brief 速度子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，用于底盘 4 轮同步）
-void ZdtMotor_MultiAddSpeed(ZdtMotor_t* motor, float rpm);
+/// @brief 速度子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动）
+void ZdtMotor_MultiAddSpeed(ZdtMulti_t* ctx, ZdtMotor_t* motor, float rpm);
+
+/// @brief 位置子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动）
+void ZdtMotor_MultiAddPosition(ZdtMulti_t* ctx, ZdtMotor_t* motor, float deg, uint8_t mode);
 
 /// @brief 位置模式：pos 单位 °（内部转脉冲 3200/圈），mode 见 ZDT_POS_*
 void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode);

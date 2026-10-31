@@ -13,7 +13,7 @@
 ZdtMotor_t* ZdtMotorList[8] = { NULL };
 
 /* 发送一帧（单包），扩展帧 ID = (地址<<8)|包序号 */
-static void Zdt_SendFrame(uint8_t addr, uint8_t packet, const uint8_t* d, uint8_t n)
+static uint8_t Zdt_SendFrame(uint8_t addr, uint8_t packet, const uint8_t* d, uint8_t n)
 {
     CAN_TxHeaderTypeDef tx = { 0 };
     uint32_t mb;
@@ -22,17 +22,19 @@ static void Zdt_SendFrame(uint8_t addr, uint8_t packet, const uint8_t* d, uint8_
     tx.RTR = CAN_RTR_DATA;
     tx.DLC = n;
 
-    /* CAN1 只有 3 个 TX 邮箱，全满时 HAL_CAN_AddTxMessage 会直接丢帧（返回 HAL_ERROR）。
-       底盘/云台都是背靠背连发 4~6 帧，必须等空闲邮箱，否则后几帧被静默丢弃。
-       但不能死等：外设 bus-off 时 HAL 会一直立即返回错误，原来的 10000 次空转
-       能在这个 5ms 任务里卡十几毫秒，把底盘和云台一起拖慢。这里按时间封顶，
-       真丢了也没关系——速度和位置指令都是幂等的，下个周期会重发。 */
+    /* CAN1 只有 3 个 TX 邮箱，全满时 HAL_CAN_AddTxMessage 直接返回 HAL_ERROR（丢帧）。
+       底盘任务背靠背连发一整串广播包，必须等空闲邮箱；但不能死等：bus-off 时 HAL 会
+       一直立即返回错误，纯空转能把 10ms 任务卡十几毫秒。这里按时间封顶。
+       现在全总线只有底盘任务发帧，不会再有另一个任务来抢邮箱（之前云台任务也发，
+       两边互相挤，多包广播丢一包就整帧作废——"底盘卡住"、某轴"完全没反应"）。 */
     HAL_StatusTypeDef ret = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
     uint32_t t0 = HAL_GetTick();
     while (ret != HAL_OK && (HAL_GetTick() - t0) < ZDT_TX_TIMEOUT_MS)
     {
+        osThreadYield();
         ret = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t*)d, &mb);
     }
+    return (ret == HAL_OK);
 }
 
 /* 低层发送：cmd[0] 为功能码，追加校验码后拆包发送。
@@ -120,6 +122,16 @@ void ZdtCan_SetZero(uint8_t addr)
     Zdt_MotorSend(addr, c, sizeof(c));
 }
 
+/* 解除堵转保护（手册 5.4.x：0x0E 0x52）。
+   电机撞限位堵转后，固件会把保护标志【锁存】：位置反馈照常回（所以在状态掩码里显示
+   在线），但拒绝一切速度/位置命令——表现就是"电机在线，可怎么按都不动"，
+   必须掉电重启才恢复。这条命令就是软件侧的"重启"，使能时补一帧即可。 */
+void ZdtCan_ClearStall(uint8_t addr)
+{
+    uint8_t c[] = { 0x0E, 0x52 };
+    Zdt_MotorSend(addr, c, sizeof(c));
+}
+
 void ZdtCan_Home(uint8_t addr, uint8_t mode)
 {
     uint8_t c[] = { 0x9A, mode, 0x00 };
@@ -155,37 +167,42 @@ void ZdtCan_SetTimedReturn(uint8_t addr, uint8_t func, uint16_t interval_ms)
 
 /* ============ 多电机命令 (0xAA)：一条广播帧发多个电机命令，同时执行 ============ */
 /* 手册 5.3.1：00 AA 总字节数(2) + 各子命令(地址+功能码/数据+校验码) + 校验码，
-   地址 0 为广播，所有电机同时开始；CAN 上按功能码重复规则拆包。 */
+   地址 0 为广播，所有电机同时开始；CAN 上按功能码重复规则拆包。
+   组帧缓冲放在 ctx 里、由调用任务持有。全总线只能有一个 0xAA 发送者：两条序列
+   的 CAN ID 都是 0x000/0x001…，电机按包序号重组会串包，而 0x6B 是固定字节、
+   拦不住错帧——串出来的帧会被电机当真执行。目前只有底盘任务在组广播帧。 */
 
-static uint8_t  s_MultiBuf[256];
-static uint16_t s_MultiLen;
-
-void ZdtCan_MultiBegin(void)
+void ZdtCan_MultiBegin(ZdtMulti_t* ctx)
 {
-    s_MultiLen = 0;
+    ctx->Len = 0;
 }
 
 /* 追加一条子命令：地址 + 功能码/数据 + 校验码 */
-void ZdtCan_MultiAdd(uint8_t addr, const uint8_t* cmd, uint8_t len)
+void ZdtCan_MultiAdd(ZdtMulti_t* ctx, uint8_t addr, const uint8_t* cmd, uint8_t len)
 {
-    s_MultiBuf[s_MultiLen++] = addr;
+    if (ctx->Len + len + 2 > ZDT_MULTI_BUF_MAX)   /* 装不下就丢这一条，绝不越界 */
+        return;
+
+    ctx->Buf[ctx->Len++] = addr;
     for (uint8_t i = 0; i < len; i++)
-        s_MultiBuf[s_MultiLen++] = cmd[i];
-    s_MultiBuf[s_MultiLen++] = ZDT_CHECKSUM;
+        ctx->Buf[ctx->Len++] = cmd[i];
+    ctx->Buf[ctx->Len++] = ZDT_CHECKSUM;
 }
 
 /* 广播发送整帧，按"每包首字节重复功能码 AA、每包最多 8 字节"拆包 */
-void ZdtCan_MultiSend(void)
+void ZdtCan_MultiSend(ZdtMulti_t* ctx)
 {
-    uint16_t total = (uint16_t)(5 + s_MultiLen);   /* 地址1 + 功能码1 + 长度2 + 子命令 + 校验1 */
+    if (ctx->Len == 0)
+        return;
 
-    static uint8_t tx[261];
+    uint16_t total = (uint16_t)(5 + ctx->Len);   /* 功能码1 + 长度2 + 子命令 + 校验1 */
+    uint8_t* tx = ctx->Tx;
     uint16_t n = 0;
     tx[n++] = 0xAA;                       /* 功能码 */
     tx[n++] = (uint8_t)(total >> 8);      /* 长度高 */
     tx[n++] = (uint8_t)(total & 0xFF);    /* 长度低 */
-    for (uint16_t i = 0; i < s_MultiLen; i++)
-        tx[n++] = s_MultiBuf[i];
+    for (uint16_t i = 0; i < ctx->Len; i++)
+        tx[n++] = ctx->Buf[i];
     tx[n++] = ZDT_CHECKSUM;
 
     /* tx[0]=AA 为功能码，tx[1..n-1] 为数据，按功能码重复规则拆包发送（地址0 → ExtId 0x0000） */
@@ -230,31 +247,52 @@ void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm)
     motor->Speed.Set = rpm;
 }
 
-/* 速度子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，用于底盘 4 轮同步） */
-void ZdtMotor_MultiAddSpeed(ZdtMotor_t* motor, float rpm)
+/* 速度子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动） */
+void ZdtMotor_MultiAddSpeed(ZdtMulti_t* ctx, ZdtMotor_t* motor, float rpm)
 {
     uint8_t c[6];
     ZdtMotor_BuildSpeed(rpm, c);
-    ZdtCan_MultiAdd(motor->Addr, c, sizeof(c));
+    ZdtCan_MultiAdd(ctx, motor->Addr, c, sizeof(c));
 
     motor->Speed.Set = rpm;
 }
 
 /* 位置模式（Emm 固件 FD）：dir + 速度(整数RPM,2B) + 加速度(档位,1B) + 脉冲(4B,3200/圈) + 模式 + 同步 */
-void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode)
+static uint8_t ZdtMotor_BuildPosition(float deg, uint8_t mode, uint8_t* out)
 {
-    /* 方向按目标与当前实时位置的差自动取 */
+    /* 方向按目标的符号取 */
     uint8_t dir = (deg < 0.0f) ? 1 : 0;
     uint32_t pulse = (uint32_t)(fabsf(deg) * ZDT_PULSE_PER_REV / 360.0f);
 
-    uint8_t c[] = {
-        0xFD, dir,
-        ZDT_POS_SPEED_MAX >> 8, ZDT_POS_SPEED_MAX & 0xFF,   /* 速度，整数 RPM */
-        ZDT_ACC_DEFAULT,                                     /* 加速度档位 */
-        pulse >> 24, pulse >> 16, pulse >> 8, pulse & 0xFF,  /* 脉冲 4B */
-        mode, 0x00
-    };
-    Zdt_MotorSend(motor->Addr, c, sizeof(c));
+    out[0]  = 0xFD;
+    out[1]  = dir;
+    out[2]  = ZDT_POS_SPEED_MAX >> 8;                       /* 速度，整数 RPM */
+    out[3]  = ZDT_POS_SPEED_MAX & 0xFF;
+    out[4]  = ZDT_ACC_DEFAULT;                              /* 加速度档位 */
+    out[5]  = pulse >> 24;                                  /* 脉冲 4B */
+    out[6]  = pulse >> 16;
+    out[7]  = pulse >> 8;
+    out[8]  = pulse & 0xFF;
+    out[9]  = mode;
+    out[10] = 0x00;
+    return 11;
+}
+
+void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode)
+{
+    uint8_t c[11];
+    uint8_t n = ZdtMotor_BuildPosition(deg, mode, c);
+    Zdt_MotorSend(motor->Addr, c, n);
+
+    motor->Position.Set = deg;
+}
+
+/* 位置子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动） */
+void ZdtMotor_MultiAddPosition(ZdtMulti_t* ctx, ZdtMotor_t* motor, float deg, uint8_t mode)
+{
+    uint8_t c[11];
+    uint8_t n = ZdtMotor_BuildPosition(deg, mode, c);
+    ZdtCan_MultiAdd(ctx, motor->Addr, c, n);
 
     motor->Position.Set = deg;
 }

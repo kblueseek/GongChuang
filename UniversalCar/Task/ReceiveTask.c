@@ -31,7 +31,8 @@ void ReceiveTask(void const* argument)
     Receive.LastOnlineTick = 0;
 
     uint32_t LastReportTick = 0;
-    uint32_t LastOdomTick = 0;
+    uint32_t LastOdomTick   = 0;
+    uint32_t LastGimbalTick = 0;
 
     while (1)
     {
@@ -43,6 +44,9 @@ void ReceiveTask(void const* argument)
         if (!PiComm_IsOnline()) {
             PiCommand.Enabled = 0;
             PiCommand.Vel.Vx = PiCommand.Vel.Vy = PiCommand.Vel.Wz = 0;   /* 清速度，防重连后残留 */
+            /* 松轴是示教时的临时状态：树莓派一掉线就恢复锁轴，不能让人手扶着的
+               升降轴在无人看管时一直处于无保持力的状态。 */
+            PiCommand.GimbalRelease = 0;
         }
 
 #if BLE_CONTROL_ENABLE
@@ -76,13 +80,23 @@ void ReceiveTask(void const* argument)
             PiComm_SendStatus(Receive.State, Receive.ErrorFlag, mask);
         }
 
-        /* ---- 里程计回传（PI_RPT_FREQ_HZ，默认 20Hz）：Pi 位置闭环/状态机靠它判断是否到位 ---- */
+        /* ---- 里程计回传（PI_RPT_FREQ_HZ=50Hz）：Pi 位置闭环/状态机靠它判断是否到位 ---- */
         if (NowTick - LastOdomTick >= (1000 / PI_RPT_FREQ_HZ))
         {
             LastOdomTick = NowTick;
             PiComm_SendOdometry(Chassis.Pos.X * 1000.f,
                                 Chassis.Pos.Y * 1000.f,
                                 Imu.Yaw * (PI / 180.f) * 1000.f);   /* ° → mrad */
+        }
+
+        /* ---- 云台三轴位置回传（PI_GIMBAL_RPT_FREQ_HZ=20Hz）：状态屏显示 + 限位示教 ----
+           值 = 相对「上电位置」的角度，和云台限位用的是同一个坐标。 */
+        if (NowTick - LastGimbalTick >= (1000 / PI_GIMBAL_RPT_FREQ_HZ))
+        {
+            LastGimbalTick = NowTick;
+            float rel[3];
+            Gimbal_GetRelDeg(rel);
+            PiComm_SendGimbalPose(rel[0], rel[1], rel[2]);
         }
     }
 }

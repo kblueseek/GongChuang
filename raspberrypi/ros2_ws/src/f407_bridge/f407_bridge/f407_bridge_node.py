@@ -44,8 +44,10 @@ from f407_bridge.pi_comm import (
     RfcommLink,       # 经典蓝牙 SPP（当串口用）
     RPT_ODOM,         # 回传数据编号：里程计
     RPT_STATUS,       # 回传数据编号：状态
+    RPT_GIMBAL,       # 回传数据编号：云台三轴位置
     parse_odom,       # 解析里程计的函数
     parse_status,     # 解析状态的函数
+    parse_gimbal,     # 解析云台位置的函数
 )
 
 # F407 超过这么久没有任何回传，就认为它掉线了（状态 5Hz + 里程计 20Hz，1.5s 足够宽容）
@@ -64,6 +66,7 @@ class F407BridgeNode(Node):
         self.declare_parameter('ble_scan_timeout', 8.0)
         self.declare_parameter('rfcomm_device', '/dev/rfcomm0')
         self.declare_parameter('wire_device', '/dev/ttyAMA0')
+        self.declare_parameter('wire_baudrate', 115200)          # 必须和 F407 USART6 一致
         self.declare_parameter('downlink', 'wire')               # wire / lora
         self.declare_parameter('lora_device', '/dev/ttyAMA2')
         self.declare_parameter('lora_baudrate', 115200)
@@ -81,18 +84,24 @@ class F407BridgeNode(Node):
         self.create_subscription(Float32MultiArray, '/cmd_gimbal_vel', self._cb_cmd_gimbal_vel, 10)
         self.create_subscription(Int32, '/cmd_gimbal_home', self._cb_cmd_gimbal_home, 10)
         self.create_subscription(Int32, '/cmd_led', self._cb_cmd_led, 10)
+        # 限位示教结果：[轴号, 下限°, 上限°]；松轴开关：True=松轴
+        self.create_subscription(Float32MultiArray, '/cmd_gimbal_limit', self._cb_cmd_gimbal_limit, 10)
+        self.create_subscription(Bool, '/cmd_gimbal_release', self._cb_cmd_gimbal_release, 10)
 
         # ================= 方向2：发布话题（F407 -> ROS2） =================
         self._pub_odom = self.create_publisher(Odometry, '/odom', 10)
         self._pub_status = self.create_publisher(Int32MultiArray, '/robot_status', 10)
+        self._pub_gimbal = self.create_publisher(Float32MultiArray, '/gimbal_state', 10)
         self._pub_online = self.create_publisher(Bool, '/f407_online', 10)      # F407 是否有回传
         self._pub_ble = self.create_publisher(Bool, '/ble_connected', 10)       # 上行链路是否连着（有线=串口已打开，蓝牙=BLE 已连）
 
         # ================= 定时器 =================
         # 心跳 5Hz：F407 侧 500ms 收不到任何指令就会自主失能，必须比它快。
         self._heartbeat_timer = self.create_timer(0.2, self._on_heartbeat)
-        # 收下行数据 20Hz：F407 侧里程计 20Hz、状态 5Hz，20Hz 轮询足够且不占 CPU。
-        self._poll_timer = self.create_timer(0.05, self._on_poll)
+        # 收下行数据 50Hz：F407 侧里程计 50Hz、云台位置 20Hz、状态 5Hz。
+        # 一次 poll 会把串口里积压的字节全读完，50Hz 只是把"到达延迟"压到 20ms 以内，
+        # 不会丢帧；频率再低就会把 50Hz 里程计攒成一串突发帧发出去。
+        self._poll_timer = self.create_timer(0.02, self._on_poll)
         # 链路状态 2Hz：发布"F407 是否在线 / 上行链路是否连着"，给状态屏和别的节点用。
         self._link_timer = self.create_timer(0.5, self._on_link_status)
 
@@ -119,8 +128,9 @@ class F407BridgeNode(Node):
         down = str(self.get_parameter('downlink').value).lower()
         if up == 'wire' and down == 'wire':
             device = self.get_parameter('wire_device').value
-            link = PiCommLink(device=device, baudrate=115200)
-            self.get_logger().info(f'有线直连：{device} @ 115200（上行 + 下行共用一条串口）')
+            baud = int(self.get_parameter('wire_baudrate').value)
+            link = PiCommLink(device=device, baudrate=baud)
+            self.get_logger().info(f'有线直连：{device} @ {baud}（上行 + 下行共用一条串口）')
             return link, link
         return self._make_uplink(), self._make_downlink()
 
@@ -129,8 +139,9 @@ class F407BridgeNode(Node):
         mode = str(self.get_parameter('uplink').value).lower()
         if mode == 'wire':
             device = self.get_parameter('wire_device').value
-            self.get_logger().info(f'上行：有线 {device}')
-            return PiCommLink(device=device, baudrate=115200)
+            baud = int(self.get_parameter('wire_baudrate').value)
+            self.get_logger().info(f'上行：有线 {device} @ {baud}')
+            return PiCommLink(device=device, baudrate=baud)
         if mode == 'rfcomm':
             device = self.get_parameter('rfcomm_device').value
             self.get_logger().info(f'上行：经典蓝牙 SPP {device}')
@@ -155,7 +166,7 @@ class F407BridgeNode(Node):
         mode = str(self.get_parameter('downlink').value).lower()
         if mode == 'wire':
             device = self.get_parameter('wire_device').value
-            baud = 115200
+            baud = int(self.get_parameter('wire_baudrate').value)
             self.get_logger().info(f'下行：有线 {device} @ {baud}')
         else:
             device = self.get_parameter('lora_device').value
@@ -217,6 +228,17 @@ class F407BridgeNode(Node):
         """收到 /cmd_led：补光灯亮度 0~100%。"""
         self._up.send_led(float(msg.data))
 
+    def _cb_cmd_gimbal_limit(self, msg: Float32MultiArray):
+        """收到 /cmd_gimbal_limit：msg.data = [轴号, 下限°, 上限°]（限位示教结果）。"""
+        if len(msg.data) >= 3:
+            axis = int(msg.data[0])
+            if 0 <= axis <= 2:
+                self._up.send_gimbal_limit(axis, float(msg.data[1]), float(msg.data[2]))
+
+    def _cb_cmd_gimbal_release(self, msg: Bool):
+        """收到 /cmd_gimbal_release：True=松轴（电机控制板失能，可手拨），False=恢复。"""
+        self._up.send_gimbal_release(bool(msg.data))
+
     # ---------------- 定时器回调 ----------------
 
     def _on_heartbeat(self):
@@ -229,7 +251,7 @@ class F407BridgeNode(Node):
         self._up.send_enable(self._enable_state)
 
     def _on_poll(self):
-        """20Hz 从下行串口收数据，可能一次收到多帧。"""
+        """50Hz 从下行串口收数据，可能一次收到多帧。"""
         for cmd, data in self._down.poll():
             self._last_rx_s = self.get_clock().now().nanoseconds / 1e9
             if cmd == RPT_ODOM:
@@ -237,6 +259,9 @@ class F407BridgeNode(Node):
             elif cmd == RPT_STATUS:
                 state, err, mask = parse_status(data)
                 self._pub_status.publish(Int32MultiArray(data=[state, err, mask]))
+            elif cmd == RPT_GIMBAL:
+                self._pub_gimbal.publish(
+                    Float32MultiArray(data=[float(v) for v in parse_gimbal(data)]))
 
     def _on_link_status(self):
         """2Hz 发布链路状态，并在线状态变化时打一条日志。"""

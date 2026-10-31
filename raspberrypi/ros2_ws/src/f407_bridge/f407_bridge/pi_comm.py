@@ -72,12 +72,15 @@ CMD_CAM = 0x06        # 相机舵机
 CMD_ENABLE = 0x07     # 整车使能/失能（单一状态，1=使能 0=失能）
 CMD_POSE = 0x09       # 位姿目标（走到世界系 (x,y) 并转到朝向 yaw，底盘位置+航向闭环）
 CMD_LED = 0x0A        # 补光灯亮度（0~100%，PWM 调光）
+CMD_GIMBAL_LIMIT = 0x0B    # 云台单轴限位（示教结果下发）
+CMD_GIMBAL_RELEASE = 0x0C  # 云台三轴松轴/恢复（限位示教时人手拨动）
 CMD_HEARTBEAT = 0x10  # 心跳（定期发一次，告诉 F407 "我还活着"）
 
 # ==================== 回传数据编号 ====================
 # 这些是 F407 主动发给树莓派的"数据编号"（方向反过来）。编号都 >= 0x80，用最高位区分方向。
 RPT_ODOM = 0x81        # 里程计（车走了多远、朝向多少）
 RPT_STATUS = 0x83      # 整车状态（状态、错误码、电机在线情况）
+RPT_GIMBAL = 0x84      # 云台三轴位置（相对上电位置，单位 °）
 
 # 帧头两个字节
 SOF1 = 0xAA
@@ -217,6 +220,29 @@ def encode_gimbal_vel(axis: int, deg_per_s: float) -> bytes:
     return struct.pack(">Bh", axis, spd)  # B=1字节无符号, h=2字节 int16
 
 
+def encode_gimbal_limit(axis: int, min_deg: float, max_deg: float) -> bytes:
+    """云台单轴限位（0x0B）：轴号(1字节) + 下限(int16, ×0.1°) + 上限(int16, ×0.1°)。
+
+    这两个角度是"相对 F407 上电位置"的坐标，和云台位置回传 0x84 完全同一套坐标：
+    示教时树莓派看到多少，就原样发回来。F407 收到后覆盖 RobotConfig.h 的默认限位。
+    """
+    if axis not in (0, 1, 2):
+        raise PiCommError(f"云台轴越界：{axis}")
+    lo = int(round(min_deg * 10.0))
+    hi = int(round(max_deg * 10.0))
+    if lo > hi:
+        lo, hi = hi, lo
+    for name, val in (("min", lo), ("max", hi)):
+        if not -32768 <= val <= 32767:
+            raise PiCommError(f"{name} 超出 int16：{val}")
+    return struct.pack(">Bhh", axis, lo, hi)
+
+
+def encode_gimbal_release(en: bool) -> bytes:
+    """云台松轴（0x0C）：1 字节，1=松轴（电机控制板失能，可手拨），0=恢复锁轴。"""
+    return bytes([1 if en else 0])
+
+
 def encode_home(mask: int) -> bytes:
     """云台回零指令内容：一个字节，每一位代表一个轴要不要回零。"""
     return bytes([mask & 0x07])   # 只保留低 3 位（3 个轴）
@@ -260,6 +286,18 @@ def parse_status(data: bytes) -> tuple[int, int, int]:
     if len(data) != 3:
         raise PiCommError(f"状态帧长度应为3，实际{len(data)}")
     return data[0], data[1], data[2]   # 三个字节依次对应三个含义
+
+
+def parse_gimbal(data: bytes) -> tuple[float, float, float]:
+    """解析云台位置帧（0x84），返回 (yaw°, lift°, extend°)。
+
+    三个 int16，单位 0.1°，坐标是"相对 F407 上电位置"。上电后不要用手去掰轴，
+    否则这个基准就变了（限位示教就是在这个基准上做的）。
+    """
+    if len(data) != 6:
+        raise PiCommError(f"云台位置帧长度应为6，实际{len(data)}")
+    yaw, lift, extend = struct.unpack(">hhh", data)
+    return yaw / 10.0, lift / 10.0, extend / 10.0
 
 
 class PiCommLink:
@@ -364,6 +402,12 @@ class PiCommLink:
 
     def send_gimbal_vel(self, axis: int, deg_per_s: float) -> bool:
         return self._send(CMD_GIMBAL_VEL, encode_gimbal_vel(axis, deg_per_s))
+
+    def send_gimbal_limit(self, axis: int, min_deg: float, max_deg: float) -> bool:
+        return self._send(CMD_GIMBAL_LIMIT, encode_gimbal_limit(axis, min_deg, max_deg))
+
+    def send_gimbal_release(self, en: bool) -> bool:
+        return self._send(CMD_GIMBAL_RELEASE, encode_gimbal_release(en))
 
     def send_home(self, mask: int) -> bool:
         return self._send(CMD_HOME, encode_home(mask))
@@ -605,6 +649,12 @@ class BleLink:
 
     def send_gimbal_vel(self, axis: int, deg_per_s: float) -> bool:
         return self._send(CMD_GIMBAL_VEL, encode_gimbal_vel(axis, deg_per_s))
+
+    def send_gimbal_limit(self, axis: int, min_deg: float, max_deg: float) -> bool:
+        return self._send(CMD_GIMBAL_LIMIT, encode_gimbal_limit(axis, min_deg, max_deg))
+
+    def send_gimbal_release(self, en: bool) -> bool:
+        return self._send(CMD_GIMBAL_RELEASE, encode_gimbal_release(en))
 
     def send_home(self, mask: int) -> bool:
         return self._send(CMD_HOME, encode_home(mask))

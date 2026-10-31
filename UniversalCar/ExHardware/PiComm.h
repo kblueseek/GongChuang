@@ -29,11 +29,14 @@
 #define PI_CMD_GIMBAL_VEL    0x08    /* DATA: axis(u8 0=yaw/1=lift/2=extend) + deg/s(int16，整数 °/s) */
 #define PI_CMD_POSE          0x09    /* DATA: x y yaw (int32 mm, int32 mm, int16 mrad)，底盘位姿目标(位置+航向闭环) */
 #define PI_CMD_LED           0x0A    /* DATA: brightness(u8, 0~100%) 补光灯亮度（PWM 调光） */
+#define PI_CMD_GIMBAL_LIMIT  0x0B    /* DATA: axis(u8) + min(int16 ×0.1°) + max(int16 ×0.1°) 示教限位 */
+#define PI_CMD_GIMBAL_RELEASE 0x0C   /* DATA: en(u8)，1=松轴（电机控制板失能，可手拨） 0=恢复锁轴 */
 #define PI_CMD_HEARTBEAT     0x10    /* DATA: 无，1Hz */
 
 /* ============ 遥测码（STM32 → 树莓派） ============ */
 #define PI_RPT_ODOM          0x81    /* DATA: x y theta (int32 mm, int32 mm, int16 mrad) */
 #define PI_RPT_STATUS        0x83    /* DATA: state(u8) + err(u8) + motor_online_mask(u8) */
+#define PI_RPT_GIMBAL        0x84    /* DATA: yaw lift extend (int16 ×0.1°，相对上电位置) */
 
 /// @brief 树莓派下发的整车指令（各任务直接读）
 typedef struct
@@ -56,6 +59,15 @@ typedef struct
         float    DegPerSec; //目标角速度 °/s（PI_CMD_GIMBAL_VEL 下发，速度模式用）
         uint32_t Tick;      //最后一次收到该轴速度指令的时刻，0 = 从没收到过
     } GimbalVel[3];
+
+    struct
+    {
+        float Min;      //示教下限 °（相对上电位置）
+        float Max;      //示教上限 °
+        uint8_t Valid;  //1 = 树莓派下发过，云台用它覆盖 RobotConfig.h 的默认值
+    } GimbalLimit[3];
+
+    uint8_t GimbalRelease;  //1 = 云台三轴松轴（电机控制板失能，可手拨） 0 = 正常
 
     uint8_t HomeMask;   //回零请求 bit0=yaw bit1=lift bit2=extend（执行后由任务清除）
     uint8_t Enabled;    //整车使能状态：1=使能 0=失能（唯一状态，无急停/锁存区分）
@@ -102,6 +114,9 @@ void PiComm_SendOdometry(float x_mm, float y_mm, float theta_mrad);
 
 /// @brief 发送整车状态（电机在线掩码等）
 void PiComm_SendStatus(uint8_t state, uint8_t err, uint8_t motorOnlineMask);
+
+/// @brief 发送云台三轴位置（相对上电位置，单位 °；状态屏显示 + 限位示教用）
+void PiComm_SendGimbalPose(float yawDeg, float liftDeg, float extendDeg);
 
 /// @brief UART4（LoRa）发送完成回调，由 usart.c 的 HAL_UART_TxCpltCallback 调用
 void PiComm_TxCpltCallback(void);

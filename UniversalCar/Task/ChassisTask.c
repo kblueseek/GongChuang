@@ -10,10 +10,23 @@
 
 #include "header.h"
 
+/* 200 Hz。总线预算：每拍 5 包广播(8B) + 3 条云台单机帧(7B)，最坏装填 ~1250 bit
+   ≈ 2.5ms@500k；7 个电机 10ms 回帧再占 ~21%。200Hz 合计约 76%，留 1/4 余量。
+   （100Hz≈48%，250Hz≈90% 已经很挤，理论上限约 285Hz；再快只能把回传周期放长） */
 #define CHASSIS_TASK_UPDATE_TICK 5
 
 /* 编码器计数 → 轮位移系数：65536 计数 = 1 圈 = 2πR，即 1 计数 ≈ 3.76µm */
 #define WHEEL_M_PER_COUNT  ((2.0f * PI * WHEEL_RADIUS_M) / 65536.0f)
+
+/* 多电机广播（0xAA）组帧缓冲。全总线只有本任务一个发送者，每拍组一条帧：
+   只放 4 轮速度（32 字节子命令 → 整帧 37 字节 / 6 个 CAN 包，实测一直好用）。
+   云台三轴不塞进这条广播：7 条子命令会撑到 61 字节 / 9 个 CAN 包，现场实测电机
+   一条都不执行（手册示例最长 34 字节 / 5 包）。云台三轴改用单机 F6 帧，
+   由 Gimbal_SendAxisSpeedFrames() 紧随广播之后、在同一个任务里发出。
+   云台的一次性命令（使能/解堵转/回传配置）也由 Gimbal_TxService() 在本任务里发。
+   两个任务各发各的会出两种问题：两条 0xAA 序列共用 CAN ID 0x000/0x001… 电机按包
+   序号重组会串包；而且抢 CAN1 的 3 个发送邮箱，广播丢一包整帧作废（底盘卡住）。 */
+static ZdtMulti_t s_MultiCtx;
 
 /* ==================== 航向保持 PID 参数（度域：误差 ° → 输出 °/s） ====================
    IMU Yaw 作反馈，PID 输出当作车体自旋速度 Wz。目标航向由 spin 滑杆给出（-180~180°）。
@@ -152,25 +165,52 @@ static void Chassis_PosPidInit(void)
    实际速度(Chassis.Vel / WheelRpm)另算，供阻尼/交叉校验用，不进位置累加。 */
 static void Chassis_OdometryUpdate(void)
 {
+    static uint32_t s_OdomTick = 0;
+
     /* 首帧：等 4 轮都收到编码器反馈后再初始化差分基准，避免起始跳变 */
     if (!Chassis.OdomReady) {
         for (int i = 0; i < 4; i++)
             if (!ZdtMotor_IsOnline(&Chassis.Wheel[i])) return;
         for (int i = 0; i < 4; i++)
             Chassis.WheelLastCount[i] = Chassis.Wheel[i].Position.RawCount;
+        s_OdomTick = HAL_GetTick();
         Chassis.OdomReady = 1;
         return;
     }
 
-    float dt = CHASSIS_TASK_UPDATE_TICK * 0.001f;
+    /* 控制周期（5ms）比编码器回传周期（10ms）快：没有新数据的那一拍 dCount 恒为 0，
+       按固定 dt 去算会把实际速度打成 0、下一拍再翻倍。所以只在真的收到新计数时积分，
+       dt 取两次积分之间实际经过的时间；连续几拍都没有新数据再认为车停了。 */
+    uint32_t now = HAL_GetTick();
+    int32_t dCount[4];
+    uint8_t fresh = 0;
+
+    for (int i = 0; i < 4; i++) {
+        dCount[i] = Chassis.Wheel[i].Position.RawCount - Chassis.WheelLastCount[i];
+        if (dCount[i] != 0)
+            fresh = 1;
+    }
+    if (!fresh) {
+        if ((uint32_t)(now - s_OdomTick) >= 4 * ZDT_FEEDBACK_PERIOD_MS) {
+            Chassis.Vel.Vx = Chassis.Vel.Vy = Chassis.Vel.Wz = 0.0f;
+            for (int i = 0; i < 4; i++)
+                Chassis.WheelRpm[i] = 0.0f;
+        }
+        return;
+    }
+
+    float dt = (now - s_OdomTick) * 0.001f;
+    if (dt <= 0.0f)
+        return;
+    s_OdomTick = now;
+
     float L = WHEEL_HALF_WHEELBASE_M + WHEEL_HALF_TRACK_M;
     float dv[4];
 
     for (int i = 0; i < 4; i++) {
-        int32_t dCount = Chassis.Wheel[i].Position.RawCount - Chassis.WheelLastCount[i];
         Chassis.WheelLastCount[i] = Chassis.Wheel[i].Position.RawCount;
-        Chassis.WheelRpm[i] = (float)dCount * 60.0f / (65536.0f * dt);   /* 实际滚动 RPM */
-        dv[i] = (float)dCount * WHEEL_M_PER_COUNT * s_WheelDir[i];        /* 麦轮分量位移 m */
+        Chassis.WheelRpm[i] = (float)dCount[i] * 60.0f / (65536.0f * dt);   /* 实际滚动 RPM */
+        dv[i] = (float)dCount[i] * WHEEL_M_PER_COUNT * s_WheelDir[i];        /* 麦轮分量位移 m */
     }
 
     /* 麦轮正解：轮位移 → 车体位移/转角（系数为常数，位移级也线性成立） */
@@ -262,6 +302,12 @@ void ChassisTask(void const* argument)
     {
         osDelayUntil(&PreviousWakeTime, CHASSIS_TASK_UPDATE_TICK);
 
+        /* ---- 云台的一次性单机帧（使能 / 解除堵转 / 位置回传配置）----
+               云台任务只置请求，这里由全总线唯一的发送者发出去：如果云台任务自己
+               发，会和本任务连发的广播抢 CAN1 的 3 个发送邮箱，广播丢一包整帧作废
+               （底盘卡住），云台的单机帧也可能整条被挤掉（X 轴没反应）。 ---- */
+        Gimbal_TxService();
+
         /* ---- 周期性重发 4 轮定时返回配置（1s 一次）：防止个别电机上电慢/漏收
                导致没有编码器反馈(0x36)。配置命令幂等，重复发无害。 ---- */
         {
@@ -278,8 +324,10 @@ void ChassisTask(void const* argument)
         if (PiCommand.Enabled)
         {
             if (!Chassis.isEnable) {
-                for (int i = 0; i < 4; i++)
+                for (int i = 0; i < 4; i++) {
                     ZdtCan_Enable(Chassis.Wheel[i].Addr, 1);
+                    ZdtCan_ClearStall(Chassis.Wheel[i].Addr);   /* 刚使能：顺带清掉锁存的堵转保护 */
+                }
             }
             Chassis.isEnable = 1;
         }
@@ -290,11 +338,13 @@ void ChassisTask(void const* argument)
             }
             Chassis.isEnable = 0;
 
-            /* 失能仍周期发速度 0：平滑减速并锁轴，电机侧保持使能不松轴 */
-            ZdtCan_MultiBegin();
+            /* 失能：四轮广播每拍都发速度 0，云台三轴紧跟着各发一条 F6 速度 0，
+               平滑减速并锁轴，电机侧保持使能不松轴。整车失能 = 7 个电机全部持续被压住。 */
+            ZdtCan_MultiBegin(&s_MultiCtx);
             for (int i = 0; i < 4; i++)
-                ZdtMotor_MultiAddSpeed(&Chassis.Wheel[i], 0);
-            ZdtCan_MultiSend();
+                ZdtMotor_MultiAddSpeed(&s_MultiCtx, &Chassis.Wheel[i], 0);
+            ZdtCan_MultiSend(&s_MultiCtx);
+            Gimbal_SendAxisSpeedFrames();   /* 云台任务失能时已把 Rpm 压 0 */
             continue;
         }
 
@@ -362,11 +412,14 @@ void ChassisTask(void const* argument)
         Chassis_MecanumCalc(rpm);
         Chassis_WheelRpmLimit(rpm);
 
-        /* 四轮速度一次下发：多电机命令 0xAA（一条广播帧），4 轮同时开始执行 */
-        ZdtCan_MultiBegin();
+        /* 4 轮先走 0xAA 广播（一条帧，6 个 CAN 包，实测可用），
+           云台三轴随后各发一条单机 F6 帧。同一个任务、同一条时间线，
+           全总线仍然只有这一个发送者，云台任务只算不发。 */
+        ZdtCan_MultiBegin(&s_MultiCtx);
         for (int i = 0; i < 4; i++)
-            ZdtMotor_MultiAddSpeed(&Chassis.Wheel[i], rpm[i]);
-        ZdtCan_MultiSend();
+            ZdtMotor_MultiAddSpeed(&s_MultiCtx, &Chassis.Wheel[i], rpm[i]);
+        ZdtCan_MultiSend(&s_MultiCtx);
+        Gimbal_SendAxisSpeedFrames();
 
         /* ---- 载物盘舵机 ---- */
         Servo_SetAngle(&Chassis.PlateServo, PiCommand.Plate);

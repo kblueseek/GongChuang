@@ -41,6 +41,7 @@ def generate_launch_description():
             parameters=[{
                 'uplink': 'wire',
                 'wire_device': '/dev/ttyAMA0',
+                'wire_baudrate': 115200,     # 必须和 F407 USART6 一致
                 'downlink': 'wire',
             }],
         ),
@@ -66,7 +67,7 @@ def generate_launch_description():
             name='joy_control',
             output='screen',
         ),
-        # 7. 状态屏（I2C OLED：在线状态 / 坐标 / 朝向 / 电机掩码）
+        # 7. 状态屏（I2C OLED：三页可翻，按键 GPIO23）
         Node(
             package='f407_bridge',
             executable='status_display_node',

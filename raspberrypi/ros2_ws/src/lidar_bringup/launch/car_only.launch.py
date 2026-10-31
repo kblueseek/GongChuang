@@ -26,10 +26,11 @@ def generate_launch_description():
             parameters=[{
                 'uplink': 'wire',
                 'wire_device': '/dev/ttyAMA0',
+                'wire_baudrate': 115200,     # 必须和 F407 USART6 一致
                 'downlink': 'wire',
             }],
         ),
-        # 状态屏：I2C OLED（GPIO2/3），显示在线状态、坐标、朝向
+        # 状态屏：I2C OLED（GPIO2/3），三页（状态 / 云台位置 / 链路），按键 GPIO23 翻页
         Node(
             package='f407_bridge',
             executable='status_display_node',
