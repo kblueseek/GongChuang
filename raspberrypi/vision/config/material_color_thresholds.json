@@ -4,7 +4,7 @@
   "camera_device": "/dev/video0",
   "image_width": 1280,
   "image_height": 720,
-  "calibration_file": "/home/orangepi/Desktop/cyqm_gx_wlby/code/config/realtek_rgb_camera.yaml",
+  "calibration_file": "/home/kbluepi/vision_only/vision/config/realtek_rgb_camera.yaml",
   "colors": [
     {
       "color_id": 1,
@@ -18,25 +18,25 @@
         {
           "lower": [
             0,
-            123,
-            112
+            64,
+            65
           ],
           "upper": [
-            5,
-            232,
-            229
+            8,
+            255,
+            255
           ]
         },
         {
           "lower": [
-            174,
-            123,
-            112
+            170,
+            64,
+            65
           ],
           "upper": [
             179,
-            232,
-            229
+            255,
+            255
           ]
         }
       ]
@@ -157,5 +157,5 @@
       ]
     }
   ],
-  "saved_at_utc": "2026-09-28T02:18:38.680779+00:00"
+  "saved_at_utc": "2026-10-31T09:59:25.155974+00:00"
 }
