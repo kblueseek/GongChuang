@@ -172,6 +172,8 @@ class MaterialDetectNode(Node):
             int(item['color_id']): item['name'] for item in self._config['colors']
         }
 
+        self._cap = None
+        self._size = None   # 相机打不开时也保证存在，_on_tick 好走 detected=0 分支
         try:
             self._cap, self._path, self._size = open_camera(
                 str(self.get_parameter('device').value),
