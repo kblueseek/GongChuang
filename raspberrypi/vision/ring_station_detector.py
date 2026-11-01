@@ -679,16 +679,24 @@ def draw_ring_station_detection(frame, result: RingStationDetection):
         return frame
     colors = ((0, 180, 255), (0, 255, 0), (255, 160, 0))
     points = []
-    for index, (center, ellipse, color) in enumerate(
-        zip(result.centers_px, result.ellipses, colors), start=1
+    for position, (center, ellipse) in enumerate(
+        zip(result.centers_px, result.ellipses)
     ):
+        color = colors[position] if position < len(colors) else (200, 200, 200)
         cv2.ellipse(frame, ellipse, color, 2, cv2.LINE_AA)
         point = tuple(int(round(value)) for value in center)
         points.append(point)
         cv2.drawMarker(frame, point, color, cv2.MARKER_CROSS, 24, 2)
+        # 只显示圆心坐标，**不标环号**（环号交给上层流程自己判定）。
+        # 标在环的正下方、水平居中，避免压在同心圆的白色线条上看不清。
+        label = f"({point[0]}, {point[1]})"
+        (text_w, _), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+        half_height = int(max(ellipse[1]) / 2) if len(ellipse) > 1 else 30
         cv2.putText(
-            frame, f"R{index}", (point[0] + 10, point[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA,
+            frame, label,
+            (point[0] - text_w // 2, point[1] + half_height + 26),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2, cv2.LINE_AA,
         )
     cv2.polylines(frame, [np.asarray(points, np.int32)], False, (255, 0, 255), 2)
     cv2.rectangle(frame, (10, 65), (820, 145), (0, 0, 0), -1)

@@ -115,13 +115,9 @@ class GuiRosNode(Node):
 
     def __init__(self):
         super().__init__('motion_gui')
-        # 发布：发序列 / 叫停 / 使能 / 急停
+        # 发布：发序列 / 叫停（使能/失能控制权归手柄，上位机不再控制）
         self.pub_load = self.create_publisher(String, '/motion_load', 10)
         self.pub_stop = self.create_publisher(Bool, '/motion_stop', 10)
-        self.pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
-        self.pub_unlock = self.create_publisher(Bool, '/cmd_unlock', 10)
-        self.pub_estop = self.create_publisher(Bool, '/cmd_estop', 10)
-        self.pub_estop_clear = self.create_publisher(Bool, '/cmd_estop_clear', 10)
         # 订阅：里程计 / 状态机进度 / 整车状态
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
         self.create_subscription(String, '/motion_state', self._cb_state, 10)
@@ -157,24 +153,6 @@ class GuiRosNode(Node):
         b = Bool()
         b.data = True
         self.pub_stop.publish(b)
-
-    def send_enable(self, en: bool):
-        if en:
-            # 失能后 F407 会锁存，使能前必须先解锁
-            self.pub_unlock.publish(Bool(data=True))
-        b = Bool()
-        b.data = en
-        self.pub_enable.publish(b)
-
-    def send_estop(self):
-        b = Bool()
-        b.data = True
-        self.pub_estop.publish(b)
-
-    def send_estop_clear(self):
-        b = Bool()
-        b.data = True
-        self.pub_estop_clear.publish(b)
 
 
 # ==================== tkinter 界面 ====================
@@ -244,10 +222,6 @@ class App:
         ttk.Button(bottom, text='▶ 执行整段', command=self.run_all).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text='▶ 执行选中一条', command=self.run_selected).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text='■ 停止', command=self.node.send_stop).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text='使能', command=lambda: self.node.send_enable(True)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text='失能', command=lambda: self.node.send_enable(False)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text='急停', command=self.node.send_estop).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text='解除急停', command=self.node.send_estop_clear).pack(side=tk.LEFT, padx=4)
 
         self._refresh_ui()   # 启动定时刷新
 

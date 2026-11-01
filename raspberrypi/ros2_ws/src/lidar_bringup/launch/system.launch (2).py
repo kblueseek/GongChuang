@@ -1,0 +1,78 @@
+# 总启动文件：一次把整车 ROS2 侧的所有节点都拉起来。
+#
+# 大白话：运行 ros2 launch lidar_bringup system.launch.py 就等于同时启动下面 4 个程序：
+#   1. 雷达驱动      -> 产出 /scan
+#   2. 障碍检测      -> /scan 变成 /obstacles
+#   3. F407 桥接     -> 话题和有线串口互转（上行 + 下行共用 USART6）
+#   4. 运动规划      -> /obstacles 变成 /cmd_vel
+#   5. 手柄驱动      -> /joy
+#   6. 手柄控制      -> /joy 变成整车控制话题
+#   7. 状态屏        -> I2C OLED 显示在线状态/坐标/朝向
+# 它们靠"话题"串成一条流水线。
+
+from launch import LaunchDescription
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        # 1. 激光雷达驱动（带参数文件）
+        Node(
+            package='ydlidar_ros2_driver',
+            executable='ydlidar_ros2_driver_node',
+            name='ydlidar_ros2_driver_node',
+            output='screen',
+            parameters=[FindPackageShare('lidar_bringup') + '/config/x3_pro.yaml'],
+        ),
+        # 2. 障碍检测节点（我们自己写的）
+        Node(
+            package='obstacle_detect',
+            executable='obstacle_detect_node',   # 这个名字对应 setup.py 里 entry_points 定义的命令
+            name='obstacle_detect',
+            output='screen',
+        ),
+        # 3. F407 桥接节点（有线串口：上行 + 下行共用 USART6）
+        Node(
+            package='f407_bridge',
+            executable='f407_bridge_node',
+            name='f407_bridge',
+            output='screen',
+            parameters=[{
+                'uplink': 'wire',
+                'wire_device': '/dev/ttyAMA0',
+                'wire_baudrate': 115200,     # 必须和 F407 USART6 一致
+                'downlink': 'wire',
+            }],
+        ),
+        # 4. 运动规划节点（避障）
+        Node(
+            package='motion_planner',
+            executable='motion_planner_node',
+            name='motion_planner',
+            output='screen',
+        ),
+        # 5. 手柄驱动（USB 手柄 -> /joy，autorepeat 让摇杆按住时持续上报）
+        Node(
+            package='joy',
+            executable='joy_node',
+            name='joy_node',
+            output='screen',
+            parameters=[{'autorepeat_rate': 20.0}],
+        ),
+        # 6. 手柄控制（/joy -> 整车控制话题：运动/使能/云台/舵机/补光灯）
+        Node(
+            package='joy_control',
+            executable='joy_control_node',
+            name='joy_control',
+            output='screen',
+        ),
+        # 7. 状态屏（I2C OLED：三页可翻，按键 GPIO23）
+        Node(
+            package='f407_bridge',
+            executable='status_display_node',
+            name='status_display',
+            output='screen',
+            parameters=[{'width': 128, 'height': 64}],   # 160x80 的屏改成 160 / 80
+        ),
+    ])
