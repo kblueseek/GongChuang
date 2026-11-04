@@ -1,62 +1,19 @@
 /**
- * @attention   采用UTF-8字符集编码
- * @brief       底盘控制任务
- * @details     麦克纳姆 X 布局逆解算（车体坐标系：x 前进，y 左移，ω 逆时针为正）：
- *                v_fl = Vx - Vy - Wz*(Lx+Ly)      v_fr = Vx + Vy + Wz*(Lx+Ly)
- *                v_rl = Vx + Vy - Wz*(Lx+Ly)      v_rr = Vx - Vy + Wz*(Lx+Ly)
- *              线速度 → 轮 RPM：rpm = v/(2πr)*60，再乘安装方向系数。
- *              ZDT 电机内部闭环，本任务直接下发速度指令（周期重发兼作心跳）。
+ * @attention  
+ * @brief       
+ * @details     
  */
 
 #include "header.h"
 
 /* 200 Hz。总线预算：每拍 5 包广播(8B) + 3 条云台单机帧(7B)，最坏装填 ~1250 bit
-   ≈ 2.5ms@500k；7 个电机 10ms 回帧再占 ~21%。200Hz 合计约 76%，留 1/4 余量。
-   （100Hz≈48%，250Hz≈90% 已经很挤，理论上限约 285Hz；再快只能把回传周期放长） */
+   ≈ 2.5ms@500k；7 个电机 10ms 回帧再占 ~21%。200Hz 合计约 76%，留 1/4 余量。*/
 #define CHASSIS_TASK_UPDATE_TICK 5
-
-/* 编码器计数 → 轮位移系数：65536 计数 = 1 圈 = 2πR，即 1 计数 ≈ 3.76µm */
 #define WHEEL_M_PER_COUNT  ((2.0f * PI * WHEEL_RADIUS_M) / 65536.0f)
-
-/* 多电机广播（0xAA）组帧缓冲。全总线只有本任务一个发送者，每拍组一条帧：
-   只放 4 轮速度（32 字节子命令 → 整帧 37 字节 / 6 个 CAN 包，实测一直好用）。
-   云台三轴不塞进这条广播：7 条子命令会撑到 61 字节 / 9 个 CAN 包，现场实测电机
-   一条都不执行（手册示例最长 34 字节 / 5 包）。云台三轴改用单机 F6 帧，
-   由 Gimbal_SendAxisSpeedFrames() 紧随广播之后、在同一个任务里发出。
-   云台的一次性命令（使能/解堵转/回传配置）也由 Gimbal_TxService() 在本任务里发。
-   两个任务各发各的会出两种问题：两条 0xAA 序列共用 CAN ID 0x000/0x001… 电机按包
-   序号重组会串包；而且抢 CAN1 的 3 个发送邮箱，广播丢一包整帧作废（底盘卡住）。 */
-static ZdtMulti_t s_MultiCtx;
-
-/* ==================== 航向保持 PID 参数（度域：误差 ° → 输出 °/s） ====================
-   IMU Yaw 作反馈，PID 输出当作车体自旋速度 Wz。目标航向由 spin 滑杆给出（-180~180°）。
-   符号搞反会形成正反馈：误差永远顶在 ±180，输出 = kP×180 呈方波、车原地打转。 */
-
 #define CHASSIS_HEADING_ENABLE        1       /* 1=启用航向修正 0=退回手动自旋指令 */
-
-/* 反馈方向系数：Wz>0 = 车体逆时针转（俯视）；JY901S Yaw 也是逆时针为正 → 两者一致取 +1。
-   实测确认：手动逆时针转车，Yaw 变大则 +1，变小则 -1。（模块倒装时方向会再反一次） */
 #define CHASSIS_HEADING_YAW_DIR       (1.0f)
 
-#define CHASSIS_HEADING_KP            4.0f    /* 比例，°/s 每 °；太小修正无力，太大抖 */
-#define CHASSIS_HEADING_KI            0.0f    /* 积分：10Hz 回传下先关，否则助长震荡 */
-#define CHASSIS_HEADING_KD            0.0f    /* 微分：回传率低噪声大，先关 */
-#define CHASSIS_HEADING_MAX_W         0.6f    /* 修正自旋上限 rad/s（≈34°/s） */
-#define CHASSIS_HEADING_DEADBAND      0.0f    /* °，死区，防静止时抖 */
-#define CHASSIS_HEADING_INTEGRAL_BAND 15.0f   /* °，积分分离 */
-#define CHASSIS_HEADING_I_MAX         0.5f    /* 积分项限幅 rad/s */
-
-/* ==================== 回零（位置闭环）参数 ====================
-   世界系位置误差 m → PID → 世界系速度 m/s，再转车体系下发。
-   目标恒为里程计零点 (0,0)，即上电位置。KP/KI 单位 (m/s)/m。 */
-#define CHASSIS_RETURN_KP        1.5f    /* 比例：1m 误差给 1.5 m/s（被 MAX_V 限住） */
-#define CHASSIS_RETURN_KI        0.3f    /* 积分：消除稳态误差，让车真正压到零点 */
-#define CHASSIS_RETURN_KD        0.2f    /* 微分：先关 */
-#define CHASSIS_RETURN_MAX_V     0.5f    /* 回零最大速度 m/s */
-#define CHASSIS_RETURN_I_MAX     0.3f    /* 积分项限幅 m/s */
-#define CHASSIS_RETURN_INTEGRAL_BAND 1.0f /* m，误差小于此值才积分，防大误差积分饱和 */
-#define CHASSIS_RETURN_ARRIVED   0.02f   /* m，距离零点小于此值判到位并停车 */
-
+static ZdtMulti_t s_MultiCtx;
 Chassis_t Chassis;
 
 /* 每轮方向系数（按实际安装方向标定 ±1，见 RobotConfig.h） */
@@ -120,20 +77,20 @@ static void Chassis_HeadingPidInit(void)
 {
     PID_InitStruct_t Param;
 
-    Param.kP = CHASSIS_HEADING_KP;
-    Param.kI = CHASSIS_HEADING_KI;
-    Param.kD = CHASSIS_HEADING_KD;
+    Param.kP = 4.f;
+    Param.kI = 0.f;
+    Param.kD = 0.f;
     Param.DeltaTime = CHASSIS_TASK_UPDATE_TICK * 0.001f;
     Param.DifferentialFreqDiv = 1;
 
     Param.CircleResolution = 360.0f;                          /* Yaw 量程 ±180°，过零走劣弧 */
 
     Param.MaxError = 180.0f;
-    Param.MaxOutput = CHASSIS_HEADING_MAX_W * 180.0f / PI;    /* rad/s → °/s */
-    Param.I_Max = CHASSIS_HEADING_I_MAX * 180.0f / PI;
+    Param.MaxOutput = 0.6f * 180.0f / PI;    /* rad/s → °/s */
+    Param.I_Max = 0.5f * 180.0f / PI;
 
-    Param.DeadBand = CHASSIS_HEADING_DEADBAND;
-    Param.IntegralBand = CHASSIS_HEADING_INTEGRAL_BAND;
+    Param.DeadBand = 0.1f;
+    Param.IntegralBand = 0.5f;
 
     PID_Init(&Chassis.HeadingPid, &Param);
 }
@@ -143,18 +100,18 @@ static void Chassis_PosPidInit(void)
 {
     PID_InitStruct_t Param;
 
-    Param.kP = CHASSIS_RETURN_KP;
-    Param.kI = CHASSIS_RETURN_KI;
-    Param.kD = CHASSIS_RETURN_KD;
+    Param.kP = 1.5f;
+    Param.kI = 0.3f;
+    Param.kD = 0.2f;
     Param.DeltaTime = CHASSIS_TASK_UPDATE_TICK * 0.001f;
     Param.DifferentialFreqDiv = 1;
 
     Param.CircleResolution = 0;          /* 线性量，不用角度环绕 */
     Param.MaxError = 10.0f;              /* 最大误差 m */
-    Param.MaxOutput = CHASSIS_RETURN_MAX_V;
-    Param.I_Max = CHASSIS_RETURN_I_MAX;
+    Param.MaxOutput = 0.5f;
+    Param.I_Max = 0.3f;
     Param.DeadBand = 0.0f;
-    Param.IntegralBand = CHASSIS_RETURN_INTEGRAL_BAND;
+    Param.IntegralBand = 1.0f;
 
     PID_Init(&Chassis.PosPidX, &Param);
     PID_Init(&Chassis.PosPidY, &Param);
@@ -231,10 +188,7 @@ static void Chassis_OdometryUpdate(void)
     Chassis.Pos.Y += dx * sinY + dy * cosY;
 }
 
-/* 位置闭环：世界系位置误差 → PID → 世界系速度 → 转车体系，覆盖 Vx/Vy。
-   目标可以是 Pi 下发的任意位姿(PI_CMD_POSE)，也可以是蓝牙回零的零点(0,0)。
-   Pi 位姿目标到达后由 Pi 侧判定并下发下一目标，这里持续 PID 锁定、不自动停；
-   蓝牙回零是"一次性"的：到位即停、清请求、清积分。 */
+// 位置闭环
 static void Chassis_PoseControl(float targetX, float targetY)
 {
     float yawRad = Imu.Yaw * PI / 180.0f;
@@ -253,7 +207,7 @@ static void Chassis_PoseControl(float targetX, float targetY)
 
     /* 蓝牙回零到位判定：距离零点足够近则停车、清请求、清积分 */
     if (PiCommand.ReturnHome &&
-        sqrtf(Chassis.Pos.X * Chassis.Pos.X + Chassis.Pos.Y * Chassis.Pos.Y) < CHASSIS_RETURN_ARRIVED)
+        sqrtf(Chassis.Pos.X * Chassis.Pos.X + Chassis.Pos.Y * Chassis.Pos.Y) < 0.0f)
     {
         Chassis.Move.Vx = 0;
         Chassis.Move.Vy = 0;

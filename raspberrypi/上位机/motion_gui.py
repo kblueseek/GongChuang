@@ -247,6 +247,10 @@ class App:
         # 三项都齐了（yaw 不是 None）才能把里程计换算到场地。
         self.odom_start = [0.0, 0.0, None]
 
+        # 车体是 300x300 的正方形（field.json: robot.size_mm）。
+        # 只用于画图，按真实尺寸画才能一眼看出会不会蹭墙/蹭黄块。
+        self.robot_size = float(self.cfg.get("robot", {}).get("size_mm", 300.0))
+
         # ---------- 雷达 / 规划状态 ----------
         self.raw_points = []        # (设备角, 距离, 强度)
         self.points = []            # 世界坐标 [(x, y, 强度)]
@@ -256,6 +260,11 @@ class App:
         self.mission_legs = []
         self.mission_total = 0.0
         self.goal_world = None
+        # 模拟执行用：没有真车时让车在图上沿着规划路径一步步走
+        self.sim_pose = None        # (x, y, yaw_deg) 场地系；None = 不模拟
+        self.play_pts = None        # 待播放的位姿序列
+        self.play_i = 0
+        self.play_after = None      # tk.after 的句柄，用来取消
         self.lidar = None
         self.lidar_q = queue.Queue()
         self.scanning = False
@@ -494,6 +503,24 @@ class App:
         ttk.Button(box, text='清空点云', command=self.clear_scan).pack(fill=tk.X, pady=1)
         ttk.Button(box, text='保存场地参数', command=self.save_cfg).pack(fill=tk.X, pady=1)
 
+        # 模拟雷达时手上有抽签位置，就照着实摆；再点一次同一个障碍 = 删掉
+        self.var_edit_obs = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text='手动布置障碍（点地图 加/删 圆柱）',
+                        variable=self.var_edit_obs,
+                        command=self._redraw).pack(anchor='w', pady=(2, 0))
+
+        # 工位停车点：勾上以后点地图，把下拉框里那个工位的 approach 挪过去
+        zrow = ttk.Frame(box); zrow.pack(fill=tk.X, pady=(3, 0))
+        self.var_edit_zone = tk.BooleanVar(value=False)
+        ttk.Checkbutton(zrow, text='点地图设置工位',
+                        variable=self.var_edit_zone).pack(side=tk.LEFT)
+        self.cb_zone = ttk.Combobox(
+            zrow, width=7, state='readonly',
+            values=[z.get('name', '') for z in self.cfg.get('work_zones', [])])
+        if self.cb_zone['values']:
+            self.cb_zone.current(0)
+        self.cb_zone.pack(side=tk.LEFT, padx=(6, 0))
+
         row = ttk.Frame(box); row.pack(fill=tk.X, pady=(2, 0))
         ttk.Label(row, text='目标格').pack(side=tk.LEFT)
         self.ent_cell = ttk.Entry(row, width=6)
@@ -699,6 +726,10 @@ class App:
                                         else '逆时针为正（不取反）'))
 
     def _nudge_yaw(self, delta):
+        """雷达朝向微调。雷达装在车头上，所以**车起点朝向一起改**——
+        否则只转雷达箭头、车还斜着停在原地，地图和车对不上。
+        如果确实是"雷达和车头有安装偏角"，改完再把车起点 yaw 单独调回去。
+        """
         cur = self._num(self.ent_lz, self.field.lidar_yaw)
         self._set(self.ent_lz, (cur + delta) % 360)
         self._apply_lidar_mount()
@@ -769,6 +800,17 @@ class App:
             f'已标定：里程计 ({o[0]:+.3f},{o[1]:+.3f})m θ={math.degrees(o[2]):+.1f}° '
             f'= 场地 ({self.robot_start[0]:.0f},{self.robot_start[1]:.0f})mm '
             f'θ={self.robot_start[2]:.0f}°。现在地图上的车和实际对上了。')
+        # 雷达 = 车头 ⇒ 车起点朝向跟着一起改，车才会真的转过来
+        self.robot_start = (self.robot_start[0], self.robot_start[1],
+                            self.field.lidar_yaw)
+        self.cfg['robot_start'] = {'x': self.robot_start[0],
+                                   'y': self.robot_start[1],
+                                   'yaw_deg': self.robot_start[2]}
+        try:
+            self.ent_rdeg.delete(0, tk.END)
+            self.ent_rdeg.insert(0, f'{self.robot_start[2]:g}')
+        except Exception:
+            pass
         self._redraw()
 
     def _robot_field(self):
@@ -834,9 +876,9 @@ class App:
         obs = [{'x': c['x'], 'y': c['y'], 'r': mapping._ob_radius(c), 'intensity': 60}
                for c in self.obstacles]
         if not obs:
-            obs = [{'x': 110, 'y': 620, 'r': 25, 'intensity': 60},
-                   {'x': -60, 'y': -300, 'r': 25, 'intensity': 60},
-                   {'x': -150, 'y': 1150, 'r': 150, 'intensity': 90}]
+            # 不再自动塞演示圆柱：障碍摆哪儿由【手动布置障碍】决定。
+            # 只保留原料区转盘——它是真实凸起的实体，雷达本来就会扫到它。
+            obs = [{'x': -150, 'y': 1150, 'r': 150, 'intensity': 90}]
         return obs
 
     # ==================== 雷达数据（后台线程 → 队列） ====================
@@ -930,10 +972,23 @@ class App:
         self._redraw()
 
     def _is_station_cell(self, c, r):
+        """这一格是不是"工位格"——只有**包含工位停车点/工位中心**的格子才算。
+
+        ⚠ 不能用"矩形相交"来判断：原料区（x∈[-300,0]）的矩形会擦到相邻的
+        B5（x∈[-675,-225]，重叠 75mm），于是 B5 被当成工位格**永久豁免**，
+        里面有障碍也永远不封锁 —— 车就会从 B5 中间穿过去。
+        """
         rc = self.field.cell_rect(c, r)
         for z in self.field.work_zones:
-            zr = z['rect']
-            if not (zr.x1 < rc.x0 or zr.x0 > rc.x1 or zr.y1 < rc.y0 or zr.y0 > rc.y1):
+            # 停车点所在格：必须豁免，否则永远到不了工位
+            ap = z.get('approach')
+            if ap and rc.contains(ap[0], ap[1]):
+                return True
+            # 工位矩形中心所在格也豁免一份。
+            # 注意 field.work_zones 的条目只有 name/approach/rect，**没有 x/y**
+            zr = z.get('rect')
+            if zr is not None and rc.contains((zr.x0 + zr.x1) / 2.0,
+                                              (zr.y0 + zr.y1) / 2.0):
                 return True
         return False
 
@@ -1051,8 +1106,13 @@ class App:
         out.append(ded[-1])
         return out
 
-    def _path_commands(self, path_mm, title=None):
-        """世界系折线 → motion_planner 的 goto 指令（里程计系，米/度）。"""
+    def _path_commands(self, path_mm, title=None, final_yaw_deg=None,
+                       fixed_yaw_deg=None):
+        """世界系折线 → motion_planner 的 goto 指令（里程计系，米/度）。
+
+        final_yaw_deg: 到了最后一个航点要摆到的场地朝向（度）。
+                       作业点用"机械臂朝场外"的朝向；None = 沿路径方向。
+        """
         wps = self._waypoints(path_mm)
         cmds = []
         if title:
@@ -1066,6 +1126,12 @@ class App:
                 hd = math.degrees(math.atan2(y - wps[-2][1], x - wps[-2][0]))
             else:
                 hd = cur_deg
+            if fixed_yaw_deg is not None:
+                # 全向底盘：整段保持同一朝向，靠平移走过去。
+                # 这样到作业点不用再原地转，转角也从"每段都转"降到"只在换朝向时转"。
+                hd = float(fixed_yaw_deg)
+            elif final_yaw_deg is not None and i == n - 1:
+                hd = float(final_yaw_deg)      # 到位后摆成作业要求的朝向
             ox, oy, oth = self._field_to_odom(x, y, hd)
             cmds.append({'cmd': 'goto',
                          'x_m': round(ox, 3),
@@ -1129,6 +1195,9 @@ class App:
         self.mission_legs = legs
         self.mission_total = total
         self.plan = None
+        # 作业点要求"机械臂侧朝场地外侧"，把该朝向挂到每段的终点上
+        for leg in legs:
+            leg["final_yaw"] = self._outward_yaw(leg.get("to_xy"))
         ok = sum(1 for leg in legs if leg['ok'])
         eta = total / max(self.field.mission_speed, 1.0)
         self.mission_info.set(f'{ok}/{len(legs)} 段可通  总长 {total / 1000:.2f} m  '
@@ -1142,19 +1211,8 @@ class App:
         if not self.mission_legs:
             self._set_status('先点【规划全程】')
             return
-        if self.node.odom is None:
-            messagebox.showwarning('没有里程计', '还没收到 /odom，不能导航。')
-            return
-        if self.odom_start[2] is None:
-            messagebox.showwarning(
-                '还没标定车起点',
-                '把车摆到【车起点】，再点左边【此刻车在车起点 → 标定里程计】。')
-            return
-        if self.node.robot_status and self.node.robot_status[0] != 1:
-            if not messagebox.askyesno(
-                    '车还没就绪',
-                    '整车状态不是就绪/使能，现在下发车不会动。仍要下发吗？'):
-                return
+        # 注意：这里**不再**"一没里程计就弹窗退回"。
+        # 没里程计时走离线演练（把指令填进左侧列表，不下发），见本函数末尾。
         bad = [i for i, leg in enumerate(self.mission_legs) if not leg['ok']]
         if bad:
             messagebox.showerror('有段不通', f'第 {",".join(str(i + 1) for i in bad)} 段规划失败，'
@@ -1176,12 +1234,158 @@ class App:
             cmds += self._path_commands(res['path_world'], '先去任务起点')
         for i, leg in enumerate(self.mission_legs):
             cmds += self._path_commands(
-                leg['path'], f'{i + 1}. {leg["from_name"]} → {leg["to_name"]}')
+                leg['path'], f'{i + 1}. {leg["from_name"]} → {leg["to_name"]}',
+                final_yaw_deg=leg.get('final_yaw'))
+        # ---- 没有里程计 / 起点没标定：离线演练，不下发 ----
+        if self.node.odom is None or self.odom_start[2] is None:
+            self.commands = list(cmds)
+            self._reload_listbox()
+            why = '还没收到 /odom' if self.node.odom is None else '车起点还没标定'
+            n_goto = sum(1 for c in cmds if c['cmd'] == 'goto')
+            self._set_status(
+                f'{why}：已把 {len(cmds)} 条指令（goto {n_goto} 个）填进左侧列表，'
+                f'未下发，改为**模拟执行**——车会在图上按路线一步步走。'
+                f'接上真车并标定起点后再点【执行全程】就会真正下发。')
+            self._play_mission()
+            return
+        # ---- 真车下发前，再确认整车就绪 ----
+        if self.node.robot_status and self.node.robot_status[0] != 1:
+            if not messagebox.askyesno(
+                    '车还没就绪',
+                    '整车状态不是就绪/使能，现在下发车不会动。仍要下发吗？'):
+                return
         if not self.node.send_sequence(cmds):
             self._planner_missing()
             return
         self._set_status(f'已下发全程路线：{len(cmds)} 条指令（其中 goto '
                          f'{sum(1 for c in cmds if c["cmd"] == "goto")} 个）')
+
+    # ==================== 模拟执行（没有真车也能看车跑） ====================
+
+    def _play_mission(self):
+        """把整条任务路线按固定步长采样成位姿序列，用 tk.after 一步步播放。
+
+        **朝向**：车头始终朝**行驶方向**，拐弯处用前向限速平滑
+        （每步 ≤ max_dyaw），所以 90° 的弯会摊到接下来几步里边开边转，
+        不会原地甩头。
+
+        注意：这里只管"看着像在开"。**到作业点要摆成什么朝向由真车指令保证**
+        （`_path_commands` 会把该段最后一个 goto 的 yaw_deg 设成 final_yaw），
+        两件事不要混在一起，否则动画里的车头会跟行驶方向拧着走。
+
+        采样按 60mm 定长沿折线插值：路径大多是一大段直线，共线点被压掉后
+        两个航点能隔 500mm 以上，按航点播就是"一步跳半米"。
+        """
+        if not self.mission_legs:
+            self._set_status('先点【规划全程】')
+            return
+
+        step_mm = 60.0
+        max_dyaw = 10.0          # 每步最多转多少度 → 转弯快慢
+
+        pos, tgt = [], []
+        prev_yaw = None
+
+        for leg in self.mission_legs:
+            wps = self._waypoints(leg.get('path') or [], min_step_mm=10.0)
+            if not wps:
+                continue
+            seg = []
+            for k in range(len(wps) - 1):
+                x0, y0 = wps[k]
+                x1, y1 = wps[k + 1]
+                d = math.hypot(x1 - x0, y1 - y0)
+                if d <= 1e-6:
+                    continue
+                hd = math.degrees(math.atan2(y1 - y0, x1 - x0))   # 行驶方向
+                t = 0.0
+                while t < d:
+                    r = t / d
+                    seg.append((x0 + (x1 - x0) * r, y0 + (y1 - y0) * r, hd))
+                    t += step_mm
+            lx, ly = wps[-1]
+            eh = (math.degrees(math.atan2(ly - wps[-2][1], lx - wps[-2][0]))
+                  if len(wps) >= 2 else self.robot_start[2])
+            seg.append((float(lx), float(ly), float(eh)))
+            # 段与段的衔接点会和上一段终点重合，不去掉就会"停一步只转头"
+            if pos and seg and math.hypot(seg[0][0] - pos[-1][0],
+                                          seg[0][1] - pos[-1][1]) < 1.0:
+                seg = seg[1:]
+            # ---- 段首：如果和上一段末朝向差得多，就地快速摆正 ----
+            # 段与段之间是在作业点**停车**换向的，这时候让它"边开边转"会变成
+            # 倒着开十几步，更难看。这里做一次短促的原地摆正（30°/步，
+            # 180° 也就 6 步 ≈ 0.8 秒），不是一路打转。
+            if prev_yaw is not None:
+                dd = wrap_deg(seg[0][2] - prev_yaw)
+                if abs(dd) > max_dyaw:
+                    n_spin = min(int(abs(dd) / 30.0) + 1, 8)
+                    for k in range(1, n_spin + 1):
+                        pos.append((seg[0][0], seg[0][1]))
+                        tgt.append(wrap_deg(prev_yaw + dd * k / n_spin))
+
+            # ---- 本段内做前向限速：拐角摊到之后几步，车一直在动 ----
+            seg_yaw = seg[0][2]
+            for k, (x, y, hd) in enumerate(seg):
+                if k == 0:
+                    seg_yaw = hd
+                else:
+                    d = wrap_deg(hd - seg_yaw)
+                    if abs(d) > max_dyaw:
+                        seg_yaw = wrap_deg(seg_yaw + max_dyaw * (1 if d > 0 else -1))
+                    else:
+                        seg_yaw = hd
+                pos.append((x, y))
+                tgt.append(seg_yaw)
+            prev_yaw = seg_yaw
+
+        if not pos:
+            self._set_status('没有可播放的路径')
+            return
+
+        pts = [(pos[k][0], pos[k][1], tgt[k]) for k in range(len(pos))]
+
+        self._stop_play()
+        self.play_pts = pts
+        self.play_i = 0
+        self._set_status(f'模拟执行：{len(pts)} 步 × 130ms ≈ {len(pts) * 0.13:.0f} s')
+        self._play_tick()
+
+    def _play_tick(self):
+        """每 130ms 走一步。走完自动停。"""
+        if not self.play_pts or self.play_i >= len(self.play_pts):
+            n = len(self.play_pts or [])
+            self._stop_play()
+            self._set_status(f'模拟执行结束（走过 {n} 个航点）')
+            return
+        self.sim_pose = self.play_pts[self.play_i]
+        self.play_i += 1
+        self._redraw()
+        self.play_after = self.root.after(130, self._play_tick)
+
+    def _stop_play(self):
+        if self.play_after is not None:
+            try:
+                self.root.after_cancel(self.play_after)
+            except Exception:
+                pass
+            self.play_after = None
+        self.play_pts = None
+        self.play_i = 0
+        self.sim_pose = None
+        self._redraw()
+
+    def _leg_yaw(self, index):
+        """第 index 段要保持的场地朝向。
+
+        规则：作业点用 leg["final_yaw"]（机械臂朝作业区）；
+        其余段沿用上一段的朝向。返回 None 表示不约束。
+        """
+        yaw = None
+        for leg in self.mission_legs[:index + 1]:
+            fy = leg.get('final_yaw')
+            if fy is not None:
+                yaw = float(fy)
+        return yaw
 
     def clear_route(self):
         self.mission_legs = []
@@ -1248,9 +1452,146 @@ class App:
                                         fill='#fffbe6', outline='#d8d0a0', tags='hover')
                 c.tag_lower(bg, tid)
 
+    # ---------- 手动布置障碍（模拟雷达时用） ----------
+
+    def _toggle_obstacle(self, wx, wy):
+        """点地图加/删一个圆柱障碍。
+
+        落在已有障碍（半径 + 60mm）以内 = 删掉它；否则在该处加一个。
+        障碍直接进 self.obstacles，A* 规划立刻生效。
+        """
+        r_cyl = float(self.cfg.get("cylinder", {}).get("diameter_mm", 50.0)) / 2.0
+        hit = None
+        for ob in self.obstacles:
+            if math.hypot(wx - ob["x"], wy - ob["y"]) <= r_cyl + 60.0:
+                hit = ob
+                break
+        if hit is not None:
+            self.obstacles.remove(hit)
+            cells = self._rebuild_blocked_cells()
+            self._set_status(f'删除障碍 @ ({hit["x"]:.0f}, {hit["y"]:.0f})，'
+                             f'剩 {len(self.obstacles)} 个；'
+                             f'整格封锁：{self._cells_text(cells)}')
+        else:
+            self.obstacles.append({"x": float(wx), "y": float(wy), "r": r_cyl,
+                                   "n": 0, "rms": 0.0, "kind": "manual", "dist": 0.0})
+            cells = self._rebuild_blocked_cells()
+            self._set_status(f'添加障碍 @ ({wx:.0f}, {wy:.0f}) φ{r_cyl * 2:.0f}mm，'
+                             f'共 {len(self.obstacles)} 个；'
+                             f'整格封锁：{self._cells_text(cells)}')
+        self.plan = None
+        # 模拟雷达的障碍是构造时拷进去的副本，改了 self.obstacles 要同步过去，
+        # 否则新摆的圆柱不会出现在点云里。
+        if self.lidar is not None and self.var_sim.get():
+            self.lidar.obstacles = self._sim_obstacles()
+        self._redraw()
+
+    # ---------- 工位停车点 ----------
+
+    def _set_zone_approach(self, wx, wy):
+        """把下拉框选中的工位停车点挪到地图上点的那一点，并立刻写回 field.json。
+
+        改的是 `approach`（规划真正用的点）；`x/y/w/h`（画出来的方框、
+        以及"机械臂朝哪"的参考中心）不动。
+        """
+        name = self.cb_zone.get() if hasattr(self, 'cb_zone') else ''
+        if not name:
+            self._set_status('先在右边下拉框选一个工位')
+            return
+
+        raw = self.cfg.get('work_zones', [])
+        idx = next((i for i, z in enumerate(raw) if z.get('name') == name), None)
+        if idx is None:
+            self._set_status(f'field.json 里没有工位「{name}」')
+            return
+
+        px, py = round(float(wx), 1), round(float(wy), 1)
+        raw[idx]['approach'] = [px, py]
+        # 运行中的 FieldModel 是另一份拷贝，规划用的是它，必须同步
+        for z in self.field.work_zones:
+            if z.get('name') == name:
+                z['approach'] = (px, py)
+                break
+
+        self._rebuild_blocked_cells()      # 工位格豁免跟着变
+        self.plan = None
+        self.mission_legs = []
+        self.save_cfg()                    # 直接落盘，免得忘了按【保存场地参数】
+
+        yaw = self._outward_yaw((px, py))
+        self._set_status(
+            f'「{name}」停车点 → ({px:.0f}, {py:.0f})'
+            + (f'，机械臂朝向 {yaw:.0f}°' if yaw is not None else '')
+            + '，已写入 field.json；重新点【规划全程】生效')
+        self._redraw()
+
+    # ---------- 整格封锁 ----------
+
+    def _cells_text(self, cells):
+        if not cells:
+            return '无'
+        return '、'.join(self.field.cell_label(c, r) for (c, r) in sorted(cells))
+
+    def _rebuild_blocked_cells(self):
+        """按当前障碍重算"整格禁行"的 5×5 格。
+
+        规则和 detect() 一致：障碍所在的 450×450 格**整格**不许走，
+        但**工位所在格不封**（封了就永远到不了工位）。
+
+        注意：手动布置的障碍也必须走这条路，否则 `blocked_cells` 一直是空的，
+        「整格封锁」勾了也不生效 —— 车会从有障碍的那一格中间穿过去。
+        """
+        cells = set()
+        for ob in self.obstacles:
+            cr = self.field.cell_at(ob['x'], ob['y'])
+            if not cr or self._is_station_cell(*cr):
+                continue
+            cells.add(cr)
+        self.blocked_cells = cells
+        return cells
+
+    # ---------- 作业点到达朝向 ----------
+
+    def _outward_yaw(self, xy):
+        """作业点上要求车摆到的场地朝向：**机械臂侧朝场地外侧**。
+
+        机械臂 + 扫码相机在车头**逆时针 90°**（车体 +y，车左）。
+        要让车左指向"从场心指向该作业点"的外法线，车头就要比外法线少 90°：
+            外法线   0°(东) → 车头 270°(南) → 车左朝东 ✓
+            外法线  90°(北) → 车头   0°(东) → 车左朝北 ✓
+            外法线 180°(西) → 车头  90°(北) → 车左朝西 ✓
+            外法线 270°(南) → 车头 180°(西) → 车左朝南 ✓
+
+        xy 不是 work_zones 的 approach 点（或就在场心）就返回 None，不加朝向约束。
+        """
+        if xy is None:
+            return None
+        zone = None
+        for z in self.cfg.get("work_zones", []) or []:
+            ap = z.get("approach")
+            if ap and math.hypot(xy[0] - ap[0], xy[1] - ap[1]) <= 1.0:
+                zone = z
+                break
+        if zone is None:
+            return None
+        # 机械臂要指向的方向 = 从停车点指向该作业区中心（原料区的停车点偏了
+        # x=-150，用"场心外法线"会差 10°，指作业区本身才准）
+        dx = float(zone.get("x", 0.0)) - xy[0]
+        dy = float(zone.get("y", 0.0)) - xy[1]
+        if math.hypot(dx, dy) < 1.0:
+            return None
+        arm_dir = math.degrees(math.atan2(dy, dx))
+        return wrap_deg(arm_dir - 90.0)
+
     def on_click(self, ev):
         w = self._px_to_world(ev.x, ev.y)
         if w is None:
+            return
+        if self.var_edit_obs.get():        # 手动布置障碍模式下，点击只改障碍，不设目标
+            self._toggle_obstacle(*w)
+            return
+        if self.var_edit_zone.get():       # 设置工位模式下，点击改该工位的停车点
+            self._set_zone_approach(*w)
             return
         if self.var_snap.get():
             cr = self.field.cell_at(*w)
@@ -1406,17 +1747,51 @@ class App:
                            outline='#7a4fbf', width=2, dash=(2, 2))
         c.create_text(sx + 9, sy + 8, text='起点', anchor='nw', fill='#7a4fbf', font=('', 8))
 
-        # 车（当前位姿）。没标定就不画——画出来也是错的，反而误导。
+        # 车（当前位姿）：优先模拟/真实位姿，离线时按起点画虚线示意。
+        # 车体尺寸由 field.json 的 robot.size_mm 决定：
+        #   车头 = 车体 +x（前进方向，红色粗边 + 红箭头）
+        #   机械臂 + 扫码相机 = 车头逆时针 90°（车体 +y，绿色粗边 + 绿箭头）
         o = self.node.odom
-        if o is not None and self.odom_start[2] is not None:
+        live = o is not None and self.odom_start[2] is not None
+        sim = self.sim_pose is not None
+        if sim:
+            # 模拟执行：没有真车，按播放出来的位姿画（实线，看起来像真在跑）
+            fx, fy, fd = self.sim_pose
+            live = True
+        elif live:
             fx, fy, fd = self._odom_to_field(*o)
-            cx, cy = self._w2p(fx, fy)
-            a = math.radians(fd)
-            tri = [(cx + 14 * math.cos(a), cy - 14 * math.sin(a)),
-                   (cx + 9 * math.cos(a + 2.5), cy - 9 * math.sin(a + 2.5)),
-                   (cx + 9 * math.cos(a - 2.5), cy - 9 * math.sin(a - 2.5))]
-            c.create_polygon(*[v for p in tri for v in p],
-                             fill='#d81b60', outline='#8e0038')
+        else:
+            # 没有里程计时按"车停在起点"画 —— 离线也能核对车体尺寸和朝向
+            fx, fy, fd = self.robot_start
+        hf = self.robot_size / 2.0
+        ca, sa = math.cos(math.radians(fd)), math.sin(math.radians(fd))
+
+        def _corner(lx, ly):
+            """车体坐标(mm) → 画布像素（x 朝车头、y 朝车左）。"""
+            return self._w2p(fx + lx * ca - ly * sa,
+                             fy + lx * sa + ly * ca)
+
+        c.create_polygon(*[v for p in (_corner(+hf, +hf), _corner(+hf, -hf),
+                                       _corner(-hf, -hf), _corner(-hf, +hf))
+                           for v in p],
+                         fill='#f8bbd0',
+                         outline='#ad1457' if live else '#8d8d8d',
+                         width=2,
+                         dash=() if live else (4, 3))   # 没里程计时画虚线
+        # 车头：前边加粗 + 一根短箭头
+        c.create_line(*_corner(+hf, +hf), *_corner(+hf, -hf), fill='#ad1457', width=4)
+        c.create_line(*_corner(0, 0), *_corner(+hf + 90, 0),
+                      fill='#ad1457', width=2, arrow=tk.LAST)
+        # 机械臂侧（车左）：绿色粗边 + 绿箭头
+        c.create_line(*_corner(+hf, +hf), *_corner(-hf, +hf), fill='#2e7d32', width=4)
+        c.create_line(*_corner(0, 0), *_corner(0, +hf + 90),
+                      fill='#2e7d32', width=2, arrow=tk.LAST)
+        if sim:
+            c.create_text(*_corner(0, -hf - 40), text='模拟执行中',
+                          fill='#d81b60', font=('', 8))
+        elif not live:
+            c.create_text(*_corner(0, -hf - 40), text='车（未接车，按起点画）',
+                          fill='#8d8d8d', font=('', 8))
 
         # 雷达
         lx, ly = self._w2p(f.lidar_x, f.lidar_y)

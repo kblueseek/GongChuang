@@ -802,6 +802,45 @@ def clearance_mm(path, grid, cylinders):
     return best
 
 
+def erode_mask(mask, cell_mm, pad_mm):
+    """把可走掩码按 pad_mm 向内腐蚀（= 把墙/黄块按车半径膨胀）。
+
+    为什么必须做：mask 是"质点能不能走"。不做腐蚀的话，A* 会让一条
+    300mm 宽的车从"B5 和墙之间 75mm 缝"里钻过去 —— 车根本过不了，
+    规划结果看着就是"从犄角旮旯绕"。
+
+    用可分离的方形结构元（先按行、再按列），O(n·k) 而不是 O(n·k²)。
+    """
+    k = int(math.ceil(float(pad_mm) / float(cell_mm)))
+    if k <= 0:
+        return [row[:] for row in mask]
+    ny, nx = len(mask), len(mask[0])
+
+    tmp = [[False] * nx for _ in range(ny)]
+    for iy in range(ny):
+        row, out = mask[iy], tmp[iy]
+        for ix in range(nx):
+            ok = True
+            for d in range(-k, k + 1):
+                j = ix + d
+                if j < 0 or j >= nx or not row[j]:
+                    ok = False
+                    break
+            out[ix] = ok
+
+    res = [[False] * nx for _ in range(ny)]
+    for ix in range(nx):
+        for iy in range(ny):
+            ok = True
+            for d in range(-k, k + 1):
+                j = iy + d
+                if j < 0 or j >= ny or not tmp[j][ix]:
+                    ok = False
+                    break
+            res[iy][ix] = ok
+    return res
+
+
 def plan_path(grid, mask, cylinders, start, goal, robot_radius,
               min_clear_mm=20.0, cell_block=None, cost_fn=None):
     """带退让的规划：先按理想车半径规划，走不通就逐步缩小膨胀半径重试。
@@ -815,6 +854,9 @@ def plan_path(grid, mask, cylinders, start, goal, robot_radius,
 
     返回 dict: path / cost / pad / scale / min_clear / note / goal_blocked / start_blocked
     """
+    # 车不是质点：先把可走区域按车半径腐蚀，否则会从墙缝里钻过去
+    mask = erode_mask(mask, grid.cell, robot_radius)
+
     nx, ny = len(mask[0]), len(mask)
 
     def _free(ix, iy):
@@ -828,6 +870,16 @@ def plan_path(grid, mask, cylinders, start, goal, robot_radius,
 
     goal_blocked = not _free(*goal)
     start_blocked = not _free(*start)
+
+    # _free() 只看车道掩码和整格封锁，**不含圆柱**。
+    # 而 astar() 在目标/起点被封锁时会"静默换到最近可走格"——
+    # 不在这里补这一刀，界面就会显示"正常通过"，实际路径却停在离目标很远的位置
+    # （用户看到的"路走到障碍旁边就不走了"就是这种情况）。
+    _hard = grid.build_blocked(cylinders, robot_radius)
+    if not goal_blocked and _hard[goal[1]][goal[0]]:
+        goal_blocked = True
+    if not start_blocked and _hard[start[1]][start[0]]:
+        start_blocked = True
 
     scales = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5)
     best = None
@@ -865,6 +917,15 @@ def plan_path(grid, mask, cylinders, start, goal, robot_radius,
                 "goal_blocked": goal_blocked, "start_blocked": start_blocked}
     if best["min_clear"] < min_clear_mm:
         best["note"] += f"（余量仅 {best['min_clear']:.0f}mm，很勉强）"
+    # 目标被 astar 挪走时，把"到底偏了多少"写清楚：否则界面上只显示
+    # "正常通过"，用户会以为路径是对的，实际停在离目标半米外。
+    if goal_blocked:
+        gw = grid.c2w(*goal)
+        end = best["path_world"][-1] if best["path_world"] else gw
+        off = math.hypot(end[0] - gw[0], end[1] - gw[1])
+        best["note"] += (f"（目标压在障碍禁区里，实际停在偏 {off:.0f}mm 处；"
+                         f"要停到目标请把它挪到离圆柱 ≥"
+                         f"{robot_radius + 25:.0f}mm 的位置）")
     return best
 
 

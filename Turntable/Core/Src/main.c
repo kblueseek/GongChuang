@@ -33,20 +33,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* ==================== 转盘参数 ==================== */
-#define ZDT_ADDR            1       /* 电机地址（电机侧需配成 1） */
-#define ZDT_CHECKSUM        0x6B    /* 协议固定校验码 */
+/* ==================== 转盘参数（只改这里） ==================== */
 
-/* 120° = 3200/3 = 1066.67 脉冲。按 1067/1067/1066 循环，
-   三次相加正好 3200（一整圈），长期运行不会累积角度误差。 */
-#define TURN_PULSE_A        1067u
-#define TURN_PULSE_B        1066u
+/* 目标周期：转一圈用多少毫秒。8000 = 8 秒一圈。运行时也能用 Turntable_SetPeriodMs() 改 */
+#define TURNTABLE_PERIOD_MS   8000u
 
-#define TURN_PERIOD_MS      4000u   /* 每 4 秒转一次 */
-#define TURN_SPEED_RPM      30u     /* 位置模式运行速度（整数 RPM，0~3000） */
-#define TURN_ACC            100u    /* 加速度档位 0~255，越大越快；0=不加曲线直接启动 */
+/* 标定常数：满速（脉宽打到 1000us 或 2000us）时转一圈用多少毫秒。
+   这个值决定「8 秒一圈」准不准，标定方法见下面 USER CODE 0 的说明。 */
+#define SERVO_FULL_REV_MS     1000u
 
-#define TURN_ALTERNATE      0       /* 1=正反交替（120°→回原位→120°…）  0=始终同向 */
+/* 方向：1 = 正转，-1 = 反转。装反了改这里，不用重新接线 */
+#define TURNTABLE_DIR         1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,14 +54,12 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static uint8_t s_RxByte;              /* UART5 单字节中断接收缓冲 */
-
-volatile uint32_t g_MotorAckCount;    /* 合法应答帧计数（Keil Watch 里观察） */
-volatile uint8_t  g_LastFunc;         /* 最近一次应答的功能码 */
-volatile uint8_t  g_LastResult;       /* 最近一次应答的结果码：02=成功 E2/EE=错误 */
-
-static uint32_t s_Step = 0;           /* 已转次数（用于 1067/1067/1066 循环） */
-static uint32_t s_LastTurnTick;       /* 上次转向时刻 */
+/* 转盘运行时状态（Keil 的 Watch 窗口里可以直接看这几个变量） */
+static uint32_t s_PeriodMs  = TURNTABLE_PERIOD_MS;   /* 当前目标周期 ms/圈 */
+static uint32_t s_FullRevMs = SERVO_FULL_REV_MS;     /* 标定常数：满速一圈 ms */
+static int8_t   s_Dir       = TURNTABLE_DIR;         /* +1 / -1 */
+static uint8_t  s_Running   = 0;                     /* 1 = 正在转 */
+static uint16_t s_PulseUs   = 1500u;                 /* 当前下发脉宽 us（调试用） */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,103 +70,136 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ==================== 转盘驱动：360° 连续旋转舵机 ====================
+   接线：舵机信号线（橙/白）→ PA6（TIM3_CH1）
+         舵机电源（红）     → 独立 5V（不要从单片机的 3.3V 取，堵转能到 1A）
+         舵机地（棕/黑）    → 与单片机 GND 共地（必须！不共地信号无效）
 
-/* ==================== 张大头（ZDT）电机串口协议 ====================
-   帧格式：[地址] [功能码] [命令数据...] [校验码 0x6B]
-   接线：PC12(TX) → 电机 RX，PD2(RX) ← 电机 TX，GND 共地
-   电机侧配置：通讯端口=串口，地址=1，波特率=115200 */
+   原理：50Hz PWM（20ms 周期），脉宽决定转向和转速：
+           1000us ──── 1500us ──── 2000us
+           满速反转     停        满速正转
+         偏离 1500us 越多转越快，转速大致和偏移量成正比。
 
-/* 发送一帧：地址 + 功能码 + n 字节数据 + 校验码 */
-static void Zdt_Send(uint8_t func, const uint8_t* data, uint8_t n)
+   为什么这里有标定常数：360° 舵机没有位置/速度反馈，单片机不知道它转多快，
+   只能"给一个脉宽，假设它以某个速度转"。所以：
+       目标周期 → 偏移量 = 满速偏移(500us) × 满速一圈用时(SERVO_FULL_REV_MS) ÷ 目标周期
+   SERVO_FULL_REV_MS 就是唯一的标定量，标定一次就准了。
+
+   标定步骤：
+     1. 把 SERVO_FULL_REV_MS 保持默认 1000（=假设满速 1 秒一圈），烧进去。
+     2. 在转盘上贴一个记号，秒表计 10 圈的总时间，除以 10 得到实际一圈 T_实测(ms)。
+     3. 新值 = 1000 × T_实测 ÷ 8000，填回 SERVO_FULL_REV_MS，重新烧录。
+        例：实测一圈 12s → 1000 × 12000 ÷ 8000 = 1500，把 1000 改成 1500。
+     4. 再测一次微调，一般一到两轮就能对到 ±0.1s。
+
+   注意：8 秒一圈只需要 62us 左右的偏移量，接近很多舵机的死区边缘。如果发现
+   舵机根本不转或时转时停，说明这个舵机慢不到这么慢，处理办法见文末说明。
+   ================================================================ */
+
+/* ---- 电气参数：按你的舵机手册改 ---- */
+#define SERVO_STOP_US   1500u                            /* 停止脉宽 */
+#define SERVO_MIN_US    1000u                            /* 满速反向 */
+#define SERVO_MAX_US    2000u                            /* 满速正向 */
+#define SERVO_HALF_US   (SERVO_STOP_US - SERVO_MIN_US)   /* 满速偏移量 = 500us */
+
+/* 定时器时钟（Hz）。F1 的 TIM2/3/4 挂在 APB1，TIM1 在 APB2；
+   APB 预分频 ≠ 1 时定时器时钟是总线时钟的 2 倍。 */
+static uint32_t TimerClockHz(TIM_TypeDef* tim)
 {
-    uint8_t buf[16];
-    uint8_t i = 0;
-
-    buf[i++] = ZDT_ADDR;
-    buf[i++] = func;
-    for (uint8_t k = 0; k < n; k++)
-        buf[i++] = data[k];
-    buf[i++] = ZDT_CHECKSUM;
-
-    HAL_UART_Transmit(&huart5, buf, i, 50);
+    uint32_t pclk = (tim == TIM1) ? HAL_RCC_GetPCLK2Freq() : HAL_RCC_GetPCLK1Freq();
+    return (pclk == HAL_RCC_GetHCLKFreq()) ? pclk : pclk * 2u;
 }
 
-/* 使能 / 锁轴：01 F3 AB 01 00 6B */
-static void Zdt_Enable(void)
+/* 把定时器统一成「1 个计数 = 1us、周期 20ms」。
+   这样 CCR 的数值就直接等于脉宽(us)，和舵机手册对得上；
+   即使 CubeMX 里 PSC/ARR 填错了，这里也会纠正过来。 */
+static void Servo_SetTimebase(void)
 {
-    uint8_t d[] = { 0xAB, 0x01, 0x00 };
-    Zdt_Send(0xF3, d, sizeof(d));
+    uint32_t timClk = TimerClockHz(htim3.Instance);
+
+    htim3.Instance->PSC = timClk / 1000000u - 1u;
+    htim3.Instance->ARR = 20000u - 1u;      /* 20000us = 20ms = 50Hz */
+    htim3.Instance->EGR = TIM_EGR_UG;       /* 立即装载新的 PSC/ARR */
 }
 
-/* 位置模式（FD）：相对当前实时位置转 pulse 个脉冲
-   dir: 0=正向(CW)  1=反向(CCW)
-   帧：01 FD dir speed(2B) acc pulse(4B) mode=02 sync=00 6B */
-static void Zdt_MovePulses(uint32_t pulse, uint8_t dir)
+static void Servo_WriteUs(uint16_t us)
 {
-    uint16_t spd = TURN_SPEED_RPM;
-    uint8_t d[10];
-
-    d[0] = dir;
-    d[1] = (uint8_t)(spd >> 8);
-    d[2] = (uint8_t)(spd & 0xFF);
-    d[3] = TURN_ACC;
-    d[4] = (uint8_t)(pulse >> 24);
-    d[5] = (uint8_t)(pulse >> 16);
-    d[6] = (uint8_t)(pulse >> 8);
-    d[7] = (uint8_t)(pulse & 0xFF);
-    d[8] = 0x02;        /* 2 = 相对当前实时位置 */
-    d[9] = 0x00;        /* 0 = 立即执行 */
-
-    Zdt_Send(0xFD, d, sizeof(d));
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, us);
 }
 
-/* 应答帧长度（含地址、功能码、校验码） */
-static uint8_t Zdt_FrameLen(uint8_t func)
+/* 由目标周期反算脉宽：转速 ∝ 偏移量，周期 ∝ 1/偏移量 */
+static uint16_t Servo_PulseForPeriod(uint32_t periodMs)
 {
-    switch (func) {
-    case 0x35: return 6;   /* 实时转速：addr + 35 + 符号 + 速度2B + 校验 */
-    case 0x36: return 8;   /* 实时位置：addr + 36 + 符号 + 位置4B + 校验 */
-    case 0x3C: return 5;   /* 状态：addr + 3C + 回零状态 + 电机状态 + 校验 */
-    default:   return 4;   /* 通用应答：addr + func + 02/E2/EE + 6B */
+    uint32_t offset;
+
+    if (periodMs < 10u)
+        periodMs = 10u;                     /* 防除零；10ms 一圈已远超舵机能力 */
+
+    offset = (uint32_t)(((uint64_t)SERVO_HALF_US * s_FullRevMs + periodMs / 2u) / periodMs);
+    if (offset > SERVO_HALF_US)
+        offset = SERVO_HALF_US;             /* 转到满速就饱和在 1000/2000us */
+
+    return (s_Dir >= 0) ? (uint16_t)(SERVO_STOP_US + offset)
+                        : (uint16_t)(SERVO_STOP_US - offset);
+}
+
+/* ---------------- 对外接口 ---------------- */
+
+/* 初始化：配时基、开 PWM，脉宽先停在 1500us（不转） */
+static void Turntable_Init(void)
+{
+    Servo_SetTimebase();
+    Servo_WriteUs(SERVO_STOP_US);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+}
+
+/* 主要接口：运行时改周期（ms/圈），转着的时候改立即生效 */
+static void Turntable_SetPeriodMs(uint32_t periodMs)
+{
+    s_PeriodMs = periodMs;
+    if (s_Running) {
+        s_PulseUs = Servo_PulseForPeriod(s_PeriodMs);
+        Servo_WriteUs(s_PulseUs);
     }
 }
 
-/* 串口是字节流，用状态机按帧长切分。仅用于调试观察，不参与控制 */
-static void Zdt_RxByte(uint8_t b)
+/* 标定接口：满速一圈的毫秒数 */
+static void Turntable_SetFullRevMs(uint32_t ms)
 {
-    static uint8_t state = 0;
-    static uint8_t buf[8];
-    static uint8_t idx = 0;
-    static uint8_t len = 0;
-
-    if (state == 0) {                       /* 等地址字节 1~7 */
-        if (b >= 1 && b <= 7) {
-            buf[0] = b;
-            idx = 1;
-            state = 1;
-        }
-        return;
-    }
-
-    if (state == 1) {                       /* 等功能码，据此确定整帧长度 */
-        buf[1] = b;
-        len = Zdt_FrameLen(b);
-        idx = 2;
-        state = 2;
-        return;
-    }
-
-    buf[idx++] = b;                         /* 收集剩余字节 */
-    if (idx >= len) {
-        if (buf[len - 1] == ZDT_CHECKSUM) {
-            g_MotorAckCount++;
-            g_LastFunc = buf[1];
-            g_LastResult = buf[2];          /* 通用应答：02=成功 E2/EE=错误 */
-        }
-        state = 0;
-    }
+    s_FullRevMs = (ms < 10u) ? 10u : ms;
+    Turntable_SetPeriodMs(s_PeriodMs);      /* 重新算一遍脉宽 */
 }
 
+/* 方向接口：+1 正转 / -1 反转 */
+static void Turntable_SetDir(int8_t dir)
+{
+    s_Dir = (dir >= 0) ? 1 : -1;
+    Turntable_SetPeriodMs(s_PeriodMs);
+}
+
+static void Turntable_Start(void)
+{
+    s_PulseUs = Servo_PulseForPeriod(s_PeriodMs);
+    Servo_WriteUs(s_PulseUs);
+    s_Running = 1;
+}
+
+static void Turntable_Stop(void)
+{
+    s_PulseUs = SERVO_STOP_US;
+    Servo_WriteUs(s_PulseUs);
+    s_Running = 0;
+}
+
+/*
+ * 【如果 8 秒一圈舵机转不动怎么办】
+ * 大多数 360° 舵机在 1500us 附近有 30~60us 的死区，8 秒一圈算出来只有 62us 偏移，
+ * 正好卡在边缘。两个办法：
+ *   ① 机械减速：舵机轴上套一级齿轮/同步带，减速比 N，舵机转 N 圈转盘转 1 圈。
+ *      代码里把 TURNTABLE_PERIOD_MS 改成 8000/N（舵机自己的周期），最省事。
+ *   ② 走走停停：让舵机以 4 秒一圈转 4 秒、停 4 秒，平均也是 8 秒一圈。
+ *      缺点是动作不连续，转盘会一顿一顿的。
+ */
 /* USER CODE END 0 */
 
 /**
@@ -205,13 +233,9 @@ int main(void)
   MX_GPIO_Init();
   MX_UART5_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart5, &s_RxByte, 1);   /* 开启单字节中断接收，用于观察电机应答 */
-
-  HAL_Delay(500);          /* 等电机上电稳定 */
-  Zdt_Enable();            /* 使能锁轴 */
-  HAL_Delay(100);
-
-  s_LastTurnTick = HAL_GetTick();   /* 使能后开始计 4 秒 */
+  Turntable_Init();        /* 配时基 + 开 PWM，脉宽先停在 1500us（不转） */
+  HAL_Delay(500);          /* 等舵机上电自检稳定（有的舵机上电会抖一下） */
+  Turntable_Start();       /* 按 TURNTABLE_PERIOD_MS 开始转 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -221,25 +245,15 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (HAL_GetTick() - s_LastTurnTick >= TURN_PERIOD_MS)
-    {
-        uint32_t pulse;
-        uint8_t  dir;
+    /* 转盘是纯硬件 PWM，主循环里没有周期性的活要干。
+       下面是几个可以在调试时临时打开用的接口：
 
-        s_LastTurnTick += TURN_PERIOD_MS;    /* 累加而不是重取时间，长时间运行周期不漂移 */
-
-        /* 1067 / 1067 / 1066：每 3 次正好 3200 脉冲 = 360°，零累积误差 */
-        pulse = (s_Step % 3 == 2) ? TURN_PULSE_B : TURN_PULSE_A;
-
-#if TURN_ALTERNATE
-        dir = (s_Step & 1) ? 1 : 0;          /* 奇数次反向（转过去再转回来） */
-#else
-        dir = 0;                             /* 0 = 始终正向 */
-#endif
-
-        Zdt_MovePulses(pulse, dir);
-        s_Step++;
-    }
+         Turntable_SetPeriodMs(5000);   // 改成 5 秒一圈，立即生效
+         Turntable_SetFullRevMs(1200);  // 改标定常数（满速一圈 ms）
+         Turntable_SetDir(-1);          // 反转
+         Turntable_Stop();              // 停
+         Turntable_Start();             // 按当前周期重新开始
+    */
   }
   /* USER CODE END 3 */
 }
@@ -290,16 +304,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-/* 每收到 1 字节进一次中断；处理完必须重新武装，否则只会收到第一个字节 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == UART5) {
-        Zdt_RxByte(s_RxByte);
-        HAL_UART_Receive_IT(&huart5, &s_RxByte, 1);
-    }
-}
-
+/* 转盘不需要串口：全部逻辑都在上面 USER CODE 0 里，主循环空转即可。 */
 /* USER CODE END 4 */
 
 /**
