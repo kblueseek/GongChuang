@@ -8,6 +8,7 @@
 #   5. 手柄驱动      -> /joy
 #   6. 手柄控制      -> /joy 变成整车控制话题
 #   7. 状态屏        -> I2C OLED 显示在线状态/坐标/朝向
+#   8. 圆环视觉矫正  -> calibrate 指令：识别三圆环对位后重置里程计
 # 它们靠"话题"串成一条流水线。
 
 from launch import LaunchDescription
@@ -45,11 +46,19 @@ def generate_launch_description():
                 'downlink': 'wire',
             }],
         ),
-        # 4. 运动规划节点（避障）
+        # 4. 运动规划节点（状态机）
         Node(
             package='motion_planner',
             executable='motion_planner_node',
             name='motion_planner',
+            output='screen',
+        ),
+        # 8. 圆环工位视觉矫正（calibrate 指令的执行者：摄像头识别三圆环→小步对位
+        #    →/set_odom 重置里程计）。触发时才打开摄像头，平时不占用 /dev/video0。
+        Node(
+            package='ring_fix',
+            executable='ring_fix_node',
+            name='ring_fix',
             output='screen',
         ),
         # 5. 手柄驱动（USB 手柄 -> /joy，autorepeat 让摇杆按住时持续上报）

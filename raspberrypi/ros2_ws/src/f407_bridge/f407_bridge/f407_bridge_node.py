@@ -95,6 +95,13 @@ class F407BridgeNode(Node):
         self.create_subscription(Int32, '/cmd_gimbal_zero', self._cb_cmd_gimbal_zero, 10)
         # 在线调参：[参数编号, 数值]，编号见 pi_comm.py 的 TUNE_*
         self.create_subscription(Float32MultiArray, '/cmd_tune', self._cb_cmd_tune, 10)
+        # 里程计重置（圆环视觉矫正用）：/set_odom 把"修正坐标系"锚定到车的真实位姿。
+        # 本节点在 /odom 上报时加偏移、在 /cmd_pose 下发时减偏移，ROS 侧统一活在
+        # 修正系，F407 内部始终用它自己的原始里程计系。
+        self.create_subscription(Pose2D, '/set_odom', self._cb_set_odom, 10)
+        self._pub_odom_shift = self.create_publisher(Pose2D, '/odom_shift', 10)
+        self._odom_offset = (0.0, 0.0, 0.0)   # (t_x, t_y, t_yaw)：odom' = t + R(t_yaw)·odom
+        self._last_raw_odom = None            # 最近一次 F407 原始里程计 (x, y, yaw)
 
         # ================= 方向2：发布话题（F407 -> ROS2） =================
         self._pub_odom = self.create_publisher(Odometry, '/odom', 10)
@@ -207,8 +214,13 @@ class F407BridgeNode(Node):
         self._up.send_enable(self._enable_state)
 
     def _cb_cmd_pose(self, msg: Pose2D):
-        """收到 /cmd_pose：把目标位姿发给 F407，位置+航向闭环在 F407 上执行。"""
-        if not self._up.send_pose(msg.x, msg.y, msg.theta):
+        """收到 /cmd_pose：把目标位姿发给 F407，位置+航向闭环在 F407 上执行。
+
+        若做过 /set_odom 修正，目标位姿活在"修正坐标系"里，先减去偏移换回
+        F407 的原始里程计系再下发。
+        """
+        x, y, th = self._remove_odom_offset(msg.x, msg.y, msg.theta)
+        if not self._up.send_pose(x, y, th):
             self.get_logger().debug('POSE 发送失败', throttle_duration_sec=2.0)
 
     def _cb_cmd_gimbal(self, msg: Float32MultiArray):
@@ -262,6 +274,43 @@ class F407BridgeNode(Node):
             param_id = int(round(msg.data[0]))
             self._up.send_tune(param_id, float(msg.data[1]))
 
+    # ---------------- 里程计修正（/set_odom） ----------------
+
+    def _cb_set_odom(self, msg: Pose2D):
+        """把"修正坐标系"锚定到 msg 指定的真实位姿（圆环视觉矫正的收官动作）。
+
+        偏移按绝对量记录：之后 odom' = t + R(t_yaw)·raw，重复重置互相覆盖。
+        同时把 t 发布到 /odom_shift，让上位机把它的场地锚点做同样的平移，
+        保证"场地 ↔ 里程计"换算在重置前后不变。
+        F407 重启（掉线恢复）时偏移自动清零——它的原始里程计已经换了新零点。
+        """
+        if self._last_raw_odom is None:
+            self.get_logger().warning('/set_odom 被忽略：还没收到过 F407 里程计')
+            return
+        rx, ry, rth = self._last_raw_odom
+        dth = (msg.theta - rth + math.pi) % (2.0 * math.pi) - math.pi
+        c, s = math.cos(dth), math.sin(dth)
+        tx = msg.x - (c * rx - s * ry)
+        ty = msg.y - (s * rx + c * ry)
+        self._odom_offset = (tx, ty, dth)
+        self._pub_odom_shift.publish(Pose2D(x=tx, y=ty, theta=dth))
+        self.get_logger().info(
+            f'里程计已重置：odom = ({tx:+.3f},{ty:+.3f})m '
+            f'+ R({math.degrees(dth):+.1f}°)·raw')
+
+    def _apply_odom_offset(self, x: float, y: float, th: float):
+        """F407 原始里程计 → 修正坐标系：p' = t + R(t_yaw)·p。"""
+        tx, ty, tth = self._odom_offset
+        c, s = math.cos(tth), math.sin(tth)
+        return (tx + c * x - s * y, ty + s * x + c * y, th + tth)
+
+    def _remove_odom_offset(self, x: float, y: float, th: float):
+        """修正坐标系 → F407 原始里程计（_apply_odom_offset 的逆变换）。"""
+        tx, ty, tth = self._odom_offset
+        c, s = math.cos(tth), math.sin(tth)
+        px, py = x - tx, y - ty
+        return (c * px + s * py, -s * px + c * py, th - tth)
+
     # ---------------- 定时器回调 ----------------
 
     def _on_heartbeat(self):
@@ -278,7 +327,9 @@ class F407BridgeNode(Node):
         for cmd, data in self._down.poll():
             self._last_rx_s = self.get_clock().now().nanoseconds / 1e9
             if cmd == RPT_ODOM:
-                self._publish_odom(parse_odom(data))
+                raw = parse_odom(data)
+                self._last_raw_odom = raw
+                self._publish_odom(raw)
             elif cmd == RPT_STATUS:
                 state, err, mask = parse_status(data)
                 self._pub_status.publish(Int32MultiArray(data=[state, err, mask]))
@@ -305,6 +356,11 @@ class F407BridgeNode(Node):
         if online != self._last_online:
             self._last_online = online
             if online:
+                # F407 重新上线说明它重启过（或刚上电）：原始里程计换了新零点，
+                # 旧的修正偏移继续叠加只会得到 garbage，直接清零（保守、可预期）。
+                if self._odom_offset != (0.0, 0.0, 0.0):
+                    self.get_logger().info('F407 重新上线：里程计修正偏移清零')
+                self._odom_offset = (0.0, 0.0, 0.0)
                 self.get_logger().info('F407 回传正常（链路通了）')
             else:
                 self.get_logger().warning('F407 无回传：检查串口接线/波特率/共地')
@@ -314,8 +370,11 @@ class F407BridgeNode(Node):
             self.get_logger().info(f'上行链路{"已连接" if ble else "未连接"}{"" if ble else ("：" + err if err else "")}')
 
     def _publish_odom(self, pose):
-        """把 (x米, y米, 朝向弧度) 组装成标准的里程计消息发出去。"""
-        x, y, theta = pose
+        """把 (x米, y米, 朝向弧度) 组装成标准的里程计消息发出去。
+
+        做过 /set_odom 修正时，先套偏移让 /odom 活在修正坐标系里。
+        """
+        x, y, theta = self._apply_odom_offset(*pose)
         msg = Odometry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.get_parameter('frame_id').value

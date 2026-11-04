@@ -29,7 +29,11 @@
   cam      {"cmd":"cam",    "deg":0}           相机舵机
   enable   {"cmd":"enable", "en":true}         使能/失能电机
   delay    {"cmd":"delay",  "ms":1000}         原地等多少毫秒
-  calibrate{"cmd":"calibrate"}                 视觉校准钩子(占位，待接圆环识别)
+  calibrate{"cmd":"calibrate","x_m":-2.169,"y_m":1.061}
+           圆环工位视觉矫正：ring_fix 节点开摄像头识别三圆环，小步驱动底盘把
+           中间环对到标定基准，对准后通过 /set_odom 把里程计重置到"圆环坐标
+           (+对准偏移)"——清除累计里程计误差。x_m/y_m 是中间圆环的里程计坐标
+           （米）。失败/超时就跳过这一条，不中断任务。
   comment  {"cmd":"comment","text":"..."}      注释，什么都不做
 
   ===== 复杂动作（本次新增，给节点动作序列用） =====
@@ -109,6 +113,9 @@ class MotionPlannerNode(Node):
         self.declare_parameter('vision_args', '')
         self.declare_parameter('vision_cwd', '')
         self.declare_parameter('script_timeout_s', 60.0)
+        # 圆环视觉矫正（calibrate 指令）最多等多久：要覆盖摄像头打开、识别
+        # 稳定、小步对位的全部时间，给足余量。
+        self.declare_parameter('calibrate_timeout_s', 60.0)
 
         self.arrive_tol_xy = float(self.get_parameter('arrive_tol_xy').value)
         self.arrive_tol_yaw = float(self.get_parameter('arrive_tol_yaw').value)
@@ -117,6 +124,7 @@ class MotionPlannerNode(Node):
         self.turn_hold_s = float(self.get_parameter('turn_hold_s').value)
         sequence_file = str(self.get_parameter('sequence_file').value)
         self.default_script_timeout = float(self.get_parameter('script_timeout_s').value)
+        self.calibrate_timeout_s = float(self.get_parameter('calibrate_timeout_s').value)
 
         # ---- 发布的话题（本节点 -> 其他节点） ----
         self._pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)                     # 位姿目标
@@ -133,6 +141,9 @@ class MotionPlannerNode(Node):
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)          # 里程计：判断到位
         self.create_subscription(String, '/motion_load', self._cb_load, 10)     # 上位机下发序列
         self.create_subscription(Bool, '/motion_stop', self._cb_stop, 10)       # 上位机叫停
+        # 圆环视觉矫正（calibrate 指令）：把目标发给 ring_fix 节点，等它回结果
+        self._pub_ring_target = self.create_publisher(Pose2D, '/ring_fix/target', 10)
+        self.create_subscription(String, '/ring_fix/result', self._cb_ring_fix, 10)
 
         # ---- 内部状态 ----
         self.odom = None            # 最新里程计 (x, y, theta)，单位 米/米/弧度
@@ -140,10 +151,14 @@ class MotionPlannerNode(Node):
         self.index = -1             # 当前执行到第几条（-1 = 还没开始）
         # 状态机状态：
         #   idle 空闲 / stepping 连续执行 / moving 平移中 / settling 到点停稳
-        #   turning 原地转向 / waiting 等延时 / proc 等子程序
+        #   turning 原地转向 / waiting 等延时 / proc 等子程序 / fixing 等圆环视觉矫正
         self.phase = 'idle'
         self.deadline = 0.0         # delay 指令的到期时间
         self.move_deadline = 0.0    # 当前阶段（走/停稳/转）的超时时间
+
+        # 圆环视觉矫正（calibrate 指令）等待状态
+        self._fix_result = None     # ring_fix 节点回传的 JSON（/ring_fix/result）
+        self._fix_deadline = 0.0    # 矫正超时时刻
 
         # 绝对位姿目标（世界系）：从"当前里程计"出发，逐条指令累计
         self.tx = 0.0
@@ -200,6 +215,7 @@ class MotionPlannerNode(Node):
         """
         if bool(msg.data) and self.phase != 'idle':
             self._kill_proc()                            # 停止时把视觉/脚本子进程也收掉
+            self._fix_result = None                      # 挂起的圆环矫正结果一并作废
             self.phase = 'idle'
             self.index = -1
             self._pub_active.publish(Bool(data=False))   # 交还控制权给手柄
@@ -207,6 +223,14 @@ class MotionPlannerNode(Node):
             # 把当前位置设为目标位姿发给 F407，让它"锁"在原地不动
             if self.odom is not None:
                 self._publish_pose(self.odom[0], self.odom[1], self.odom[2])
+
+    def _cb_ring_fix(self, msg: String):
+        """ring_fix 节点的圆环矫正结果（JSON 字符串），_tick 里消费。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:  # noqa: BLE001
+            data = {'ok': False, 'reason': f'结果不是合法 JSON：{msg.data[:80]}'}
+        self._fix_result = data if isinstance(data, dict) else {'ok': False}
 
     # ---------------- 序列加载 ----------------
 
@@ -244,6 +268,7 @@ class MotionPlannerNode(Node):
             self.get_logger().error('无里程计，无法开始')
             return
         self._kill_proc()                           # 上一条序列残留的脚本先收掉
+        self._fix_result = None                     # 挂起的圆环矫正结果一并作废
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
         self.yaw_stable_since = 0.0
         self.index = -1
@@ -265,6 +290,33 @@ class MotionPlannerNode(Node):
                 return
             if self.phase != 'stepping':
                 return
+        if self.phase == 'fixing':
+            # 等 ring_fix 节点完成圆环对位 + 里程计重置
+            if self._fix_result is None:
+                if self._now() > self._fix_deadline:
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 视觉矫正超时'
+                        f'（{self.calibrate_timeout_s:.0f}s），跳过（里程计未重置）')
+                    self.phase = 'stepping'
+                return
+            result = self._fix_result
+            self._fix_result = None
+            if result.get('ok'):
+                # 里程计已被 ring_fix 重置；目标位姿同步到矫正后的真实位姿，
+                # 后续指令自动活在修正坐标系里（f407_bridge 负责双向换算）。
+                self.tx = float(result.get('x_m', self.tx))
+                self.ty = float(result.get('y_m', self.ty))
+                self.tyaw = float(result.get('yaw_rad', self.tyaw))
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] 视觉矫正完成：'
+                    f'里程计已重置到 ({self.tx:+.3f},{self.ty:+.3f})m '
+                    f'{math.degrees(self.tyaw):+.1f}°')
+            else:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] 视觉矫正失败：'
+                    f'{result.get("reason", "未知原因")}，跳过（里程计未重置）')
+            self.phase = 'stepping'
+            return
         if self.phase == 'moving':
             if not self._arrived_xy():   # 位置还没到，继续平移
                 if self.move_deadline and self._now() > self.move_deadline:
@@ -408,9 +460,26 @@ class MotionPlannerNode(Node):
             b.data = bool(cmd.get('en', True))
             self._pub_enable.publish(b)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 使能={b.data}')
-        elif name == 'calibrate':     # 视觉校准钩子（占位）
-            self._calibrate()
-            self._publish_state(f'[{self.index+1}/{len(self.commands)}] 视觉校准(占位)')
+        elif name == 'calibrate':     # 圆环工位视觉矫正（ring_fix 节点执行）
+            try:
+                rx = float(cmd.get('x_m'))
+                ry = float(cmd.get('y_m'))
+            except (TypeError, ValueError):
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] calibrate 需要圆环里程计坐标 '
+                    f'x_m,y_m，参数缺失，跳过')
+                return
+            target = Pose2D()
+            target.x = rx
+            target.y = ry
+            target.theta = 0.0
+            self._pub_ring_target.publish(target)
+            self._fix_result = None
+            self._fix_deadline = self._now() + self.calibrate_timeout_s
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 圆环视觉矫正 → '
+                f'({rx:+.3f},{ry:+.3f})m，识别对位中…')
+            self.phase = 'fixing'
         elif name == 'script':
             wait = bool(cmd.get('wait', True))
             if self._start_proc(cmd, 'script'):
@@ -717,11 +786,6 @@ class MotionPlannerNode(Node):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _calibrate(self):
-        """视觉校准占位：以后在这里接入"圆环在画面中的位置 -> 修正 tx/ty/tyaw"。
-        现在什么都不做，仅打一条日志。"""
-        self.get_logger().info('视觉校准：占位实现，待接入圆环识别')
-
     def _abort_timeout(self):
         """一条走/转/去指令超时：别让状态机永远卡住（比如车被顶住、轮子打滑）。
 
@@ -729,6 +793,7 @@ class MotionPlannerNode(Node):
         剩下的指令不再执行——半路停下比硬着头皮跑完安全。
         """
         self._kill_proc()
+        self._fix_result = None
         self.phase = 'idle'
         self.index = -1
         self.move_deadline = 0.0

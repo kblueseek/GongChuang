@@ -166,7 +166,7 @@ static void Chassis_HeadingPidInit(void)
     PID_InitStruct_t Param;
 
     Param.kP = 4.f;
-    Param.kI = 0.f;
+    Param.kI = 0.1f;
     Param.kD = 0.f;
     Param.DeltaTime = CHASSIS_TASK_UPDATE_TICK * 0.001f;
     Param.DifferentialFreqDiv = 1;
@@ -174,7 +174,7 @@ static void Chassis_HeadingPidInit(void)
     Param.CircleResolution = 360.0f;                          /* Yaw 量程 ±180°，过零走劣弧 */
 
     Param.MaxError = 180.0f;
-    Param.MaxOutput = 0.6f * 180.0f / PI;    /* rad/s → °/s */
+    Param.MaxOutput = 3.f * 180.0f / PI;    /* rad/s → °/s */
     Param.I_Max = 0.5f * 180.0f / PI;
 
     Param.DeadBand = 0.1f;
@@ -188,9 +188,9 @@ static void Chassis_PosPidInit(void)
 {
     PID_InitStruct_t Param;
 
-    Param.kP = 1.5f;
-    Param.kI = 0.3f;
-    Param.kD = 0.2f;
+    Param.kP = 2.0f;
+    Param.kI = 0.0f;
+    Param.kD = 0.0f;
     Param.DeltaTime = CHASSIS_TASK_UPDATE_TICK * 0.001f;
     Param.DifferentialFreqDiv = 1;
 

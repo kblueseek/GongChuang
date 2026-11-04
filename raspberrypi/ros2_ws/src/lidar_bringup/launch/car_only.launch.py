@@ -45,6 +45,14 @@ def generate_launch_description():
             name='motion_planner',
             output='screen',
         ),
+        # 圆环工位视觉矫正（calibrate 指令的执行者：摄像头识别三圆环→小步对位
+        # →/set_odom 重置里程计）。触发时才打开摄像头，平时不占用 /dev/video0。
+        Node(
+            package='ring_fix',
+            executable='ring_fix_node',
+            name='ring_fix',
+            output='screen',
+        ),
         # 手柄驱动（USB 手柄 -> /joy，autorepeat 让摇杆按住时持续上报）
         Node(
             package='joy',

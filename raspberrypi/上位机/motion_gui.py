@@ -22,6 +22,8 @@
       动作不只有给 407 的指令，还能：
         · script        启动任意程序（例如视觉识别窗口、标定脚本）；
         · align         跑视觉程序并读回 JSON，用视觉结果修正小车位姿；
+        · calibrate     圆环工位视觉矫正：识别三圆环并把中间环对到画面基准，
+                        然后把 407 里程计重置到对准位置（参数 = 圆环 odom x,y）；
         · vision_pick   视觉识别物料后自动执行定点抓取；
         · pick / place  抓取/放置宏（云台+夹爪+延时）。
 
@@ -133,7 +135,10 @@ COMMAND_TYPES = {
     'cam':       {'params': 'deg', 'hint': '相机角度(0~180)'},
     'enable':    {'params': 'en', 'hint': 'true=使能 / false=失能'},
     'delay':     {'params': 'ms', 'hint': '原地等待毫秒数'},
-    'calibrate': {'params': '', 'hint': '无参数(视觉校准占位)'},
+    'calibrate': {'params': 'x_m,y_m', 'hint': '圆环工位视觉矫正：中间圆环的里程计坐标(米)，'
+                 '例：-2.169,1.061。执行时开摄像头识别三个圆环，小步动车把中间环对到'
+                 '画面标定基准，然后把 407 里程计重置到对准位置，清除累计误差。'
+                 '失败/超时会跳过这一条。触发前确保 vision/main.py 没占用摄像头'},
     'comment':   {'params': 'text', 'hint': '注释文本(可含逗号)'},
 
     # ---- 复杂动作（motion_planner 里实现）----
@@ -190,7 +195,10 @@ def cmd_to_text(cmd: dict) -> str:
     if name == 'delay':
         return f"等待 {cmd.get('ms', 0)} ms"
     if name == 'calibrate':
-        return "视觉校准"
+        if 'x_m' in cmd or 'y_m' in cmd:
+            return (f"视觉矫正 圆环odom=({cmd.get('x_m', 0):+.3f}, "
+                    f"{cmd.get('y_m', 0):+.3f})m")
+        return "视觉矫正（未填圆环坐标）"
     if name == 'comment':
         return f"// {cmd.get('text', '')}"
     if name == 'script':
@@ -233,7 +241,8 @@ def build_cmd(name: str, params_str: str) -> dict:
     if name == 'delay':
         return {'cmd': name, 'ms': int(float(parts[0])) if parts else 0}
     if name == 'calibrate':
-        return {'cmd': name}
+        vals = [float(p) for p in parts] + [0.0, 0.0]
+        return {'cmd': name, 'x_m': vals[0], 'y_m': vals[1]}
 
     # ---- 复杂动作都用竖线分隔，避免参数里带逗号（比如脚本参数） ----
     if name in ('script', 'align', 'vision_pick'):
@@ -336,6 +345,9 @@ class GuiRosNode(Node):
         self.create_subscription(Float32MultiArray, '/tune_state', self._cb_tune_state, 10)
         # F407 当前生效的云台限位：[轴号, 是否有效, 下限, 上限]
         self.create_subscription(Float32MultiArray, '/gimbal_limits', self._cb_gimbal_limits, 10)
+        # 里程计被视觉矫正重置（/set_odom 生效）时，f407_bridge 发来的坐标系平移量；
+        # App 用它同步"车起点"锚点，保证场地↔里程计换算不变
+        self.create_subscription(Pose2D, '/odom_shift', self._cb_odom_shift, 10)
 
         self.odom = None            # (x, y, theta) 米/米/弧度
         self.traj = []              # 历史轨迹 [(x,y), ...]（里程计系）
@@ -348,6 +360,7 @@ class GuiRosNode(Node):
         self.gimbal_limits_valid = [False, False, False]
         self.online = False
         self.tune_ack = {}          # 参数编号 -> 407 回显的生效值
+        self.odom_shift = None      # 待处理的里程计坐标系平移 (t_x, t_y, t_yaw)
 
     def _cb_odom(self, msg: Odometry):
         q = msg.pose.pose.orientation
@@ -389,6 +402,11 @@ class GuiRosNode(Node):
     def _cb_tune_state(self, msg: Float32MultiArray):
         if len(msg.data) >= 2:
             self.tune_ack[int(round(msg.data[0]))] = float(msg.data[1])
+
+    def _cb_odom_shift(self, msg: Pose2D):
+        """里程计被视觉矫正重置（calibrate 指令生效）：记下坐标系平移量，由
+        App 在刷新循环里同步"车起点"锚点。可能连续来多次，只保留最新一次。"""
+        self.odom_shift = (float(msg.x), float(msg.y), float(msg.theta))
 
     def send_sequence(self, commands: list) -> bool:
         """下发一段指令序列。返回 False = 没有节点在听 /motion_load（motion_planner 没起来）。"""
@@ -1729,6 +1747,22 @@ class App:
             pass
         self._redraw()
 
+    def _apply_odom_shift(self, tx: float, ty: float, tth: float):
+        """里程计坐标系被视觉矫正平移（odom' = t + R(tth)·odom）后，把"车起点"
+        锚点做同样的姿态合成。这样 calibrate 重置里程计前后，场地↔里程计换算
+        完全一致：车在地图上的位置连续，后续规划/下发的 goto 不会跑偏。"""
+        if self.odom_start[2] is None:
+            return
+        c, s = math.cos(tth), math.sin(tth)
+        ox, oy = self.odom_start[0], self.odom_start[1]
+        self.odom_start[0] = tx + c * ox - s * oy
+        self.odom_start[1] = ty + s * ox + c * oy
+        self.odom_start[2] = wrap_deg(self.odom_start[2] + math.degrees(tth))
+        self._set_status(
+            f'里程计已被视觉矫正重置（平移 {tx:+.3f},{ty:+.3f}m '
+            f'旋转 {math.degrees(tth):+.1f}°）：地图锚点已同步，场地坐标不变')
+        self._need_redraw = True
+
     def _robot_field(self):
         """车当前在场地里的位姿。没有里程计或没标定就按"车在起点"算。"""
         o = self.node.odom
@@ -2858,6 +2892,12 @@ class App:
                 self._need_redraw = True
         self._last_odom = o
         self._update_labels()
+        # 里程计被 calibrate（圆环视觉矫正）重置：把"车起点"锚点做同样的平移，
+        # 保持 场地↔里程计 换算不变，否则地图上的车会整体跳一个漂移量。
+        shift = self.node.odom_shift
+        if shift is not None:
+            self.node.odom_shift = None
+            self._apply_odom_shift(*shift)
         self._sample_wave()
         self._update_tune_ack()
         if hasattr(self, 'gimbal_limit_vars'):
