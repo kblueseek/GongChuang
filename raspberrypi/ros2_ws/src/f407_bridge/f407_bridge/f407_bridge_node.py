@@ -37,7 +37,7 @@ from car_interfaces.msg import Pose2D             # 自定义平面位姿(x,y,th
 from nav_msgs.msg import Odometry                 # 里程计消息
 from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray
 
-# 从本包内导入协议模块（pi_comm.py 是和 comm/pi_comm.py 内容一致的副本）
+# 从本包内导入协议模块（以本包这份为准；comm/pi_comm.py 是旧脚本用的历史副本）
 from f407_bridge.pi_comm import (
     BleLink,          # 蓝牙上行（BLE GATT）
     PiCommLink,       # 串口链路（LoRa 下行 / 有线备用）
@@ -45,9 +45,13 @@ from f407_bridge.pi_comm import (
     RPT_ODOM,         # 回传数据编号：里程计
     RPT_STATUS,       # 回传数据编号：状态
     RPT_GIMBAL,       # 回传数据编号：云台三轴位置
+    RPT_TUNE,         # 回传数据编号：调参回显
+    RPT_GIMBAL_LIMIT, # 回传数据编号：云台单轴限位
     parse_odom,       # 解析里程计的函数
     parse_status,     # 解析状态的函数
     parse_gimbal,     # 解析云台位置的函数
+    parse_tune,       # 解析调参回显的函数
+    parse_gimbal_limit,  # 解析云台限位的函数
 )
 
 # F407 超过这么久没有任何回传，就认为它掉线了（状态 5Hz + 里程计 20Hz，1.5s 足够宽容）
@@ -87,11 +91,18 @@ class F407BridgeNode(Node):
         # 限位示教结果：[轴号, 下限°, 上限°]；松轴开关：True=松轴
         self.create_subscription(Float32MultiArray, '/cmd_gimbal_limit', self._cb_cmd_gimbal_limit, 10)
         self.create_subscription(Bool, '/cmd_gimbal_release', self._cb_cmd_gimbal_release, 10)
+        # 云台置零：掩码 bit0=yaw bit1=lift bit2=extend，把当前位置定义成 0 点
+        self.create_subscription(Int32, '/cmd_gimbal_zero', self._cb_cmd_gimbal_zero, 10)
+        # 在线调参：[参数编号, 数值]，编号见 pi_comm.py 的 TUNE_*
+        self.create_subscription(Float32MultiArray, '/cmd_tune', self._cb_cmd_tune, 10)
 
         # ================= 方向2：发布话题（F407 -> ROS2） =================
         self._pub_odom = self.create_publisher(Odometry, '/odom', 10)
         self._pub_status = self.create_publisher(Int32MultiArray, '/robot_status', 10)
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/gimbal_state', 10)
+        # 云台当前生效的限位：[轴号, 是否有效, 下限°, 上限°]（状态屏/上位机共用）
+        self._pub_gimbal_limit = self.create_publisher(Float32MultiArray, '/gimbal_limits', 10)
+        self._pub_tune = self.create_publisher(Float32MultiArray, '/tune_state', 10)  # [id, 生效值]
         self._pub_online = self.create_publisher(Bool, '/f407_online', 10)      # F407 是否有回传
         self._pub_ble = self.create_publisher(Bool, '/ble_connected', 10)       # 上行链路是否连着（有线=串口已打开，蓝牙=BLE 已连）
 
@@ -239,6 +250,18 @@ class F407BridgeNode(Node):
         """收到 /cmd_gimbal_release：True=松轴（电机控制板失能，可手拨），False=恢复。"""
         self._up.send_gimbal_release(bool(msg.data))
 
+    def _cb_cmd_gimbal_zero(self, msg: Int32):
+        """收到 /cmd_gimbal_zero：mask bit0=yaw bit1=lift bit2=extend，把当前位置记成 0 点。"""
+        mask = int(msg.data) & 0x07
+        if mask:
+            self._up.send_gimbal_zero(mask)
+
+    def _cb_cmd_tune(self, msg: Float32MultiArray):
+        """收到 /cmd_tune：msg.data = [参数编号, 数值]，转成 PI_CMD_TUNE 发给 407。"""
+        if len(msg.data) >= 2:
+            param_id = int(round(msg.data[0]))
+            self._up.send_tune(param_id, float(msg.data[1]))
+
     # ---------------- 定时器回调 ----------------
 
     def _on_heartbeat(self):
@@ -262,6 +285,13 @@ class F407BridgeNode(Node):
             elif cmd == RPT_GIMBAL:
                 self._pub_gimbal.publish(
                     Float32MultiArray(data=[float(v) for v in parse_gimbal(data)]))
+            elif cmd == RPT_GIMBAL_LIMIT:
+                axis, valid, lo, hi = parse_gimbal_limit(data)
+                self._pub_gimbal_limit.publish(
+                    Float32MultiArray(data=[float(axis), 1.0 if valid else 0.0, lo, hi]))
+            elif cmd == RPT_TUNE:
+                param_id, value = parse_tune(data)
+                self._pub_tune.publish(Float32MultiArray(data=[float(param_id), value]))
 
     def _on_link_status(self):
         """2Hz 发布链路状态，并在线状态变化时打一条日志。"""

@@ -1,25 +1,34 @@
 /**
  * @attention   采用UTF-8字符集编码
- * @brief       云台控制任务（三轴纯速度控制，只计算不发送）
+ * @brief       云台控制任务（速度环底 + 软件位置环，只计算不发送）
  * @details     云台三轴和底盘轮子一样只收速度：本任务算出三轴目标转速写进 GimbalTx，
  *              由底盘任务在每拍的 4 轮 0xAA 广播之后，给三轴各发一条 F6 单机帧。
  *              为什么不让云台自己发：CAN1 只有 3 个发送邮箱，两个任务同时发会互相
  *              挤掉——多包广播丢一包就整帧作废（底盘"卡住"），单机帧丢一帧就是
  *              某个轴没反应。全总线只留一个发送者，这两个问题就都不存在。
- *              控制律：摇杆 → 角速度(°/s)，回中/超时 → 0，线性比例，无软件死区。
- *              限位：每轴第一次位置反馈锁存成 0 点（相对上电位置）；之后按
- *              "相对位置 + 运动方向"掐掉越界方向的速度。
- *              限位值默认取 RobotConfig.h 的宏；树莓派开机示教时用 PI_CMD_GIMBAL_LIMIT
- *              把人工拨到的两端下发过来，运行时以树莓派下发的为准。示教点本身就是
- *              编码器原始坐标，所以限位值和限位判断用的是同一套坐标。
+ *
+ *              两种控制源，位置优先：
+ *                · PI_CMD_GIMBAL_TARGET（角度）→ 位置环 PID → 速度；收到后保持
+ *                  GIMBAL_POS_HOLD_MS，期间手柄速度指令让位，过期后速度重新接管。
+ *                · PI_CMD_GIMBAL_VEL（°/s）→ 线性比例，回中/超时 → 0。
+ *
+ *              0 点：电机掉电不保存位置。每轴第一次收到反馈时先锁存一个临时 0 点；
+ *              人工把三个轴摆到固定位后，树莓派/上位机发 PI_CMD_GIMBAL_ZERO，
+ *              本任务把此刻的编码器值直接改成 0 点（不依赖电机内部零点）。
+ *
+ *              限位：按"相对 0 点的位置 + 运动方向"掐掉越界方向的速度。
+ *              限位值默认取 RobotConfig.h 的宏；树莓派开机示教或上位机标定时用
+ *              PI_CMD_GIMBAL_LIMIT 下发，运行时以收到的为准。
  *              但"判断"还要知道速度指令的正方向对应编码器变大还是变小——编码器
  *              计数方向和电机转向相反的轴（实测 Yaw），正速度是往编码器小的一头走。
  *              所以每轴有一个符号 GIMBAL_xx_CMD_SIGN，判断前先乘上它换到编码器坐标。
  *              符号填反的典型现象：顶到限位后往回拨不动，继续往越界方向反而能动。
+ *              位置环的 PID 输出也活在这套坐标里，所以下发速度前同样乘符号。
+ *
  *              松轴示教：PI_CMD_GIMBAL_RELEASE=1 时把三轴电机控制板失能（F3 AB 00），
- *              并且停发 F6（速度帧可能把驱动重新使能），人手才能自由拨动。
+ *              并且停发 F6（速度帧可能把驱动重新使能），人手才能自由拨动、读编码器。
  *              失能（正常整车失能，不是松轴）：目标速度直接置 0，底盘广播里每拍都发 0
- *              （不松轴，保持力还在）。
+ *              （不松轴，保持力还在）；位置目标一并作废，重新使能不会自己跑去旧目标。
  *              夹爪/摄像头舵机直接跟随树莓派指令。
  */
 
@@ -30,12 +39,15 @@
 #define GIMBAL_ENABLE_RETRY_MS   500    /* 使能重发周期（ms） */
 #define GIMBAL_CONFIG_RETRY_MS   500    /* 位置回传配置重发周期（ms） */
 #define GIMBAL_VEL_TIMEOUT_MS    300    /* 这么久没收到该轴新速度就发 0 */
+#define GIMBAL_POS_HOLD_MS      3000    /* 收到角度目标后位置环保持多久（期间速度指令让位） */
+#define GIMBAL_POS_MAX_ERROR    60.0f   /* 位置环误差限幅（°），目标跳变时别一脚油门 */
+#define GIMBAL_POS_INTEGRAL_BAND 8.0f   /* 误差小于它才积分，避免大误差时积分饱和 */
 
 Gimbal_t  Gimbal;
 GimbalTx_t GimbalTx;
 
 #if GIMBAL_MOTOR_INSTALLED
-/* 云台三轴的软限位（相对上电位置，单位 °）。
+/* 云台三轴的软限位（相对 0 点，单位 °）。
    初值是 RobotConfig.h 的默认值；树莓派下发示教结果后在这里被覆盖。
    示教点是"人手把轴推到想要的位置"，所以坐标就是 (Real - Offset)，限位值和位置
    回传用的是同一套坐标，不需要另外做数值换算。 */
@@ -61,9 +73,23 @@ static const uint8_t s_AxisInstalled[3] = {
 static uint32_t s_EnableTick   = 0;
 static uint32_t s_FeedbackTick = 0;
 
-/* 上电中位偏移：每轴第一次收到位置反馈时锁存，限位按 (Real - Offset) 判断 */
+/* 0 点偏移：每轴第一次收到位置反馈时先锁存一个临时 0 点；
+   PI_CMD_GIMBAL_ZERO 到达后直接改成"当前编码器值"，限位/遥测按 (Real - Offset)。 */
 static float   s_Offset[3]      = { 0.0f, 0.0f, 0.0f };
 static uint8_t s_OffsetValid[3] = { 0, 0, 0 };
+
+/* ---- 位置环状态（角度目标 → 速度） ---- */
+static const float s_MaxSpeedDegPerSec[3] = {
+    GIMBAL_YAW_SPEED_MAX, GIMBAL_LIFT_SPEED_MAX, GIMBAL_EXTEND_SPEED_MAX
+};
+static float    s_TargetDeg[3]   = { 0.0f, 0.0f, 0.0f };
+static uint8_t  s_TargetValid[3] = { 0, 0, 0 };
+static uint32_t s_TargetTick[3]  = { 0, 0, 0 };
+static PID_t    s_PosPid[3];
+static uint8_t  s_PosPidReady     = 0;
+static float    s_LastGimbalKp    = -1.0f;
+static float    s_LastGimbalKi    = -1.0f;
+static float    s_LastGimbalKd    = -1.0f;
 
 /* 把树莓派示教出来的限位同步进来（每拍调用，代价只有 3 次判断）。
    树莓派没下发过的轴保持 RobotConfig.h 的默认值。 */
@@ -97,13 +123,125 @@ static void Gimbal_SetAxisSpeed(uint8_t i, float degPerSec)
     GimbalTx.Rpm[i] = degPerSec / 6.0f;   /* 1 RPM = 6 °/s */
 }
 
-/* 三轴当前位置（相对上电位置，°）。没锁存基准前给 0，遥测不会发 NaN。 */
+/* 三轴当前位置（相对 0 点，°）。没锁存基准前给 0，遥测不会发 NaN。 */
 void Gimbal_GetRelDeg(float out[3])
 {
     for (uint8_t i = 0; i < 3; i++)
         out[i] = s_OffsetValid[i]
                ? (s_Axis[i]->Position.Real - s_Offset[i])
                : 0.0f;
+}
+
+void Gimbal_GetLimits(float minDeg[3], float maxDeg[3])
+{
+    for (uint8_t i = 0; i < 3; i++) {
+        minDeg[i] = s_MinDeg[i];
+        maxDeg[i] = s_MaxDeg[i];
+    }
+}
+
+/* ============ 位置环 ============ */
+
+/* 位置环 PID 初始化：输出直接是 °/s（编码器坐标），限幅用各轴速度上限。
+   增益初值取 PiTune，之后每拍检查一次，上位机改了就用 PID_SetGains 热更新。 */
+static void Gimbal_InitPosPid(void)
+{
+    for (uint8_t i = 0; i < 3; i++) {
+        PID_InitStruct_t p;
+        p.kP = PiTune.GimbalKp;
+        p.kI = PiTune.GimbalKi;
+        p.kD = PiTune.GimbalKd;
+        p.DeltaTime = GIMBAL_TASK_UPDATE_TICK / 1000.0f;
+        p.DifferentialFreqDiv = 1;
+        p.CircleResolution = 0.0f;
+        p.MaxError = GIMBAL_POS_MAX_ERROR;
+        p.MaxOutput = s_MaxSpeedDegPerSec[i];
+        p.I_Max = s_MaxSpeedDegPerSec[i];
+        p.DeadBand = GIMBAL_POS_DEADBAND_DEG;
+        p.IntegralBand = GIMBAL_POS_INTEGRAL_BAND;
+        PID_Init(&s_PosPid[i], &p);
+    }
+    s_LastGimbalKp = PiTune.GimbalKp;
+    s_LastGimbalKi = PiTune.GimbalKi;
+    s_LastGimbalKd = PiTune.GimbalKd;
+    s_PosPidReady  = 1;
+}
+
+/* 上位机调参：只在三项增益真的变了才重装（PID_SetGains 会清积分）。 */
+static void Gimbal_ApplyTune(void)
+{
+    if (!s_PosPidReady)
+        return;
+    if (PiTune.GimbalKp == s_LastGimbalKp &&
+        PiTune.GimbalKi == s_LastGimbalKi &&
+        PiTune.GimbalKd == s_LastGimbalKd)
+        return;
+
+    s_LastGimbalKp = PiTune.GimbalKp;
+    s_LastGimbalKi = PiTune.GimbalKi;
+    s_LastGimbalKd = PiTune.GimbalKd;
+    for (uint8_t i = 0; i < 3; i++)
+        PID_SetGains(&s_PosPid[i], PiTune.GimbalKp, PiTune.GimbalKi, PiTune.GimbalKd);
+}
+
+/* 置零：把三个轴此刻的编码器值定义成 0 点。
+   不调用电机内部 ZdtCan_SetZero——固件所有坐标都是 (Real - Offset)，
+   软件改偏移就够了，也避免动电机内部状态影响速度模式。 */
+static void Gimbal_ApplyZero(void)
+{
+    uint8_t mask = PiCommand.GimbalZeroMask;
+    if (!mask)
+        return;
+    PiCommand.GimbalZeroMask = 0;
+
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!(mask & (1u << i)) || !s_AxisInstalled[i])
+            continue;
+        if (s_Axis[i]->LastOnlineTick == 0)     /* 从没收到过反馈，不知道当前位置 */
+            continue;
+
+        s_Offset[i]      = s_Axis[i]->Position.Real;
+        s_OffsetValid[i] = 1;
+
+        /* 置零后旧目标全部作废，否则会突然往旧坐标跑 */
+        s_TargetValid[i]            = 0;
+        s_TargetTick[i]             = 0;
+        PiCommand.GimbalTarget[i].Mask = 0;
+        PiCommand.GimbalVel[i].Tick    = 0;
+        GimbalTx.Rpm[i]                = 0.0f;
+        if (s_PosPidReady)
+            PID_Clear(&s_PosPid[i]);
+    }
+}
+
+/* 把新到的角度目标收进位置环；目标先按软限位夹一刀。 */
+static void Gimbal_TakeTargets(uint32_t now)
+{
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!PiCommand.GimbalTarget[i].Mask)
+            continue;
+        PiCommand.GimbalTarget[i].Mask = 0;
+
+        if (!s_AxisInstalled[i])
+            continue;
+
+        s_TargetDeg[i] = ConstrainF(PiCommand.GimbalTarget[i].Deg,
+                                    s_MaxDeg[i], s_MinDeg[i]);
+        s_TargetValid[i] = 1;
+        s_TargetTick[i]  = now;
+
+        /* 位置指令立即接管：清速度时间戳，别让旧速度再掺和 */
+        PiCommand.GimbalVel[i].Tick = 0;
+        if (s_PosPidReady)
+            PID_Clear(&s_PosPid[i]);
+    }
+}
+
+/* 该轴的位置目标是否还在有效期内（期间速度指令让位）。 */
+static uint8_t Gimbal_PosActive(uint8_t i, uint32_t now)
+{
+    return (uint8_t)(s_TargetValid[i] &&
+                     (uint32_t)(now - s_TargetTick[i]) < GIMBAL_POS_HOLD_MS);
 }
 
 /* ============ 交给底盘任务发送 ============ */
@@ -164,6 +302,13 @@ void Gimbal_GetRelDeg(float out[3])
 {
     out[0] = out[1] = out[2] = 0.0f;
 }
+void Gimbal_GetLimits(float minDeg[3], float maxDeg[3])
+{
+    /* 没装云台也回传固件默认值，上位机界面不会显示成一排 0 */
+    minDeg[0] = GIMBAL_YAW_MIN;    maxDeg[0] = GIMBAL_YAW_MAX;
+    minDeg[1] = GIMBAL_LIFT_MIN;   maxDeg[1] = GIMBAL_LIFT_MAX;
+    minDeg[2] = GIMBAL_EXTEND_MIN; maxDeg[2] = GIMBAL_EXTEND_MAX;
+}
 #endif
 
 void GimbalTask(void const* argument)
@@ -181,6 +326,9 @@ void GimbalTask(void const* argument)
         if (s_AxisInstalled[i])
             GimbalTx.FeedbackLeft[i] = 3;    /* 上电分成 3 拍发，确保三轴都收到回传配置 */
     }
+
+    /* ---- 位置环 PID（增益初值来自 PiTune，上位机可在线改） ---- */
+    Gimbal_InitPosPid();
 #endif
 
     /* ---- 初始化夹爪 / 摄像头舵机 ---- */
@@ -208,6 +356,10 @@ void GimbalTask(void const* argument)
 
         /* ---- 树莓派示教的限位同步（下发过的轴覆盖默认值） ---- */
         Gimbal_SyncLimits();
+
+        /* ---- 位置环增益热更新 / 置零（人工把轴摆到固定位后上位机下发） ---- */
+        Gimbal_ApplyTune();
+        Gimbal_ApplyZero();
 
         /* ---- 松轴（限位示教）：让电机控制板失能，人手可以拨动三轴 ----
            进入时连发两帧 F3 AB 00；期间不发 F6（见 Gimbal_SendAxisSpeedFrames），
@@ -265,20 +417,45 @@ void GimbalTask(void const* argument)
 
         if (!Gimbal.isEnable)
         {
-            /* 失能：目标速度压 0，并作废速度时间戳（重新使能不会接着旧速度转） */
+            /* 失能：目标速度压 0，位置/速度目标一并作废
+               （重新使能后不会自己跑去失能前留下的旧目标） */
             for (uint8_t i = 0; i < 3; i++) {
                 GimbalTx.Rpm[i] = 0.0f;
-                PiCommand.GimbalVel[i].Tick = 0;
+                PiCommand.GimbalVel[i].Tick    = 0;
+                PiCommand.GimbalTarget[i].Mask = 0;
+                s_TargetValid[i] = 0;
+                s_TargetTick[i]  = 0;
+                if (s_PosPidReady)
+                    PID_Clear(&s_PosPid[i]);
             }
         }
         else
         {
+            /* 新到的角度目标先收进来（按软限位夹一刀） */
+            Gimbal_TakeTargets(now);
+
             for (uint8_t i = 0; i < 3; i++)
             {
                 if (!s_AxisInstalled[i]) {
                     GimbalTx.Rpm[i] = 0.0f;
                     PiCommand.GimbalVel[i].Tick = 0;
                     continue;
+                }
+
+                /* 位置目标有效期内：位置环接管，手柄速度让位 */
+                if (Gimbal_PosActive(i, now)) {
+                    float rel = s_Axis[i]->Position.Real - s_Offset[i];
+                    PID_Calc(&s_PosPid[i], rel, s_TargetDeg[i]);
+                    /* PID 输出是"让编码器坐标变大"的速度，换回速度指令坐标 */
+                    Gimbal_SetAxisSpeed(i, s_PosPid[i].Output * s_CmdSign[i]);
+                    continue;
+                }
+
+                /* 目标过期：清掉，退回速度模式（不清的话下次使能会补跑旧目标） */
+                if (s_TargetValid[i]) {
+                    s_TargetValid[i] = 0;
+                    s_TargetTick[i]  = 0;
+                    PID_Clear(&s_PosPid[i]);
                 }
 
                 /* 新速度指令（未超时）→ 用摇杆速度；回中/超时 → 0 */
@@ -290,10 +467,9 @@ void GimbalTask(void const* argument)
             }
         }
 
-        /* 位置/回零指令本版不支持：收到就直接丢弃，避免标志位一直挂着、以后误执行 */
+        /* 电机内置寻零本版不支持：收到直接丢弃，避免标志位一直挂着、以后误执行。
+           位置目标不再是丢弃，而是由上面的位置环接管。 */
         PiCommand.HomeMask = 0;
-        for (uint8_t i = 0; i < 3; i++)
-            PiCommand.GimbalTarget[i].Mask = 0;
 #endif
 
         /* ---- 夹爪 / 摄像头舵机（仅使能时更新，失能保持末值） ---- */

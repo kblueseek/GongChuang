@@ -97,22 +97,33 @@ enum
       两个电机绝不能共用同一个地址（会同时动作、无法单独控制）。 */
 #define GIMBAL_YAW_INSTALLED     1
 
-/* 三轴软限位（相对「上电位置」的角度，单位 °），往越界方向推不发速度，防止撞结构。
-   云台任务在每轴第一次收到位置反馈时把那一刻锁存成 0 点，所以这里的 ± 值就是
-   "相对上电位置"的行程。下面是出厂默认值（实测行程）：
+/* 三轴软限位（相对「0 点」的角度，单位 °），往越界方向推不发速度，防止撞结构。
+   云台任务在每轴第一次收到位置反馈时先锁存一个临时 0 点；把轴摆到固定位后，
+   树莓派面板或上位机发 PI_CMD_GIMBAL_ZERO 把此刻位置改成 0 点，所以这里的 ± 值
+   就是"相对固定位"的行程。下面是出厂默认值（实测行程）：
      Extend（X 伸缩，地址 7）：行程 1160° → ±580°
      Lift  （Y 升降，地址 6）：行程 1750° → ±875°
      Yaw   （旋转，地址 5）  ：行程未量，先给 ±1000° 兜底。
-   ⚠️ 正常运行不用改这里：树莓派面板节点会在开机示教时把人为拨到的两端通过
-      PI_CMD_GIMBAL_LIMIT 下发，运行时值以树莓派下发的为准（见 PiComm.h / GimbalTask.c）。
-      这组宏只是"树莓派没下发过限位"时的兜底。
-   云台只发速度帧，不存在位置模式；限位靠"相对中位的位置 + 运动方向"在速度指令上掐掉。 */
+   ⚠️ 正常运行不用改这里：树莓派面板节点会在开机示教时、上位机在 PID 页标定时，
+      把限位通过 PI_CMD_GIMBAL_LIMIT 下发，运行时值以下发的为准（见 PiComm.h /
+      GimbalTask.c）。两边改的是同一份限位，谁最后下发谁生效。
+      这组宏只是"从没下发过限位"时的兜底。
+   云台电机本身只有速度模式，位置环在 GimbalTask 里做；限位靠"相对 0 点的位置 + 运动方向"
+   在速度指令上掐掉。 */
 #define GIMBAL_YAW_MIN      -1000.0f
 #define GIMBAL_YAW_MAX      1000.0f
 #define GIMBAL_LIFT_MIN      -875.0f
 #define GIMBAL_LIFT_MAX       875.0f
 #define GIMBAL_EXTEND_MIN    -580.0f
 #define GIMBAL_EXTEND_MAX     580.0f
+
+/* 云台位置环输出的速度上限（°/s）和到位死区（°）。
+   三轴机械负载差很多：Yaw 只带相机、Lift 要抗重力、Extend 行程长，
+   所以上限分开给。位置环增益在 PiComm/PiTune 里在线可调。 */
+#define GIMBAL_YAW_SPEED_MAX       120.0f
+#define GIMBAL_LIFT_SPEED_MAX      400.0f
+#define GIMBAL_EXTEND_SPEED_MAX    300.0f
+#define GIMBAL_POS_DEADBAND_DEG      0.5f
 
 /* 轴指令方向符号（+1 / -1）：把"下发速度的正方向"换算到"编码器位置增大的方向"。
    +1 = 正速度指令让位置反馈变大（Lift / Extend 属于这种，实车已验证）。

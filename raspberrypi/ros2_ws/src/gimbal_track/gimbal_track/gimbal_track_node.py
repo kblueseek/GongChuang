@@ -185,6 +185,7 @@ class GimbalTrackNode(Node):
 
         # 状态
         self._enabled = False
+        self._planner_active = False # 上位机正在执行动作序列：云台控制权不在视觉/手柄
         self._target = None          # (cx, cy)
         self._img_w = 1280
         self._img_h = 720
@@ -205,6 +206,8 @@ class GimbalTrackNode(Node):
         self.create_subscription(Bool, '/vision_enable', self._cb_enable, 10)
         self.create_subscription(Float32MultiArray, '/material_target', self._cb_target, 10)
         self.create_subscription(Float32MultiArray, '/gimbal_state', self._cb_gimbal_state, 10)
+        # 上位机执行动作序列期间云台归上位机，本节点一个速度都不发（和手柄同一套让位规则）
+        self.create_subscription(Bool, '/motion_active', self._cb_motion_active, 10)
         self._pub = self.create_publisher(Float32MultiArray, '/cmd_gimbal_vel', 10)
 
         rate = max(10.0, float(self.get_parameter('rate_hz').value))
@@ -319,11 +322,23 @@ class GimbalTrackNode(Node):
             self._hist.clear()
 
     def _cb_gimbal_state(self, msg: Float32MultiArray):
-        """记录 lift 当前位置（°/相对上电位置），供下探做位置闭环。"""
+        """记录 lift 当前位置（°/相对 0 点），供下探做位置闭环。"""
         data = msg.data
         if len(data) >= 3:
             self._lift_deg = float(data[1])   # [yaw, lift, extend]
             self._lift_deg_t = time.monotonic()
+
+    def _cb_motion_active(self, msg: Bool):
+        """上位机开始/结束执行动作序列。执行期间视觉节点完全让位。"""
+        active = bool(msg.data)
+        if active == self._planner_active:
+            return
+        self._planner_active = active
+        self._phase = 'wait_stop'
+        self._center_since = 0.0
+        self._dip = None
+        self.get_logger().info(
+            '上位机接管云台，视觉跟踪暂停' if active else '上位机结束，视觉跟踪恢复')
 
     # ---------------- 定时器 ----------------
 
@@ -332,8 +347,9 @@ class GimbalTrackNode(Node):
         dt = now - self._last_t
         self._last_t = now
 
-        # 没接管时一个速度都不发，让手柄正常控制；同时中止任何进行中的下探
-        if not self._enabled:
+        # 没接管 / 上位机正在跑序列时一个速度都不发，让手柄或上位机控制；
+        # 同时中止任何进行中的下探。
+        if not self._enabled or self._planner_active:
             self._phase = 'wait_stop'
             self._center_since = 0.0
             self._dip = None

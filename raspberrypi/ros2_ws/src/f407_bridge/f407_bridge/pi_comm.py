@@ -74,13 +74,17 @@ CMD_POSE = 0x09       # 位姿目标（走到世界系 (x,y) 并转到朝向 yaw
 CMD_LED = 0x0A        # 补光灯亮度（0~100%，PWM 调光）
 CMD_GIMBAL_LIMIT = 0x0B    # 云台单轴限位（示教结果下发）
 CMD_GIMBAL_RELEASE = 0x0C  # 云台三轴松轴/恢复（限位示教时人手拨动）
+CMD_TUNE = 0x0D       # 在线调参（id + float32）：最大速度 / 位置环 PID / 转向环 PID / 云台位置环 PID
+CMD_GIMBAL_ZERO = 0x0E  # 云台置零：把三轴此刻的编码器位置定义成 0 点
 CMD_HEARTBEAT = 0x10  # 心跳（定期发一次，告诉 F407 "我还活着"）
 
 # ==================== 回传数据编号 ====================
 # 这些是 F407 主动发给树莓派的"数据编号"（方向反过来）。编号都 >= 0x80，用最高位区分方向。
 RPT_ODOM = 0x81        # 里程计（车走了多远、朝向多少）
 RPT_STATUS = 0x83      # 整车状态（状态、错误码、电机在线情况）
-RPT_GIMBAL = 0x84      # 云台三轴位置（相对上电位置，单位 °）
+RPT_GIMBAL = 0x84      # 云台三轴位置（相对 0 点，单位 °）
+RPT_TUNE = 0x85        # 调参回显（id + float32）：确认 407 当前生效值
+RPT_GIMBAL_LIMIT = 0x86  # 云台单轴限位（轴号 + 是否有效 + 下限 + 上限）
 
 # 帧头两个字节
 SOF1 = 0xAA
@@ -223,8 +227,8 @@ def encode_gimbal_vel(axis: int, deg_per_s: float) -> bytes:
 def encode_gimbal_limit(axis: int, min_deg: float, max_deg: float) -> bytes:
     """云台单轴限位（0x0B）：轴号(1字节) + 下限(int16, ×0.1°) + 上限(int16, ×0.1°)。
 
-    这两个角度是"相对 F407 上电位置"的坐标，和云台位置回传 0x84 完全同一套坐标：
-    示教时树莓派看到多少，就原样发回来。F407 收到后覆盖 RobotConfig.h 的默认限位。
+    这两个角度是"相对云台 0 点"的坐标，和云台位置回传 0x84 完全同一套坐标：
+    示教/上位机标定时看到多少，就原样发回来。F407 收到后覆盖 RobotConfig.h 的默认限位。
     """
     if axis not in (0, 1, 2):
         raise PiCommError(f"云台轴越界：{axis}")
@@ -241,6 +245,50 @@ def encode_gimbal_limit(axis: int, min_deg: float, max_deg: float) -> bytes:
 def encode_gimbal_release(en: bool) -> bytes:
     """云台松轴（0x0C）：1 字节，1=松轴（电机控制板失能，可手拨），0=恢复锁轴。"""
     return bytes([1 if en else 0])
+
+
+def encode_gimbal_zero(mask: int) -> bytes:
+    """云台置零（0x0E）：1 字节，bit0=yaw bit1=lift bit2=extend。
+
+    收到后 F407 把对应轴此刻的编码器值定义成 0 点，之前示教/保存的限位仍然
+    相对这个 0 点生效。电机掉电不保存位置，所以每次上电先人工摆到固定位再置零。
+    """
+    return bytes([mask & 0x07])
+
+
+# 调参 ID，和 F407 的 PiComm.h 一一对应。
+TUNE_MAX_VX = 0x01      # 前进最大速度 m/s
+TUNE_MAX_VY = 0x02      # 平移最大速度 m/s
+TUNE_MAX_WZ = 0x03      # 转向最大角速度 rad/s
+TUNE_MAX_RPM = 0x04     # 单轮最大转速 RPM
+TUNE_POS_KP = 0x05      # 位置环 Kp
+TUNE_POS_KI = 0x06
+TUNE_POS_KD = 0x07
+TUNE_HEAD_KP = 0x08     # 转向环 Kp
+TUNE_HEAD_KI = 0x09
+TUNE_HEAD_KD = 0x0A
+TUNE_GIMBAL_KP = 0x0B   # 云台位置环 Kp（误差 ° → 速度 °/s）
+TUNE_GIMBAL_KI = 0x0C
+TUNE_GIMBAL_KD = 0x0D
+
+
+def encode_tune(param_id: int, value: float) -> bytes:
+    """在线调参指令（0x0D）：参数编号(1字节) + 数值(float32 大端)，共 5 字节。
+
+    F407 收到后立即改运行参数（不烧录），并回一帧 0x85 回显当前生效值。
+    上位机滑杆拖动时高频调用，帧很小，115200 下毫无压力。
+    """
+    if not 0 <= int(param_id) <= 0xFF:
+        raise PiCommError(f"调参编号越界：{param_id}")
+    return struct.pack(">Bf", int(param_id), float(value))
+
+
+def parse_tune(data: bytes) -> tuple[int, float]:
+    """解析调参回显帧（0x85），返回 (参数编号, 当前生效值)。"""
+    if len(data) != 5:
+        raise PiCommError(f"调参回显帧长度应为5，实际{len(data)}")
+    param_id, value = struct.unpack(">Bf", data)
+    return param_id, float(value)
 
 
 def encode_home(mask: int) -> bytes:
@@ -291,13 +339,25 @@ def parse_status(data: bytes) -> tuple[int, int, int]:
 def parse_gimbal(data: bytes) -> tuple[float, float, float]:
     """解析云台位置帧（0x84），返回 (yaw°, lift°, extend°)。
 
-    三个 int16，单位 0.1°，坐标是"相对 F407 上电位置"。上电后不要用手去掰轴，
-    否则这个基准就变了（限位示教就是在这个基准上做的）。
+    三个 int16，单位 0.1°，坐标是"相对云台 0 点"。0 点由 PI_CMD_GIMBAL_ZERO
+    定义（上电时先是第一次收到反馈的位置，人工摆到固定位后置零即可）。
     """
     if len(data) != 6:
         raise PiCommError(f"云台位置帧长度应为6，实际{len(data)}")
     yaw, lift, extend = struct.unpack(">hhh", data)
     return yaw / 10.0, lift / 10.0, extend / 10.0
+
+
+def parse_gimbal_limit(data: bytes) -> tuple[int, bool, float, float]:
+    """解析云台限位帧（0x86），返回 (轴号, 是否有效, 下限°, 上限°)。
+
+    帧内容：轴号(1字节) + valid(1字节) + 下限(int16, ×0.1°) + 上限(int16, ×0.1°)。
+    valid=False 表示这轴还没被示教/上位机下发过，值是固件默认值。
+    """
+    if len(data) != 6:
+        raise PiCommError(f"云台限位帧长度应为6，实际{len(data)}")
+    axis, valid, lo, hi = struct.unpack(">BBhh", data)
+    return int(axis), bool(valid), lo / 10.0, hi / 10.0
 
 
 class PiCommLink:
@@ -408,6 +468,12 @@ class PiCommLink:
 
     def send_gimbal_release(self, en: bool) -> bool:
         return self._send(CMD_GIMBAL_RELEASE, encode_gimbal_release(en))
+
+    def send_gimbal_zero(self, mask: int) -> bool:
+        return self._send(CMD_GIMBAL_ZERO, encode_gimbal_zero(mask))
+
+    def send_tune(self, param_id: int, value: float) -> bool:
+        return self._send(CMD_TUNE, encode_tune(param_id, value))
 
     def send_home(self, mask: int) -> bool:
         return self._send(CMD_HOME, encode_home(mask))
@@ -655,6 +721,12 @@ class BleLink:
 
     def send_gimbal_release(self, en: bool) -> bool:
         return self._send(CMD_GIMBAL_RELEASE, encode_gimbal_release(en))
+
+    def send_gimbal_zero(self, mask: int) -> bool:
+        return self._send(CMD_GIMBAL_ZERO, encode_gimbal_zero(mask))
+
+    def send_tune(self, param_id: int, value: float) -> bool:
+        return self._send(CMD_TUNE, encode_tune(param_id, value))
 
     def send_home(self, mask: int) -> bool:
         return self._send(CMD_HOME, encode_home(mask))

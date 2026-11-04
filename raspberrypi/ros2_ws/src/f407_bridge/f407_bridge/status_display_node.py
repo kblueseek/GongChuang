@@ -10,7 +10,7 @@
 
   ── 显示（三页，按键 3 / GPIO23 翻页）──
     第 1 页 状态：F407/LINK/PAD、X/Y/朝向、整车状态、错误码
-    第 2 页 云台：三轴当前位置（相对上电位置，单位 °）
+    第 2 页 云台：三轴当前位置（相对 0 点，单位 °）
     第 3 页 限位：三轴当前的软限位（来自示教结果）
 
   ── 开机限位示教（启动后自动进入）──
@@ -20,6 +20,8 @@
     4. 依次对 LIFT（Z 升降）、EXTEND（X 伸缩）做同样的事；
     5. 三轴完成后把限位写进树莓派文件，并下发给 F407；F407 立即用新限位。
     示教点就是"人手把轴停住的位置"，所以 min/max 天然和电机方向设置无关。
+    上位机开始执行动作序列（/motion_active=True）时，本节点自动退出示教，
+    把云台/使能控制权让给上位机；没教完的轴沿用上次保存的限位。
 
   按键（全部是上拉输入，按下为低电平）：
     按键1 GPIO17 ：跳过当前轴（保留上次保存的限位），进入下一轴
@@ -27,13 +29,14 @@
     按键3 GPIO23 ：记录当前点 / 翻页（非示教时）
     按键4 GPIO24 ：退出示教（已经记下的轴生效，剩下的用上次保存值）
 
-================ 重要：限位坐标是"相对 F407 上电位置" ================
-F407 在每轴上电后第一次收到编码器反馈时，把那一刻锁存成 0 点，限位就是相对这个 0 点
-的角度。所以：
-  · 每次 F407 重新上电，0 点都会变（变成上电时轴所在的位置）；
-  · 树莓派保存的限位只在"上电姿态和上次一样"时还能用；
-  · 正常用法就是每次开机都示教一遍（本节点默认自动进入），保存文件主要用于
-    查看/跳过时兜底。
+================ 重要：限位坐标是"相对 0 点" ================
+F407 在每轴上电后第一次收到编码器反馈时，先锁存一个临时 0 点；限位就是相对这个 0 点
+的角度。把云台摆到固定位后，本节点的示教或上位机 PID 页的【设为零点】都会把此刻位置
+改成 0 点，两种方式改的是同一套 0 点/限位，彼此互通。所以：
+  · 每次 F407 重新上电，0 点暂时变成上电时轴所在的位置；
+  · 树莓派保存的限位只在 0 点姿态和上次一样时还能用；
+  · 正常用法：每次开机示教一遍（本节点默认自动进入），或者把云台摆到固定位后在
+    上位机点【设为零点】再下发限位；保存文件主要用于查看/跳过时兜底。
   按 按键4 跳过时，节点会把上次保存的限位发下去——如果这次上电时轴的位置和上次
   装车时不一样，这组限位就是错的，屏幕上会显示 "OLD?" 提醒。
 
@@ -200,7 +203,7 @@ class StatusDisplayNode(Node):
         self._ble = False
         self._ble_s = 0.0
         self._joy_s = 0.0                  # 最近一次收到手柄数据的时间（判断手柄在不在）
-        self._gimbal = [0.0, 0.0, 0.0]     # 云台三轴位置 °（相对上电位置）
+        self._gimbal = [0.0, 0.0, 0.0]     # 云台三轴位置 °（相对 0 点）
         self._gimbal_s = 0.0
 
         # ================= 限位示教状态 =================
@@ -212,6 +215,8 @@ class StatusDisplayNode(Node):
         self._start_at = time.monotonic() + self._startup_delay_s
         self._release_off_left = 0         # 示教结束后还要补发几帧"恢复锁轴"
         self._last_limit_tx = 0.0
+        self._limits_report_s = 0.0        # 最近一次收到 /gimbal_limits 的时间
+        self._limits_report_valid = [False, False, False]  # 407 侧该轴是否已有有效限位
         self._last_msg = ''                # 屏幕底部临时提示
 
         # ================= 订阅（只读 + 云台位置） =================
@@ -221,6 +226,10 @@ class StatusDisplayNode(Node):
         self.create_subscription(Bool, '/ble_connected', self._cb_ble, 10)
         self.create_subscription(Joy, '/joy', self._cb_joy, 10)
         self.create_subscription(Float32MultiArray, '/gimbal_state', self._cb_gimbal, 10)
+        # 上位机开始执行序列时会置 True：这时必须退出示教，不能一直压着"失能+松轴"
+        self.create_subscription(Bool, '/motion_active', self._cb_motion_active, 10)
+        # 407 当前生效的限位（上位机改过也会从这里同步回来，两边始终是同一套）
+        self.create_subscription(Float32MultiArray, '/gimbal_limits', self._cb_limits, 10)
 
         # ================= 发布（示教用） =================
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
@@ -399,11 +408,20 @@ class StatusDisplayNode(Node):
             self._pub_release.publish(Bool(data=True))
             return
 
-        # 'off'：示教结束后补几帧恢复锁轴，之后 1Hz 重发限位（F407 重启也能补上）
+        # 'off'：示教结束后补几帧恢复锁轴
         if self._release_off_left > 0:
             self._pub_release.publish(Bool(data=False))
             self._release_off_left -= 1
-        if now - self._last_limit_tx >= 1.0:
+
+        # 限位重发只在"需要"的时候做，避免和上位机改限位打架：
+        #   · F407 重启 / 链路刚恢复：2s 没收到限位回传 → 把保存的限位补下去
+        #   · 回传显示某轴 valid=0（固件默认值）→ 这轴把保存值补下去
+        # 正常运行时 407 每 0.5s 回传一次，这里一帧都不发。
+        stale = (self._limits_report_s <= 0.0
+                 or now - self._limits_report_s > 2.0)
+        missing = any(axis in self._limits and not self._limits_report_valid[axis]
+                      for axis in range(len(_AXES)))
+        if (stale or missing) and now - self._last_limit_tx >= 1.0:
             self._publish_limits()
 
     def _publish_limits(self):
@@ -498,6 +516,40 @@ class StatusDisplayNode(Node):
         if len(msg.data) >= 3:
             self._gimbal = [float(msg.data[0]), float(msg.data[1]), float(msg.data[2])]
             self._gimbal_s = time.monotonic()
+
+    def _cb_motion_active(self, msg: Bool):
+        """上位机开始执行动作序列 → 自动退出示教。
+
+        示教的 wait/min/max 阶段会每秒发"整车失能 + 云台松轴"；上位机执行时如果
+        不退出，就会一直把车按在失能状态（表现：点了执行车不动、松轴勾选也失灵）。
+        已经记录的轴照常生效，剩余轴沿用上次保存的限位。
+        """
+        if bool(msg.data) and self._setup_state != 'off':
+            self.get_logger().info('上位机开始执行，自动退出限位示教')
+            self._on_exit()
+
+    def _cb_limits(self, msg: Float32MultiArray):
+        """407 当前生效的限位：[轴号, 是否有效, 下限, 上限]。
+
+        上位机改了限位也会走这里回到本节点：缓存跟着更新、写盘，
+        下次 F407 重启时补下去的就是最新值，两边不会各存一份。
+        """
+        if len(msg.data) < 4:
+            return
+        axis = int(round(msg.data[0]))
+        if not 0 <= axis < len(_AXES):
+            return
+        valid = bool(msg.data[1])
+        lo, hi = float(msg.data[2]), float(msg.data[3])
+        self._limits_report_s = time.monotonic()
+        self._limits_report_valid[axis] = valid
+        if not valid:
+            return                      # 固件默认值，不覆盖本地保存的示教结果
+
+        old = self._limits.get(axis)
+        if old is None or abs(old[0] - lo) > 0.05 or abs(old[1] - hi) > 0.05:
+            self._limits[axis] = (lo, hi)
+            self._save_limits()
 
     # ---------------- 绘制 ----------------
 

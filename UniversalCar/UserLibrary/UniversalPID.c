@@ -36,6 +36,17 @@ void PID_Init(PID_t* pid, PID_InitStruct_t* pidParam)
     pid->Output = 0;
 }
 
+/// @brief 在线修改 PID 三项增益（供上位机调参使用）
+/// @note  PID_t 内部存的是 kI*DeltaTime 和 kD/(DeltaTime*disp)，所以必须按
+///        初始化时的同一套换算重算；改完清一次积分/误差，避免旧状态拖累新参数。
+void PID_SetGains(PID_t* pid, float kP, float kI, float kD)
+{
+    pid->kP = kP;
+    pid->kI_mdt = kI * pid->DeltaTime;
+    pid->kD_ddt = kD / (pid->DeltaTime * ((pid->DifferentialFreqDiv == 0) ? 1 : pid->DifferentialFreqDiv));
+    PID_Clear(pid);
+}
+
 /// @brief PID控制器更新计算
 /// @param pid  PID控制器
 /// @param real 被控量当前的真实值

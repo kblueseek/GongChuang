@@ -1,0 +1,49 @@
+{
+  "nodes": [
+    {
+      "name": "1. START",
+      "route": "START",
+      "actions": []
+    },
+    {
+      "name": "2. 扫码区",
+      "route": "扫码区",
+      "actions": []
+    },
+    {
+      "name": "3. 原料区",
+      "route": "原料区",
+      "actions": []
+    },
+    {
+      "name": "4. 粗加工区",
+      "route": "粗加工区",
+      "actions": []
+    },
+    {
+      "name": "5. 暂存区",
+      "route": "暂存区",
+      "actions": []
+    },
+    {
+      "name": "6. 原料区",
+      "route": "原料区",
+      "actions": []
+    },
+    {
+      "name": "7. 粗加工区",
+      "route": "粗加工区",
+      "actions": []
+    },
+    {
+      "name": "8. 暂存区",
+      "route": "暂存区",
+      "actions": []
+    },
+    {
+      "name": "9. START",
+      "route": "START",
+      "actions": []
+    }
+  ]
+}

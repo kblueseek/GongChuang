@@ -10,6 +10,7 @@
 #include "header.h"
 
 #define RECEIVE_TASK_UPDATE_TICK 10
+#define PI_GIMBAL_LIMIT_FREQ_MS 500    /* 云台限位回传：2Hz，状态屏/上位机靠它同步 */
 
 Receive_t Receive;
 
@@ -33,6 +34,7 @@ void ReceiveTask(void const* argument)
     uint32_t LastReportTick = 0;
     uint32_t LastOdomTick   = 0;
     uint32_t LastGimbalTick = 0;
+    uint32_t LastLimitTick  = 0;
 
     while (1)
     {
@@ -90,13 +92,26 @@ void ReceiveTask(void const* argument)
         }
 
         /* ---- 云台三轴位置回传（PI_GIMBAL_RPT_FREQ_HZ=20Hz）：状态屏显示 + 限位示教 ----
-           值 = 相对「上电位置」的角度，和云台限位用的是同一个坐标。 */
+           值 = 相对「0 点」的角度，和云台限位用的是同一个坐标。 */
         if (NowTick - LastGimbalTick >= (1000 / PI_GIMBAL_RPT_FREQ_HZ))
         {
             LastGimbalTick = NowTick;
             float rel[3];
             Gimbal_GetRelDeg(rel);
             PiComm_SendGimbalPose(rel[0], rel[1], rel[2]);
+        }
+
+        /* ---- 云台软限位回传（2Hz）：状态屏和上位机看到的是同一套限位 ----
+           valid=0 表示这轴还没被示教/上位机下发过，值是固件默认值；
+           状态屏拿到 valid=0 会把自己保存的限位重新下发一次。 */
+        if (NowTick - LastLimitTick >= PI_GIMBAL_LIMIT_FREQ_MS)
+        {
+            LastLimitTick = NowTick;
+            float lo[3], hi[3];
+            Gimbal_GetLimits(lo, hi);
+            for (uint8_t i = 0; i < 3; i++)
+                PiComm_SendGimbalLimit(i, PiCommand.GimbalLimit[i].Valid,
+                                       lo[i], hi[i]);
         }
     }
 }

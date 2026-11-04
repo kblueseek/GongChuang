@@ -6,6 +6,32 @@
 #include "header.h"
 
 PiCommand_t PiCommand;
+PiTune_t    PiTune;
+
+/* 默认值集中在这里，和 ChassisTask.c 的 PID 初始化保持一致。
+   不写静态初始化列表，是因为 PiComm_Init() 可能在底盘任务启动前/后执行，
+   两个任务都直接读 PiTune；用显式复位函数最稳。 */
+void PiComm_TuneReset(void)
+{
+    PiTune.MaxSpeedX   = CHASSIS_MAX_SPEED_X;
+    PiTune.MaxSpeedY   = CHASSIS_MAX_SPEED_Y;
+    PiTune.MaxSpeedW   = CHASSIS_MAX_SPEED_W;
+    PiTune.MaxWheelRpm = (float)CHASSIS_MAX_WHEEL_RPM;
+
+    PiTune.PosKp = 1.5f;
+    PiTune.PosKi = 0.3f;
+    PiTune.PosKd = 0.2f;
+
+    PiTune.HeadingKp = 4.0f;
+    PiTune.HeadingKi = 0.0f;
+    PiTune.HeadingKd = 0.0f;
+
+    PiTune.GimbalKp = 20.0f;
+    PiTune.GimbalKi = 0.0f;
+    PiTune.GimbalKd = 0.0f;
+
+    PiTune.Version = 0;
+}
 
 /* 接收状态机：每条链路一套上下文（蓝牙上行 / USART6 有线），避免字节交织时互相打断 */
 #define PI_RX_BUF_SIZE  64
@@ -232,6 +258,69 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
         if (dLen >= 1)
             PiCommand.GimbalRelease = d[0] ? 1 : 0;
         break;
+    case PI_CMD_GIMBAL_ZERO:        /* mask(u8)：把当前位置记成 0 点（电机掉电不保存位置） */
+        if (dLen >= 1)
+            PiCommand.GimbalZeroMask |= (uint8_t)(d[0] & 0x07);
+        break;
+    case PI_CMD_TUNE:               /* id(u8) + value(float32 大端) */
+        if (dLen >= 5) {
+            uint8_t id = d[0];
+            uint32_t raw = ((uint32_t)d[1] << 24) | ((uint32_t)d[2] << 16) |
+                           ((uint32_t)d[3] << 8)  |  (uint32_t)d[4];
+            float v;
+            memcpy(&v, &raw, sizeof(v));   /* 大端拼成宿主序，再按 float 解释 */
+
+            /* 数值合法性检查：树莓派滑杆/输入框可能发出 NaN 或离谱值，
+               写进 PID 会直接把车打飞，这里一律挡掉。 */
+            if (!(v == v) || fabsf(v) > 1.0e6f)
+                return;
+
+            uint8_t applied = 0;
+            switch (id) {
+            case PI_TUNE_MAX_VX:
+                if (v >= 0.0f && v <= 5.0f)   { PiTune.MaxSpeedX = v;   applied = 1; }
+                break;
+            case PI_TUNE_MAX_VY:
+                if (v >= 0.0f && v <= 5.0f)   { PiTune.MaxSpeedY = v;   applied = 1; }
+                break;
+            case PI_TUNE_MAX_WZ:
+                if (v >= 0.0f && v <= 20.0f)  { PiTune.MaxSpeedW = v;   applied = 1; }
+                break;
+            case PI_TUNE_MAX_RPM:
+                if (v >= 0.0f && v <= 1000.0f){ PiTune.MaxWheelRpm = v; applied = 1; }
+                break;
+            case PI_TUNE_POS_KP:
+            case PI_TUNE_POS_KI:
+            case PI_TUNE_POS_KD:
+            case PI_TUNE_HEAD_KP:
+            case PI_TUNE_HEAD_KI:
+            case PI_TUNE_HEAD_KD:
+            case PI_TUNE_GIMBAL_KP:
+            case PI_TUNE_GIMBAL_KI:
+            case PI_TUNE_GIMBAL_KD:
+                if (v >= 0.0f && v <= 100.0f) {
+                    if      (id == PI_TUNE_POS_KP)    PiTune.PosKp = v;
+                    else if (id == PI_TUNE_POS_KI)    PiTune.PosKi = v;
+                    else if (id == PI_TUNE_POS_KD)    PiTune.PosKd = v;
+                    else if (id == PI_TUNE_HEAD_KP)   PiTune.HeadingKp = v;
+                    else if (id == PI_TUNE_HEAD_KI)   PiTune.HeadingKi = v;
+                    else if (id == PI_TUNE_HEAD_KD)   PiTune.HeadingKd = v;
+                    else if (id == PI_TUNE_GIMBAL_KP) PiTune.GimbalKp = v;
+                    else if (id == PI_TUNE_GIMBAL_KI) PiTune.GimbalKi = v;
+                    else                              PiTune.GimbalKd = v;
+                    applied = 1;
+                }
+                break;
+            default:
+                return;                 /* 未知 id：不刷新版本号，也不回显 */
+            }
+            if (!applied)
+                return;                 /* 超出安全范围：不生效、不回显 */
+            /* 这里运行在 UART 接收中断里，绝对不能直接发回显（有线模式是
+               阻塞发送）。只把版本号 +1，由 ChassisTask 在任务上下文里回显。 */
+            PiTune.Version++;
+        }
+        break;
     case PI_CMD_HEARTBEAT:
         break;
     default:
@@ -245,6 +334,7 @@ void PiComm_Init(void)
 {
     /* 只清状态；UART 接收由 usart.c 的 RX 中断统一管理 */
     memset(&PiCommand, 0, sizeof(PiCommand));
+    PiComm_TuneReset();
     /* 上电默认「失能」：树莓派端 _enabled 也初始为 False，两边状态才对得上。
        原来默认使能，Pi 侧却以为自己是失能的，要按两次 start 才真正切换一次，
        而且 407 单独上电（没接树莓派）时电机会直接带电锁轴。 */
@@ -339,4 +429,25 @@ void PiComm_SendGimbalPose(float yawDeg, float liftDeg, float extendDeg)
 
     uint8_t d[6] = { y >> 8, y, l >> 8, l, e >> 8, e };
     PiComm_SendFrame(PI_RPT_GIMBAL, d, sizeof(d));
+}
+
+void PiComm_SendGimbalLimit(uint8_t axis, uint8_t valid, float minDeg, float maxDeg)
+{
+    int16_t lo = PiComm_DegToInt16x10(minDeg);
+    int16_t hi = PiComm_DegToInt16x10(maxDeg);
+
+    uint8_t d[6] = { axis, valid ? 1 : 0, lo >> 8, lo, hi >> 8, hi };
+    PiComm_SendFrame(PI_RPT_GIMBAL_LIMIT, d, sizeof(d));
+}
+
+void PiComm_SendTune(uint8_t id, float value)
+{
+    uint32_t raw;
+    memcpy(&raw, &value, sizeof(raw));
+
+    uint8_t d[5] = {
+        id,
+        raw >> 24, raw >> 16, raw >> 8, raw
+    };
+    PiComm_SendFrame(PI_RPT_TUNE, d, sizeof(d));
 }

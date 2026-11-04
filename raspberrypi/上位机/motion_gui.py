@@ -1,22 +1,48 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""上位机：动作序列编辑器 + 雷达地图导航（二合一）。
+"""上位机：动作序列 + 雷达地图 + 九节点动作序列 + PID 调参（四合一）。
 
 ================ 大白话：这个程序是干什么的 ================
 
-左边两个页签：
+左边四个页签：
 
-  【动作序列】还是原来那套：编辑 move / turn / gimbal / gripper …，
-      点"执行整段"发到树莓派，motion_planner 一条一条跑。云台、夹爪、
-      载物盘、相机这些**非底盘动作**继续用指令序列写。
+  【动作序列】通用指令序列：编辑 move / turn / gimbal / gripper / script …
+      点底部【▶ 执行】发到树莓派，motion_planner 一条一条跑。
 
   【雷达 / 地图】从 vision 分支的 map_app 整合进来：
       · 按 field.json 的尺寸画出场地（灰色车道、淡黄禁行块、5×5 格）；
       · 接 D6 雷达串口（或模拟雷达）扫几圈，把回波打到地图上；
       · 自动识别圆柱/未知障碍，把占住的 450mm 格标红；
-      · 鼠标点地图上的任意位置 → A* 规划绕开障碍的路径 →
-        自动换算成里程计坐标，以 goto 指令下发给 motion_planner →
-        小车依次走完路点。勾掉"点击即导航"就只规划不下发。
+      · 鼠标点地图上的任意位置 → A* 规划绕开障碍的路径（只规划，不下发）。
+
+  【节点动作序列】整场比赛的 9 个点：每到一个点要做什么，都在这里编辑。
+      点的位置来自 field.json 的 mission.route（START → 扫码 → 原料 → … → START，
+      正好 9 个）。点底部【▶ 执行】后，上位机先按雷达地图逐段规划路线，
+      把车开到第 1 个点，跑该点的动作；再开去第 2 个点…直到第 9 个点。
+      动作不只有给 407 的指令，还能：
+        · script        启动任意程序（例如视觉识别窗口、标定脚本）；
+        · align         跑视觉程序并读回 JSON，用视觉结果修正小车位姿；
+        · vision_pick   视觉识别物料后自动执行定点抓取；
+        · pick / place  抓取/放置宏（云台+夹爪+延时）。
+
+  【PID 调参】在线改小车的所有关键参数，不用重新烧录：
+      · 前进/平移最大速度、转向最大角速度、单轮最大转速；
+      · 位置环 PID、转向环 PID、云台位置环 PID（位置环在 407 里跑）；
+      · 云台零点 / 限位 / 松轴：把云台摆到固定位后【设为零点】，限位相对零点生效；
+        限位可直接改数值后【下发限位】，和树莓派状态屏示教的是同一份；
+        【松轴】让电机关掉保持力，方便手拨找位置（会先整车失能）；
+      · 右边波形可切换 位置环 / 转向环 / 云台环，看目标 vs 实际。
+
+================ 底部按钮 ================
+
+只有两个：【▶ 执行】按当前页签决定执行什么（会先重新使能整车），
+          【■ 停止】立刻停车并整车失能（含正在跑的脚本/视觉子程序）。
+  动作序列页：执行左边整段序列
+  节点页：    执行九点任务（走完 9 个点，每个点跑自己的动作）
+  雷达页：    执行当前规划好的路径
+  PID 页：    把当前所有调参值重新下发一遍
+
+其他"点一下就动车"的按钮全部取消了，避免误触。
 
 ================ 坐标怎么对上 ================
 
@@ -63,11 +89,13 @@ import json
 import math
 import os
 import queue
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from car_interfaces.msg import Pose2D
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Int32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray, String
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -77,6 +105,7 @@ import mapping
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "field.json")
+NODES_PATH = os.path.join(HERE, "nodes.json")
 
 # ---------------- 配色（和 map_app 一致） ----------------
 C_BG      = "#ffffff"
@@ -106,6 +135,33 @@ COMMAND_TYPES = {
     'delay':     {'params': 'ms', 'hint': '原地等待毫秒数'},
     'calibrate': {'params': '', 'hint': '无参数(视觉校准占位)'},
     'comment':   {'params': 'text', 'hint': '注释文本(可含逗号)'},
+
+    # ---- 复杂动作（motion_planner 里实现）----
+    'script': {
+        'params': 'program|args|cwd|wait|timeout_s',
+        'hint': '启动一个程序。用竖线分隔：程序|参数|工作目录|等结束1/0|超时秒。'
+                '例：python3|/home/pi/vision/main.py --device /dev/video0|/home/pi/vision|0|120'
+    },
+    'align': {
+        'params': 'program|args|cwd|timeout_s|result_file',
+        'hint': '视觉矫正小车位姿。程序最后一行打印 JSON：'
+                '{"dx_m":0.01,"dy_m":-0.02,"dyaw_deg":1.5}；也可写进 result_file。'
+    },
+    'vision_pick': {
+        'params': 'program|args|cwd|timeout_s',
+        'hint': '视觉识别物品后抓取。程序打印 JSON：'
+                '{"yaw_deg":0,"lift_deg":-40,"extend_deg":150}，缺省用默认抓取位。'
+    },
+    'pick': {
+        'params': 'yaw_deg,lift_deg,safe_lift_deg,extend_deg,gripper_open,gripper_close,settle_ms',
+        'hint': '抓取宏：张爪→到安全位→下降到抓取位→夹紧→抬起。'
+                '例：0,-40,0,150,120,35,800'
+    },
+    'place': {
+        'params': 'yaw_deg,lift_deg,safe_lift_deg,extend_deg,gripper_open,gripper_close,settle_ms',
+        'hint': '放置宏：到安全位→下降到放置位→张爪→抬起。'
+                '例：0,-40,0,150,120,35,800'
+    },
 }
 
 
@@ -137,6 +193,19 @@ def cmd_to_text(cmd: dict) -> str:
         return "视觉校准"
     if name == 'comment':
         return f"// {cmd.get('text', '')}"
+    if name == 'script':
+        prog = cmd.get('program', '')
+        args = cmd.get('args', '')
+        wait = '等结束' if cmd.get('wait', True) else '后台'
+        return f"启动程序 {prog} {args}".strip() + f"（{wait}）"
+    if name == 'align':
+        return f"视觉矫正位姿 ← {cmd.get('program', '')} {cmd.get('args', '')}".strip()
+    if name == 'vision_pick':
+        return f"视觉识别并抓取 ← {cmd.get('program', '')} {cmd.get('args', '')}".strip()
+    if name in ('pick', 'place'):
+        verb = '抓取' if name == 'pick' else '放置'
+        return (f"{verb} yaw={cmd.get('yaw_deg', 0)}° lift={cmd.get('lift_deg', 0)}° "
+                f"ext={cmd.get('extend_deg', 0)}° 夹爪{cmd.get('gripper_close', 35)}°")
     return str(cmd)
 
 
@@ -165,12 +234,78 @@ def build_cmd(name: str, params_str: str) -> dict:
         return {'cmd': name, 'ms': int(float(parts[0])) if parts else 0}
     if name == 'calibrate':
         return {'cmd': name}
+
+    # ---- 复杂动作都用竖线分隔，避免参数里带逗号（比如脚本参数） ----
+    if name in ('script', 'align', 'vision_pick'):
+        vals = [p.strip() for p in params_str.split('|')]
+        vals += [''] * (5 - len(vals))
+        cmd = {'cmd': name, 'program': vals[0], 'args': vals[1], 'cwd': vals[2]}
+        if name == 'script':
+            cmd['wait'] = (vals[3].lower() not in ('0', 'false', '否', 'n', 'no'))
+            try:
+                cmd['timeout_s'] = float(vals[4]) if vals[4] else 60.0
+            except ValueError:
+                cmd['timeout_s'] = 60.0
+        elif name == 'align':
+            try:
+                cmd['timeout_s'] = float(vals[3]) if vals[3] else 60.0
+            except ValueError:
+                cmd['timeout_s'] = 60.0
+            cmd['result_file'] = vals[4]
+        else:
+            try:
+                cmd['timeout_s'] = float(vals[3]) if vals[3] else 60.0
+            except ValueError:
+                cmd['timeout_s'] = 60.0
+        return cmd
+
+    if name in ('pick', 'place'):
+        vals = [float(p) for p in parts] + [0.0] * 7
+        return {'cmd': name,
+                'yaw_deg': vals[0],
+                'lift_deg': vals[1],
+                'safe_lift_deg': vals[2],
+                'extend_deg': vals[3],
+                'gripper_open': vals[4] if len(parts) > 4 else 120.0,
+                'gripper_close': vals[5] if len(parts) > 5 else 35.0,
+                'settle_ms': int(vals[6]) if len(parts) > 6 else 800}
+
     return {'cmd': name}
 
 
 def wrap_deg(a: float) -> float:
     """角度归一化到 (-180, 180]。"""
     return (a + 180.0) % 360.0 - 180.0
+
+
+# ==================== 在线调参项 ====================
+# (参数编号, 键名, 显示名, 最小, 最大, 步长, 默认值, 是否整数)
+# 编号必须和 F407 的 PiComm.h / pi_comm.py 一致。
+TUNE_PARAMS = [
+    (0x01, 'max_vx',    '前进最大速度 (m/s)',    0.0, 3.0, 0.01, 1.0, False),
+    (0x02, 'max_vy',    '平移最大速度 (m/s)',    0.0, 3.0, 0.01, 1.0, False),
+    (0x03, 'max_wz',    '转向最大角速度 (rad/s)', 0.0, 8.0, 0.05, 3.0, False),
+    (0x04, 'max_rpm',   '单轮最大转速 (RPM)',    0,   600, 5,    300, True),
+    (0x05, 'pos_kp',    '位置环 Kp',             0.0,  8.0, 0.01, 1.5, False),
+    (0x06, 'pos_ki',    '位置环 Ki',             0.0,  5.0, 0.01, 0.3, False),
+    (0x07, 'pos_kd',    '位置环 Kd',             0.0,  5.0, 0.01, 0.2, False),
+    (0x08, 'head_kp',   '转向环 Kp',             0.0, 20.0, 0.05, 4.0, False),
+    (0x09, 'head_ki',   '转向环 Ki',             0.0, 10.0, 0.01, 0.0, False),
+    (0x0A, 'head_kd',   '转向环 Kd',             0.0, 10.0, 0.01, 0.0, False),
+    (0x0B, 'gim_kp',    '云台位置环 Kp',         0.0, 100.0, 0.5, 20.0, False),
+    (0x0C, 'gim_ki',    '云台位置环 Ki',         0.0, 20.0, 0.05, 0.0, False),
+    (0x0D, 'gim_kd',    '云台位置环 Kd',         0.0, 10.0, 0.05, 0.0, False),
+]
+
+TUNE_GROUPS = [
+    ('车速 / 限幅', ('max_vx', 'max_vy', 'max_wz', 'max_rpm')),
+    ('位置环 PID', ('pos_kp', 'pos_ki', 'pos_kd')),
+    ('转向环 PID', ('head_kp', 'head_ki', 'head_kd')),
+    ('云台位置环 PID', ('gim_kp', 'gim_ki', 'gim_kd')),
+]
+
+# 云台标定：轴名、位置显示键
+GIMBAL_AXES = (('Yaw', 'yaw'), ('Lift', 'lift'), ('Extend', 'ext'))
 
 
 # ==================== ROS2 节点：负责和树莓派通信 ====================
@@ -182,14 +317,37 @@ class GuiRosNode(Node):
         super().__init__('motion_gui')
         self.pub_load = self.create_publisher(String, '/motion_load', 10)
         self.pub_stop = self.create_publisher(Bool, '/motion_stop', 10)
+        self.pub_tune = self.create_publisher(Float32MultiArray, '/cmd_tune', 10)
+        self.pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
+        # 云台标定：置零 / 限位 / 松轴（和树莓派状态屏共用同一套话题）
+        self.pub_gimbal_zero = self.create_publisher(Int32, '/cmd_gimbal_zero', 10)
+        self.pub_gimbal_limit = self.create_publisher(Float32MultiArray, '/cmd_gimbal_limit', 10)
+        self.pub_gimbal_release = self.create_publisher(Bool, '/cmd_gimbal_release', 10)
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
         self.create_subscription(String, '/motion_state', self._cb_state, 10)
         self.create_subscription(Int32MultiArray, '/robot_status', self._cb_status, 10)
+        # PID 波形用的"目标值"：
+        #   /cmd_pose   motion_planner 下发的目标位姿
+        #   /cmd_gimbal 目标云台角度；/gimbal_state 是 F407 回传的实际角度
+        self.create_subscription(Pose2D, '/cmd_pose', self._cb_pose_target, 10)
+        self.create_subscription(Float32MultiArray, '/cmd_gimbal', self._cb_gimbal_target, 10)
+        self.create_subscription(Float32MultiArray, '/gimbal_state', self._cb_gimbal_state, 10)
+        self.create_subscription(Bool, '/f407_online', self._cb_online, 10)
+        self.create_subscription(Float32MultiArray, '/tune_state', self._cb_tune_state, 10)
+        # F407 当前生效的云台限位：[轴号, 是否有效, 下限, 上限]
+        self.create_subscription(Float32MultiArray, '/gimbal_limits', self._cb_gimbal_limits, 10)
 
         self.odom = None            # (x, y, theta) 米/米/弧度
         self.traj = []              # 历史轨迹 [(x,y), ...]（里程计系）
         self.motion_state = ''
         self.robot_status = None    # [state, err, mask]
+        self.pose_target = None     # (x, y, theta) 米/米/弧度
+        self.gimbal_target = None   # [yaw, lift, extend] 度
+        self.gimbal_state = None    # [yaw, lift, extend] 度（相对 0 点）
+        self.gimbal_limits = {}     # 轴号 -> (下限°, 上限°)
+        self.gimbal_limits_valid = [False, False, False]
+        self.online = False
+        self.tune_ack = {}          # 参数编号 -> 407 回显的生效值
 
     def _cb_odom(self, msg: Odometry):
         q = msg.pose.pose.orientation
@@ -207,19 +365,74 @@ class GuiRosNode(Node):
         if len(msg.data) >= 3:
             self.robot_status = list(msg.data[:3])
 
+    def _cb_pose_target(self, msg: Pose2D):
+        self.pose_target = (float(msg.x), float(msg.y), float(msg.theta))
+
+    def _cb_gimbal_target(self, msg: Float32MultiArray):
+        if len(msg.data) >= 3:
+            self.gimbal_target = [float(v) for v in msg.data[:3]]
+
+    def _cb_gimbal_state(self, msg: Float32MultiArray):
+        if len(msg.data) >= 3:
+            self.gimbal_state = [float(v) for v in msg.data[:3]]
+
+    def _cb_gimbal_limits(self, msg: Float32MultiArray):
+        if len(msg.data) >= 4:
+            axis = int(round(msg.data[0]))
+            if 0 <= axis <= 2:
+                self.gimbal_limits[axis] = (float(msg.data[2]), float(msg.data[3]))
+                self.gimbal_limits_valid[axis] = bool(msg.data[1])
+
+    def _cb_online(self, msg: Bool):
+        self.online = bool(msg.data)
+
+    def _cb_tune_state(self, msg: Float32MultiArray):
+        if len(msg.data) >= 2:
+            self.tune_ack[int(round(msg.data[0]))] = float(msg.data[1])
+
     def send_sequence(self, commands: list) -> bool:
         """下发一段指令序列。返回 False = 没有节点在听 /motion_load（motion_planner 没起来）。"""
         if self.pub_load.get_subscription_count() == 0:
             return False
+        # 执行前重新使能：底部【停止】会整车失能，不重新使能的话下发后车不动
+        self.send_enable(True)
         s = String()
         s.data = json.dumps(commands, ensure_ascii=False)
         self.pub_load.publish(s)
         return True
 
     def send_stop(self):
+        """■ 停止：状态机停在原地，同时整车失能（和手柄 B 键同一套效果）。"""
         b = Bool()
         b.data = True
         self.pub_stop.publish(b)
+        self.send_enable(False)
+
+    def send_enable(self, en: bool):
+        self.pub_enable.publish(Bool(data=bool(en)))
+
+    def send_gimbal_zero(self, mask: int = 0x07):
+        """把云台三轴当前位置定义成 0 点（电机掉电不保存位置）。"""
+        self.pub_gimbal_zero.publish(Int32(data=int(mask) & 0x07))
+
+    def send_gimbal_limits(self, limits: dict):
+        """limits: 轴号 -> (下限°, 上限°)。和状态屏示教结果走同一条通道。"""
+        for axis in range(3):
+            if axis not in limits:
+                continue
+            lo, hi = limits[axis]
+            self.pub_gimbal_limit.publish(
+                Float32MultiArray(data=[float(axis), float(lo), float(hi)]))
+
+    def send_gimbal_release(self, en: bool):
+        self.pub_gimbal_release.publish(Bool(data=bool(en)))
+
+    def send_tune(self, param_id: int, value: float) -> bool:
+        """发一项调参。motion 链路没起来时也不要报错，只是没人转发。"""
+        m = Float32MultiArray()
+        m.data = [float(param_id), float(value)]
+        self.pub_tune.publish(m)
+        return True
 
 
 # ==================== tkinter 界面 ====================
@@ -260,6 +473,7 @@ class App:
         self.mission_legs = []
         self.mission_total = 0.0
         self.goal_world = None
+        self._last_plan_kind = None   # 'single' = 单点规划，'mission' = 九点全程
         # 模拟执行用：没有真车时让车在图上沿着规划路径一步步走
         self.sim_pose = None        # (x, y, yaw_deg) 场地系；None = 不模拟
         self.play_pts = None        # 待播放的位姿序列
@@ -276,7 +490,33 @@ class App:
 
         self.commands = []          # 动作序列编辑器里的指令
 
-        root.title('智能搬运上位机 — 动作序列 + 雷达地图导航')
+        # ---------- 九节点动作序列 ----------
+        self.nodes = self._load_nodes()
+        self.node_sel = 0
+        self._nodes_dirty = False
+        if not os.path.exists(NODES_PATH):
+            self._save_nodes()      # 第一次运行生成 nodes.json，方便直接改文件
+
+        # ---------- PID 调参 ----------
+        # 滑杆值镜像。407 上电默认值必须和 TUNE_PARAMS 的默认值一致；
+        # 收到 /f407_online 由 False→True 时自动把全部值重发一遍，
+        # 防止 407 重启后参数悄悄回到默认。
+        self.tune = {key: float(default) for (_, key, _, _, _, _, default, _) in TUNE_PARAMS}
+        self._tune_ids = {key: pid for (pid, key, *_rest) in TUNE_PARAMS}
+        self._tune_scales = {}
+        self._tune_pending = {}
+        self._tune_after = None
+        self._tune_was_online = False
+        self.tune_status = tk.StringVar(value='调参：等待 /f407_online…')
+
+        # ---------- 波形历史（10Hz 采样，各存 60 秒） ----------
+        self.wave_pos = deque(maxlen=600)      # (目标x, 目标y, 实际x, 实际y)
+        self.wave_yaw = deque(maxlen=600)      # (目标yaw°, 实际yaw°)
+        self.wave_gimbal = deque(maxlen=600)   # (目标y,l,e, 实际y,l,e)
+        self.wave_mode = tk.StringVar(value='pos')
+        self.wave_axis = tk.IntVar(value=0)
+
+        root.title('智能搬运上位机 — 动作序列 / 雷达地图 / 九节点 / PID 调参')
         root.geometry('1500x940')
         self._build_ui()
         self._refresh()
@@ -286,20 +526,20 @@ class App:
     def _build_ui(self):
         self.status = tk.StringVar(
             value='就绪。没雷达就勾【模拟雷达】点【连接并开始】；'
-                  '左边【雷达 / 地图】扫完点地图即可导航。')
+                  '底部【▶ 执行】按当前页签执行，【■ 停止】随时停车。')
         ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN,
                   anchor='w', padding=4).pack(side=tk.BOTTOM, fill=tk.X)
 
-        bottom = ttk.Frame(self.root, padding=(8, 4))
+        # ---------- 底部：只留 执行 / 停止 ----------
+        bottom = ttk.Frame(self.root, padding=(8, 5))
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(bottom, text='▶ 执行整段', command=self.run_all).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text='▶ 执行选中一条',
-                   command=self.run_selected).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text='■ 停止（含导航）',
-                   command=self.node.send_stop).pack(side=tk.LEFT, padx=4)
-        ttk.Label(bottom, foreground='#666',
-                  text='  点地图 = 规划并导航；云台/夹爪/舵机仍用左边动作序列').pack(
-            side=tk.LEFT, padx=10)
+        ttk.Button(bottom, text='▶ 执行', width=12,
+                   command=self.execute_current).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(bottom, text='■ 停止', width=12,
+                   command=self.node.send_stop).pack(side=tk.LEFT)
+        self.exec_hint = tk.StringVar(value='执行：动作序列（当前页签）')
+        ttk.Label(bottom, textvariable=self.exec_hint,
+                  foreground='#555').pack(side=tk.LEFT, padx=16)
 
         body = ttk.Frame(self.root)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -310,26 +550,35 @@ class App:
         self.nb.pack(fill=tk.BOTH, expand=True)
         self._build_seq_tab()
         self._build_map_tab_controls()
+        self._build_nodes_tab()
+        self._build_tune_tab()
+        self.nb.bind('<<NotebookTabChanged>>', lambda e: self._on_tab_changed())
 
-        right = ttk.Frame(body)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # ---------- 右侧：地图画面 / 调参波形，按页签切换 ----------
+        self.right = ttk.Frame(body)
+        self.right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.map_frame = ttk.Frame(self.right)
+        self.wave_frame = ttk.Frame(self.right)
 
         self.pose_var = tk.StringVar(value='当前位姿: 未收到 /odom')
         self.state_var = tk.StringVar(value='状态机: —')
         self.plan_var = tk.StringVar(value='')
-        ttk.Label(right, textvariable=self.plan_var, anchor='w', foreground=C_PATH,
-                  wraplength=1000).pack(side=tk.BOTTOM, fill=tk.X, padx=8)
-        ttk.Label(right, textvariable=self.state_var, anchor='w',
+        ttk.Label(self.map_frame, textvariable=self.plan_var, anchor='w',
+                  foreground=C_PATH, wraplength=1000).pack(side=tk.BOTTOM, fill=tk.X, padx=8)
+        ttk.Label(self.map_frame, textvariable=self.state_var, anchor='w',
                   foreground='#444').pack(side=tk.BOTTOM, fill=tk.X, padx=8)
-        ttk.Label(right, textvariable=self.pose_var, anchor='w',
+        ttk.Label(self.map_frame, textvariable=self.pose_var, anchor='w',
                   foreground='#222').pack(side=tk.BOTTOM, fill=tk.X, padx=8)
 
-        self.canvas = tk.Canvas(right, bg=C_BG, highlightthickness=0)
+        self.canvas = tk.Canvas(self.map_frame, bg=C_BG, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 2))
         self.canvas.bind('<Button-1>', self.on_click)
         self.canvas.bind('<Motion>', self.on_motion)
         self.canvas.bind('<Leave>', lambda e: self._clear_hover())
         self.canvas.bind('<Configure>', lambda e: self._redraw())
+
+        self._build_wave_panel()
+        self.map_frame.pack(fill=tk.BOTH, expand=True)
 
     # ---------- 页签 1：动作序列 ----------
 
@@ -339,36 +588,710 @@ class App:
 
         ttk.Label(tab, text='动作序列（从上到下依次执行）',
                   font=('', 11, 'bold')).pack(anchor='w')
-        # 1024×768 的树莓派屏上整页要放得下，行数别太多（下面还有导入/导出）
-        self.listbox = tk.Listbox(tab, width=38, height=18)
+        self.listbox = tk.Listbox(tab, width=44, height=16)
         self.listbox.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        addrow = ttk.Frame(tab)
-        addrow.pack(fill=tk.X, pady=2)
-        self.cmd_type = tk.StringVar(value='move')
-        self.type_menu = ttk.OptionMenu(addrow, self.cmd_type, 'move',
-                                        *COMMAND_TYPES.keys(),
-                                        command=self._on_type_change)
-        self.type_menu.pack(side=tk.LEFT)
-        self.param_entry = ttk.Entry(addrow)
-        self.param_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Button(addrow, text='＋添加', command=self.add_cmd).pack(side=tk.LEFT)
-
-        self.hint_label = ttk.Label(tab, text='', foreground='gray')
-        self.hint_label.pack(anchor='w')
-        self._on_type_change('move')
-
-        editrow = ttk.Frame(tab)
-        editrow.pack(fill=tk.X, pady=4)
-        ttk.Button(editrow, text='上移', command=lambda: self.move_cmd(-1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(editrow, text='下移', command=lambda: self.move_cmd(+1)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(editrow, text='删除', command=self.del_cmd).pack(side=tk.LEFT, padx=2)
-        ttk.Button(editrow, text='清空', command=self.clear_cmds).pack(side=tk.LEFT, padx=2)
+        # 编辑器和【节点动作序列】共用同一套控件生成逻辑，只是目标列表不同
+        self.seq_editor = self._make_action_editor(
+            tab, self.listbox, lambda: self.commands, lambda: None, width=42)
 
         iorow = ttk.Frame(tab)
         iorow.pack(fill=tk.X, pady=2)
         ttk.Button(iorow, text='导入JSON', command=self.import_json).pack(side=tk.LEFT, padx=2)
         ttk.Button(iorow, text='导出JSON', command=self.export_json).pack(side=tk.LEFT, padx=2)
+
+    # ---------- 通用动作编辑器（动作序列页 / 节点动作序列页共用） ----------
+
+    def _make_action_editor(self, parent, listbox, get_cmds, on_change, width=44):
+        """生成"类型下拉 + 参数输入 + 添加/上移/下移/删除/清空"这一套控件。
+
+        get_cmds() 返回当前页签正在编辑的 list（直接原地修改）；
+        on_change() 在内容变化后调用（节点页用它自动存盘）。
+        """
+        addrow = ttk.Frame(parent)
+        addrow.pack(fill=tk.X, pady=2)
+        entry = ttk.Entry(addrow)
+        hint = ttk.Label(parent, text='', foreground='gray', wraplength=width * 7)
+
+        def on_type(name):
+            hint.config(text=f"参数：{COMMAND_TYPES[name]['params']}  —  "
+                             f"{COMMAND_TYPES[name]['hint']}")
+
+        cmd_type = tk.StringVar(value='move')
+        menu = ttk.OptionMenu(addrow, cmd_type, 'move', *COMMAND_TYPES.keys(),
+                              command=on_type)
+        menu.configure(width=9)
+        menu.pack(side=tk.LEFT)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        hint.pack(anchor='w')
+        on_type('move')
+
+        def add():
+            try:
+                cmd = build_cmd(cmd_type.get(), entry.get())
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror('参数错误', f'参数解析失败：{e}')
+                return
+            cmds = get_cmds()
+            cmds.append(cmd)
+            listbox.insert(tk.END, cmd_to_text(cmd))
+            entry.delete(0, tk.END)
+            on_change()
+
+        editrow = ttk.Frame(parent)
+        editrow.pack(fill=tk.X, pady=3)
+
+        def move(direction):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            i = sel[0]
+            j = i + direction
+            cmds = get_cmds()
+            if not (0 <= j < len(cmds)):
+                return
+            cmds[i], cmds[j] = cmds[j], cmds[i]
+            self._reload_actions(listbox, cmds)
+            listbox.selection_set(j)
+            on_change()
+
+        def delete():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            i = sel[0]
+            del get_cmds()[i]
+            self._reload_actions(listbox, get_cmds())
+            on_change()
+
+        def clear():
+            get_cmds().clear()
+            self._reload_actions(listbox, get_cmds())
+            on_change()
+
+        ttk.Button(addrow, text='＋添加', command=add).pack(side=tk.LEFT)
+        ttk.Button(editrow, text='上移', command=lambda: move(-1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(editrow, text='下移', command=lambda: move(+1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(editrow, text='删除', command=delete).pack(side=tk.LEFT, padx=2)
+        ttk.Button(editrow, text='清空', command=clear).pack(side=tk.LEFT, padx=2)
+        return {'type': cmd_type, 'entry': entry, 'hint': hint}
+
+    @staticmethod
+    def _reload_actions(listbox, cmds):
+        listbox.delete(0, tk.END)
+        for c in cmds:
+            listbox.insert(tk.END, cmd_to_text(c))
+
+    # ---------- 页签 3：九节点动作序列 ----------
+
+    def _default_nodes(self):
+        """nodes.json 不存在时，按 field.json 的 mission.route 生成默认 9 个节点。"""
+        route = list(self.cfg.get('mission', {}).get('route') or [])
+        if len(route) < 2:
+            route = ['起点', '扫码区', '原料区', '粗加工区', '暂存区',
+                     '原料区', '粗加工区', '暂存区', '起点']
+        return [{'name': f'{i + 1}. {n}', 'route': n, 'actions': []}
+                for i, n in enumerate(route)]
+
+    def _load_nodes(self):
+        try:
+            with open(NODES_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            nodes = data.get('nodes') if isinstance(data, dict) else data
+            if not isinstance(nodes, list) or not nodes:
+                raise ValueError('nodes 为空')
+            for i, n in enumerate(nodes):
+                if not isinstance(n, dict):
+                    raise ValueError('节点格式错误')
+                n.setdefault('name', f'{i + 1}. {n.get("route", "?")}')
+                n.setdefault('route', '')
+                acts = n.get('actions')
+                n['actions'] = acts if isinstance(acts, list) else []
+            return nodes
+        except FileNotFoundError:
+            return self._default_nodes()
+        except Exception as e:  # noqa: BLE001
+            if hasattr(self, 'status'):
+                self._set_status(f'nodes.json 读取失败（{e}），用默认九点')
+            return self._default_nodes()
+
+    def _save_nodes(self):
+        try:
+            with open(NODES_PATH, 'w', encoding='utf-8') as f:
+                json.dump({'nodes': self.nodes}, f, ensure_ascii=False, indent=2)
+            self._nodes_dirty = False
+        except Exception as e:  # noqa: BLE001
+            if hasattr(self, 'status'):
+                self._set_status(f'节点序列保存失败：{e}')
+
+    def _build_nodes_tab(self):
+        tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(tab, text='节点动作序列')
+
+        ttk.Label(tab, text='九节点动作序列（按 mission.route 顺序走）',
+                  font=('', 11, 'bold')).pack(anchor='w')
+        ttk.Label(tab, foreground='#666',
+                  text='选中一个节点，在下面编辑到达该点后要执行的动作。').pack(anchor='w')
+
+        self.node_list = tk.Listbox(tab, width=44, height=8, exportselection=False)
+        self.node_list.pack(fill=tk.X, pady=(4, 2))
+        self.node_list.bind('<<ListboxSelect>>', self._on_node_select)
+
+        self.node_info = tk.StringVar(value='')
+        ttk.Label(tab, textvariable=self.node_info, foreground=C_PATH,
+                  wraplength=340).pack(anchor='w')
+
+        ttk.Label(tab, text='该节点的动作（从上到下）：',
+                  font=('', 10, 'bold')).pack(anchor='w', pady=(4, 0))
+        self.node_action_list = tk.Listbox(tab, width=44, height=9)
+        self.node_action_list.pack(fill=tk.BOTH, expand=True, pady=(2, 2))
+
+        self.node_editor = self._make_action_editor(
+            tab, self.node_action_list, self._node_actions, self._node_changed, width=42)
+
+        row = ttk.Frame(tab)
+        row.pack(fill=tk.X, pady=(3, 0))
+        ttk.Button(row, text='保存', command=lambda: self._save_nodes()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text='导入', command=self._import_nodes).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text='导出', command=self._export_nodes).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text='用当前序列填充', command=self._copy_seq_to_node).pack(
+            side=tk.LEFT, padx=2)
+
+        self._reload_node_list()
+        if self.nodes:
+            self.node_list.selection_set(0)
+            self._on_node_select()
+
+    def _reload_node_list(self):
+        self.node_list.delete(0, tk.END)
+        for i, n in enumerate(self.nodes):
+            self.node_list.insert(tk.END, n.get('name') or f'{i + 1}. {n.get("route", "?")}')
+
+    def _node_actions(self):
+        if not self.nodes:
+            return []
+        self.node_sel = max(0, min(self.node_sel, len(self.nodes) - 1))
+        return self.nodes[self.node_sel]['actions']
+
+    def _node_changed(self):
+        self._nodes_dirty = True
+        self._save_nodes()
+        self._update_node_info()
+
+    def _on_node_select(self, _event=None):
+        sel = self.node_list.curselection()
+        if not sel:
+            return
+        self.node_sel = sel[0]
+        self._reload_actions(self.node_action_list, self._node_actions())
+        self._update_node_info()
+
+    def _update_node_info(self):
+        if not self.nodes:
+            self.node_info.set('还没有节点')
+            return
+        n = self.nodes[self.node_sel]
+        route = n.get('route', '')
+        pt = None
+        try:
+            pt = self.field.resolve_waypoint(route)
+        except Exception:  # noqa: BLE001
+            pt = None
+        where = f'场地 ({pt[0]:.0f}, {pt[1]:.0f})mm' if pt else '路线里解析不到坐标'
+        self.node_info.set(
+            f'第 {self.node_sel + 1}/{len(self.nodes)} 点 · 路线点「{route}」· {where} · '
+            f'{len(n.get("actions", []))} 条动作')
+
+    def _copy_seq_to_node(self):
+        if not self.nodes:
+            return
+        if not messagebox.askyesno('覆盖节点动作',
+                                   f'把【动作序列】页的 {len(self.commands)} 条复制到'
+                                   f'第 {self.node_sel + 1} 点？会覆盖该节点现有动作。'):
+            return
+        self.nodes[self.node_sel]['actions'] = [dict(c) for c in self.commands]
+        self._reload_actions(self.node_action_list, self._node_actions())
+        self._node_changed()
+
+    def _import_nodes(self):
+        path = filedialog.askopenfilename(filetypes=[('JSON 文件', '*.json')])
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            nodes = data.get('nodes') if isinstance(data, dict) else data
+            if not isinstance(nodes, list) or not nodes:
+                raise ValueError('文件里没有节点')
+            for i, n in enumerate(nodes):
+                n.setdefault('name', f'{i + 1}. {n.get("route", "?")}')
+                n.setdefault('route', '')
+                n['actions'] = n.get('actions') if isinstance(n.get('actions'), list) else []
+            self.nodes = nodes
+            self.node_sel = 0
+            self._reload_node_list()
+            self.node_list.selection_set(0)
+            self._on_node_select()
+            self._save_nodes()
+            self._set_status(f'已导入 {len(nodes)} 个节点')
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror('导入失败', str(e))
+
+    def _export_nodes(self):
+        path = filedialog.asksaveasfilename(defaultextension='.json',
+                                            filetypes=[('JSON 文件', '*.json')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'nodes': self.nodes}, f, ensure_ascii=False, indent=2)
+            messagebox.showinfo('导出成功', f'已保存到\n{path}')
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror('导出失败', str(e))
+
+    # ---------- 页签 4：PID 调参 ----------
+
+    def _build_tune_tab(self):
+        tab = self._scrollable_tab('PID 调参')
+
+        ttk.Label(tab, text='整车参数在线调整（拖动即下发，不用烧录）',
+                  font=('', 11, 'bold')).pack(anchor='w')
+        ttk.Label(tab, foreground='#666', wraplength=310,
+                  text='波形显示在右边，可切换位置环 / 转向环 / 云台环。').pack(anchor='w')
+
+        self._tune_applying = True
+        for title, keys in TUNE_GROUPS:
+            box = ttk.LabelFrame(tab, text=title, padding=3)
+            box.pack(fill=tk.X, pady=3)
+            for key in keys:
+                spec = next(s for s in TUNE_PARAMS if s[1] == key)
+                pid, _k, label, vmin, vmax, step, default, is_int = spec
+                row = ttk.Frame(box)
+                row.pack(fill=tk.X)
+                var = tk.StringVar(value=f'{default:g}')
+                scale = tk.Scale(
+                    row, from_=vmin, to=vmax, resolution=step, orient=tk.HORIZONTAL,
+                    length=240, showvalue=False, label=label, bd=0,
+                    highlightthickness=0,
+                    command=lambda v, k=key: self._on_tune_slide(k, v))
+                scale.set(default)
+                scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Label(row, textvariable=var, width=7, anchor='e').pack(
+                    side=tk.LEFT, padx=(2, 0))
+                self._tune_scales[key] = (scale, var, is_int)
+        self._tune_applying = False
+
+        row = ttk.Frame(tab)
+        row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(row, text='全部下发', command=self._send_all_tune).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text='恢复默认', command=self._restore_tune_defaults).pack(
+            side=tk.LEFT, padx=2)
+
+        ttk.Label(tab, textvariable=self.tune_status, foreground='#7a4fbf',
+                  wraplength=310).pack(anchor='w', pady=(3, 0))
+
+        # ---------- 云台零点 / 限位 / 松轴 ----------
+        cal = ttk.LabelFrame(tab, text='云台零点 / 限位 / 松轴', padding=4)
+        cal.pack(fill=tk.X, pady=(6, 3))
+        ttk.Label(cal, foreground='#666', wraplength=310,
+                  text='上电后把三个轴摆到固定位置 → 点【设为零点】；'
+                       '限位相对零点生效，树莓派状态屏示教过的限位会自动同步过来。'
+                  ).pack(anchor='w')
+
+        self.gimbal_now_var = tk.StringVar(value='当前：等待 /gimbal_state…')
+        ttk.Label(cal, textvariable=self.gimbal_now_var, font=('Consolas', 9),
+                  wraplength=310).pack(anchor='w', pady=(2, 3))
+
+        self.gimbal_limit_vars = {}
+        self._limits_user_edited = False
+        self._limits_pending = None      # 已下发、等 407 回传确认的限位
+        for axis, (name, _key) in enumerate(GIMBAL_AXES):
+            row = ttk.Frame(cal)
+            row.pack(fill=tk.X)
+            ttk.Label(row, text=name, width=7).pack(side=tk.LEFT)
+            lo_var = tk.StringVar()
+            hi_var = tk.StringVar()
+            ttk.Label(row, text='min').pack(side=tk.LEFT)
+            e_lo = ttk.Entry(row, textvariable=lo_var, width=7)
+            e_lo.pack(side=tk.LEFT, padx=(2, 6))
+            ttk.Label(row, text='max').pack(side=tk.LEFT)
+            e_hi = ttk.Entry(row, textvariable=hi_var, width=7)
+            e_hi.pack(side=tk.LEFT)
+            for e in (e_lo, e_hi):
+                e.bind('<KeyRelease>', lambda _e: self._limits_edited())
+            self.gimbal_limit_vars[axis] = (lo_var, hi_var)
+
+        row = ttk.Frame(cal)
+        row.pack(fill=tk.X, pady=(4, 2))
+        ttk.Button(row, text='设为零点', command=self._gimbal_set_zero).pack(side=tk.LEFT)
+        ttk.Button(row, text='下发限位', command=self._send_gimbal_limits).pack(
+            side=tk.LEFT, padx=4)
+        self.gimbal_release_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text='松轴（可手拨）', variable=self.gimbal_release_var,
+                        command=self._toggle_gimbal_release).pack(side=tk.LEFT, padx=(6, 0))
+        self.gimbal_cal_status = tk.StringVar(value='')
+        ttk.Label(cal, textvariable=self.gimbal_cal_status, foreground='#2e7d32',
+                  wraplength=310).pack(anchor='w')
+
+        wf = ttk.LabelFrame(tab, text='右边波形', padding=3)
+        wf.pack(fill=tk.X, pady=(4, 0))
+        for text, value in (('位置环', 'pos'), ('转向环', 'yaw'), ('云台环', 'gimbal')):
+            ttk.Radiobutton(wf, text=text, value=value, variable=self.wave_mode,
+                            command=self._redraw_wave).pack(side=tk.LEFT, padx=2)
+        self.cb_wave_axis = ttk.Combobox(wf, width=7, state='readonly',
+                                         values=['yaw', 'lift', 'extend'])
+        self.cb_wave_axis.current(0)
+        self.cb_wave_axis.pack(side=tk.LEFT, padx=(6, 0))
+        self.cb_wave_axis.bind('<<ComboboxSelected>>',
+                               lambda e: self._set_wave_axis())
+
+        self._bind_wheel(tab)
+
+    def _limits_edited(self):
+        self._limits_user_edited = True
+
+    def _sync_gimbal_limits(self):
+        """把 407 回传的限位和当前位置刷到界面上（用户正在改限位时不覆盖输入框）。"""
+        gs = self.node.gimbal_state
+        if gs is not None:
+            text = '当前：' + '  '.join(
+                f'{name} {gs[i]:+.1f}°' for i, (name, _k) in enumerate(GIMBAL_AXES))
+            if self.node.gimbal_limits and not all(self.node.gimbal_limits_valid):
+                text += '   [有些轴还没示教，限位显示固件默认]'
+            self.gimbal_now_var.set(text)
+        else:
+            self.gimbal_now_var.set('当前：等待 /gimbal_state…')
+
+        # 刚下发的限位要等 407 回传确认，期间保留输入框里的值，
+        # 否则会在"旧回传值 ← → 新输入值"之间来回跳 0.5s。
+        if self._limits_pending is not None:
+            if self._limits_confirmed():
+                self._limits_pending = None
+                self._limits_user_edited = False
+                self.gimbal_cal_status.set('407 已确认限位')
+            else:
+                return
+
+        if self._limits_user_edited:
+            return
+        for axis in range(len(GIMBAL_AXES)):
+            if axis not in self.node.gimbal_limits:
+                continue
+            lo, hi = self.node.gimbal_limits[axis]
+            lo_var, hi_var = self.gimbal_limit_vars[axis]
+            lo_var.set(f'{lo:g}')
+            hi_var.set(f'{hi:g}')
+
+    def _limits_confirmed(self):
+        """407 回传的限位是否已经等于刚下发的值（按 0.1° 网格比较）。"""
+        for axis, (lo, hi) in self._limits_pending.items():
+            got = self.node.gimbal_limits.get(axis)
+            if got is None:
+                return False
+            # F407 收到的是 int16 ×0.1°（向零截断），按同一网格比才算"确认"
+            want_lo = int(lo * 10.0) / 10.0
+            want_hi = int(hi * 10.0) / 10.0
+            if abs(got[0] - want_lo) > 0.049 or abs(got[1] - want_hi) > 0.049:
+                return False
+        return True
+
+    def _parse_gimbal_limits(self):
+        limits = {}
+        try:
+            for axis in range(len(GIMBAL_AXES)):
+                lo_var, hi_var = self.gimbal_limit_vars[axis]
+                lo = float(lo_var.get())
+                hi = float(hi_var.get())
+                if lo > hi:
+                    lo, hi = hi, lo
+                limits[axis] = (lo, hi)
+        except (TypeError, ValueError):
+            self.gimbal_cal_status.set(
+                '限位还不是数字：等 407 回传一次，或手动填 min / max')
+            return None
+        return limits
+
+    def _send_gimbal_limits(self):
+        limits = self._parse_gimbal_limits()
+        if limits is None:
+            return
+        self.node.send_gimbal_limits(limits)
+        self._limits_pending = dict(limits)
+        self._limits_user_edited = True     # 等回传确认前不要用旧值覆盖输入框
+        self.gimbal_cal_status.set('限位已下发，等 407 回传确认…')
+
+    def _gimbal_set_zero(self):
+        """把三轴此刻的位置定义成 0 点，然后把当前限位重新下发。"""
+        self.node.send_gimbal_zero(0x07)
+        self._limits_user_edited = False
+        self.gimbal_cal_status.set('已设 0 点，正在重新下发限位…')
+        self.root.after(300, self._send_gimbal_limits)
+
+    def _toggle_gimbal_release(self):
+        en = bool(self.gimbal_release_var.get())
+        if en:
+            # 松轴前先整车失能：手拨的时候底盘/其它轴不会突然动
+            self.node.send_enable(False)
+        self.node.send_gimbal_release(en)
+        self.gimbal_cal_status.set(
+            '已松轴：可以手拨电机，上面的当前角度会实时变化'
+            if en else '已锁轴')
+
+    def _set_wave_axis(self):
+        try:
+            self.wave_axis.set(max(0, self.cb_wave_axis.current()))
+        except Exception:  # noqa: BLE001
+            self.wave_axis.set(0)
+        self._redraw_wave()
+
+    def _on_tune_slide(self, key, value):
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return
+        entry = self._tune_scales.get(key)
+        if entry:
+            scale, var, is_int = entry
+            var.set(f'{fv:.0f}' if is_int else f'{fv:g}')
+        self.tune[key] = fv
+        if getattr(self, '_tune_applying', False):
+            return
+        self._tune_pending[key] = fv
+        if self._tune_after is None:
+            self._tune_after = self.root.after(60, self._flush_tune)
+
+    def _flush_tune(self):
+        self._tune_after = None
+        pending, self._tune_pending = self._tune_pending, {}
+        for key, value in pending.items():
+            self.node.send_tune(self._tune_ids[key], value)
+        if pending:
+            self.tune_status.set(f'已下发 {len(pending)} 项参数，等待 407 回显…')
+
+    def _send_all_tune(self):
+        for key, value in self.tune.items():
+            self.node.send_tune(self._tune_ids[key], value)
+        self.tune_status.set('已下发全部参数，等待 407 回显…')
+
+    def _restore_tune_defaults(self):
+        self._tune_applying = True
+        try:
+            for (pid, key, _label, _lo, _hi, _step, default, is_int) in TUNE_PARAMS:
+                self.tune[key] = float(default)
+                scale, var, _ = self._tune_scales[key]
+                scale.set(default)
+                var.set(f'{default:g}')
+        finally:
+            self._tune_applying = False
+        self._send_all_tune()
+
+    def _update_tune_ack(self):
+        acks = self.node.tune_ack
+        if not acks:
+            self.tune_status.set('调参：还没有收到 407 回显（检查串口 / f407_bridge）')
+            return
+        names = {pid: key for pid, key, *_ in TUNE_PARAMS}
+        if self.node.online:
+            self.tune_status.set('407 已确认：' + '  '.join(
+                f'{names.get(pid, hex(pid))}={val:g}' for pid, val in
+                sorted(acks.items())))
+        else:
+            self.tune_status.set('调参：407 离线（参数值保留在界面上）')
+
+    # ---------- 右侧波形面板 ----------
+
+    def _build_wave_panel(self):
+        top = ttk.Frame(self.wave_frame, padding=(8, 4))
+        top.pack(fill=tk.X)
+        ttk.Label(top, text='波形：', font=('', 10, 'bold')).pack(side=tk.LEFT)
+        ttk.Label(top, foreground='#666',
+                  text='虚线=目标值（/cmd_pose、/cmd_gimbal）  实线=实际值（/odom、/gimbal_state）'
+                  ).pack(side=tk.LEFT)
+        self.wave_info = tk.StringVar(value='等待数据…')
+        ttk.Label(self.wave_frame, textvariable=self.wave_info, anchor='w',
+                  foreground='#444').pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 4))
+        self.wave_canvas = tk.Canvas(self.wave_frame, bg=C_BG, highlightthickness=0)
+        self.wave_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 2))
+        self.wave_canvas.bind('<Configure>', lambda e: self._redraw_wave())
+
+    # ---------- 波形采样 / 绘制 ----------
+
+    def _sample_wave(self):
+        """10Hz 采样：目标来自 planner 下发的话题，实际来自 F407 回传。"""
+        o = self.node.odom
+        t = self.node.pose_target
+        if o is not None and t is not None:
+            self.wave_pos.append((t[0], t[1], o[0], o[1]))
+            # 航向角显示成度；目标/实际可能跨 ±180°，这里各自取原值，
+            # 波形上出现"跳一圈"说明确实绕过了 ±180°，不是画错。
+            self.wave_yaw.append((math.degrees(t[2]), math.degrees(o[2])))
+        gt = self.node.gimbal_target
+        gs = self.node.gimbal_state
+        if gt is not None and gs is not None:
+            self.wave_gimbal.append(tuple(gt) + tuple(gs))
+        self._update_wave_info()
+
+    def _update_wave_info(self):
+        mode = self.wave_mode.get()
+        if mode == 'pos':
+            if self.wave_pos:
+                tx, ty, ax, ay = self.wave_pos[-1]
+                self.wave_info.set(
+                    f'位置环   目标 ({tx:+.3f}, {ty:+.3f}) m   实际 ({ax:+.3f}, {ay:+.3f}) m'
+                    f'   误差 {math.hypot(tx - ax, ty - ay) * 1000:.0f} mm')
+            else:
+                self.wave_info.set('位置环：等待 /cmd_pose 与 /odom…')
+        elif mode == 'yaw':
+            if self.wave_yaw:
+                ty, ay = self.wave_yaw[-1]
+                self.wave_info.set(
+                    f'转向环   目标 {ty:+.1f}°   实际 {ay:+.1f}°   '
+                    f'误差 {wrap_deg(ty - ay):+.1f}°')
+            else:
+                self.wave_info.set('转向环：等待 /cmd_pose 与 /odom…')
+        else:
+            axis = self.wave_axis.get()
+            names = ('yaw', 'lift', 'extend')
+            if self.wave_gimbal:
+                s = self.wave_gimbal[-1]
+                self.wave_info.set(
+                    f'云台环 {names[axis]}   目标 {s[axis]:+.1f}°   '
+                    f'实际 {s[3 + axis]:+.1f}°   误差 {s[axis] - s[3 + axis]:+.1f}°')
+            else:
+                self.wave_info.set('云台环：等待 /cmd_gimbal 与 /gimbal_state…')
+
+    def _redraw_wave(self):
+        c = getattr(self, 'wave_canvas', None)
+        if c is None or not c.winfo_ismapped():
+            return
+        c.delete('all')
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 40 or h < 40:
+            return
+        mode = self.wave_mode.get()
+        if mode == 'pos':
+            panels = [
+                ('X 位置 (m)', self.wave_pos, 0, 2, '#1f6fd6'),
+                ('Y 位置 (m)', self.wave_pos, 1, 3, '#d62728'),
+            ]
+        elif mode == 'yaw':
+            panels = [('航向 (deg)', self.wave_yaw, 0, 1, '#8e24aa')]
+        else:
+            axis = self.wave_axis.get()
+            names = ('yaw', 'lift', 'extend')
+            panels = [(f'云台 {names[axis]} (deg)', self.wave_gimbal,
+                       axis, 3 + axis, '#008c50')]
+        self._draw_wave_panels(c, w, h, panels)
+        self._update_wave_info()
+
+    def _draw_wave_panels(self, c, w, h, panels):
+        """每个 panel = (标题, 序列, 目标下标, 实际下标, 实际颜色)。"""
+        left, right, top, bottom = 54, 10, 10, 8
+        gap = 14
+        n = len(panels)
+        ph = (h - top - bottom - gap * (n - 1)) / n
+        for pi, (title, series, ti, ai, color) in enumerate(panels):
+            y0 = top + pi * (ph + gap)
+            y1 = y0 + ph
+            c.create_rectangle(left, y0, w - right, y1, outline='#dcdcdc')
+            c.create_text(left + 6, y0 + 10, anchor='w', fill='#444',
+                          font=('', 9, 'bold'), text=title)
+            c.create_line(w - right - 96, y0 + 10, w - right - 74, y0 + 10,
+                          fill='#999', width=2, dash=(4, 3))
+            c.create_text(w - right - 70, y0 + 10, anchor='w', fill='#888',
+                          font=('', 8), text='目标')
+            c.create_line(w - right - 40, y0 + 10, w - right - 18, y0 + 10,
+                          fill=color, width=2)
+            c.create_text(w - right - 14, y0 + 10, anchor='w', fill='#888',
+                          font=('', 8), text='实际')
+            if not series:
+                c.create_text((left + w - right) / 2, (y0 + y1) / 2,
+                              text='等待数据…', fill='#aaa')
+                continue
+            vals = []
+            for s in series:
+                vals.extend((s[ti], s[ai]))
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-6:
+                pad = max(abs(hi) * 0.1, 1.0)
+            else:
+                pad = (hi - lo) * 0.15
+            lo -= pad
+            hi += pad
+            span = max(hi - lo, 1e-9)
+            npts = len(series)
+            xspan = max(npts - 1, 1)
+
+            def px(i):
+                return left + (i / xspan) * (w - left - right)
+
+            def py(v):
+                return y1 - (v - lo) / span * (y1 - y0)
+
+            for k in range(5):
+                v = lo + (hi - lo) * k / 4.0
+                y = py(v)
+                if y0 + 1 < y < y1 - 1:
+                    c.create_line(left, y, w - right, y, fill='#f0f0f0')
+                c.create_text(left - 5, y, anchor='e', fill='#999',
+                              font=('Consolas', 8), text=f'{v:.2f}')
+            for sel, col, dash in ((ti, '#999', (4, 3)), (ai, color, None)):
+                pts = []
+                for i, s in enumerate(series):
+                    pts.extend((px(i), py(s[sel])))
+                if len(pts) >= 4:
+                    c.create_line(*pts, fill=col, width=2, dash=dash)
+                elif len(pts) == 2:
+                    c.create_oval(pts[0] - 3, pts[1] - 3, pts[0] + 3, pts[1] + 3,
+                                  fill=col, outline='')
+
+    # ---------- 页签切换 / 底部执行 ----------
+
+    def _current_tab_title(self):
+        try:
+            return self.nb.tab(self.nb.select(), 'text')
+        except Exception:  # noqa: BLE001
+            return ''
+
+    def _on_tab_changed(self):
+        title = self._current_tab_title()
+        if title == 'PID 调参':
+            self.map_frame.pack_forget()
+            if not self.wave_frame.winfo_ismapped():
+                self.wave_frame.pack(fill=tk.BOTH, expand=True)
+            self._redraw_wave()
+            self.exec_hint.set('执行：把当前全部调参值重新下发到 407')
+        else:
+            self.wave_frame.pack_forget()
+            if not self.map_frame.winfo_ismapped():
+                self.map_frame.pack(fill=tk.BOTH, expand=True)
+            if title == '节点动作序列':
+                self.exec_hint.set('执行：九点任务（依次经过 9 个点，每点跑自己的动作）')
+            elif title == '雷达 / 地图':
+                self.exec_hint.set('执行：刚规划的单点路径，或规划好的九点全程')
+            else:
+                self.exec_hint.set('执行：动作序列（当前页签整段）')
+        self._redraw()
+
+    def execute_current(self):
+        title = self._current_tab_title()
+        if title == '节点动作序列':
+            self.execute_mission()
+        elif title == '雷达 / 地图':
+            if (self._last_plan_kind == 'single' and self.plan
+                    and self.plan.get('path_world')):
+                self.navigate_plan()
+            elif self.mission_legs:
+                self.execute_mission()      # 依次走九个节点，并执行节点动作
+            elif self.plan and self.plan.get('path_world'):
+                self.navigate_plan()
+            else:
+                self._set_status('还没有规划路径：点地图或【③ 规划到目标】，'
+                                 '或点【规划全程】走九点路线')
+        elif title == 'PID 调参':
+            self._send_all_tune()
+        else:
+            self.run_all()
 
     # ---------- 页签 2：雷达 / 地图 ----------
 
@@ -383,6 +1306,7 @@ class App:
         cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         inner = ttk.Frame(cv, padding=6)
         win = cv.create_window((0, 0), window=inner, anchor='nw')
+        inner._scroll_canvas = cv          # 滚轮绑定按页签各用各的 canvas
         self._map_scroll = cv
 
         def _resize(_=None):
@@ -393,17 +1317,22 @@ class App:
         cv.bind('<Configure>', _resize)
         return inner
 
-    def _bind_wheel(self, widget):
-        """Linux 下滚轮是 Button-4/5（不是 MouseWheel），递归绑到页签里所有控件。"""
+    def _bind_wheel(self, widget, cv=None):
+        """Linux 下滚轮是 Button-4/5（不是 MouseWheel），递归绑到页签里所有控件。
+
+        cv 必须是本页签自己的滚动 canvas：两个页签都用滚动容器时，不能共用
+        self._map_scroll，否则在一个页签上滚滚轮会去滚另一个页签。
+        """
+        if cv is None:
+            cv = getattr(widget, '_scroll_canvas', self._map_scroll)
+
         def _wheel(ev):
-            if ev.num == 4:
-                self._map_scroll.yview_scroll(-3, 'units')
-            else:
-                self._map_scroll.yview_scroll(3, 'units')
+            cv.yview_scroll(-3 if ev.num == 4 else 3, 'units')
+
         widget.bind('<Button-4>', _wheel)
         widget.bind('<Button-5>', _wheel)
         for ch in widget.winfo_children():
-            self._bind_wheel(ch)
+            self._bind_wheel(ch, cv)
 
     def _build_map_tab_controls(self):
         tab = self._scrollable_tab('雷达 / 地图')
@@ -527,7 +1456,7 @@ class App:
         self.ent_cell.insert(0, 'C3')
         self.ent_cell.pack(side=tk.LEFT, padx=2)
         self.ent_cell.bind('<Return>', lambda e: self.goto_cell())
-        ttk.Button(row, text='去', width=4, command=self.goto_cell).pack(side=tk.LEFT)
+        ttk.Button(row, text='规划', width=4, command=self.goto_cell).pack(side=tk.LEFT)
 
         row2 = ttk.Frame(box); row2.pack(fill=tk.X, pady=(2, 0))
         ttk.Label(row2, text='目标 odom').pack(side=tk.LEFT)
@@ -539,7 +1468,7 @@ class App:
         ttk.Label(row2, text='m').pack(side=tk.LEFT)
         for e in (self.ent_gx, self.ent_gy):
             e.bind('<Return>', lambda ev: self.goto_odom())
-        ttk.Button(row2, text='去', width=4, command=self.goto_odom).pack(side=tk.LEFT)
+        ttk.Button(row2, text='规划', width=4, command=self.goto_odom).pack(side=tk.LEFT)
 
         # ---- 选项 ----
         box = ttk.LabelFrame(tab, text='选项', padding=4)
@@ -558,9 +1487,6 @@ class App:
                         command=self._redraw).grid(row=0, column=0, sticky='w')
         ttk.Checkbutton(cf1, text='吸附格心', variable=self.var_snap,
                         command=self._redraw).grid(row=0, column=1, sticky='w', padx=(8, 0))
-        self.var_auto = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text='点击即导航（取消则只规划、不下发）',
-                        variable=self.var_auto).pack(anchor='w')
         # field.json 里 drivable.white=false 是"只走灰色田字形车道"。
         # 注意：ring_mm=550 时外圈+十字已经把全场铺满，这个开关没有区别；
         # 只有 ring_mm 调小、黄块和墙之间留出白区时，打开它才能压白区绕障。
@@ -569,23 +1495,12 @@ class App:
                         variable=self.var_white,
                         command=self._apply_white).pack(anchor='w')
 
-        # ---- 导航 ----
-        box = ttk.LabelFrame(tab, text='导航', padding=4)
-        box.pack(fill=tk.X, pady=3)
-        row = ttk.Frame(box); row.pack(fill=tk.X)
-        ttk.Button(row, text='▶ 导航到目标', command=self.navigate_plan).pack(
-            side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(row, text='■', width=3, command=self.node.send_stop).pack(
-            side=tk.LEFT, padx=(4, 0))
-
         # ---- 任务路线 ----
-        box = ttk.LabelFrame(tab, text='任务路线（field.json 的 mission.route）', padding=4)
+        box = ttk.LabelFrame(tab, text='九点任务路线（节点页的路线名）', padding=4)
         box.pack(fill=tk.X, pady=3)
         row = ttk.Frame(box); row.pack(fill=tk.X)
-        ttk.Button(row, text='规划全程', command=self.plan_mission).pack(
+        ttk.Button(row, text='规划全程（只算路，不动车）', command=self.plan_mission).pack(
             side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(row, text='执行全程', command=self.execute_mission).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         ttk.Button(row, text='清空', width=5, command=self.clear_route).pack(side=tk.LEFT)
         self.mission_info = tk.StringVar(value='还没规划')
         ttk.Label(box, textvariable=self.mission_info, foreground=C_PATH,
@@ -599,9 +1514,10 @@ class App:
 
         self._fill_mission_list()
         self._bind_wheel(tab)
-        wrap = lambda ev: self._map_scroll.yview_scroll(-3 if ev.num == 4 else 3, 'units')
-        self._map_scroll.bind('<Button-4>', wrap)
-        self._map_scroll.bind('<Button-5>', wrap)
+        map_cv = self._map_scroll
+        wrap = lambda ev: map_cv.yview_scroll(-3 if ev.num == 4 else 3, 'units')
+        map_cv.bind('<Button-4>', wrap)
+        map_cv.bind('<Button-5>', wrap)
 
     # ---------- 小工具（布局） ----------
 
@@ -1013,6 +1929,7 @@ class App:
             self.grid, self.mask, self.obstacles, start, goal,
             self.field.robot_radius, cell_block=self._cell_block(),
             cost_fn=self._cost_fn())
+        self._last_plan_kind = 'single'
         self._report_plan(self.plan)
         self._redraw()
 
@@ -1106,37 +2023,35 @@ class App:
         out.append(ded[-1])
         return out
 
-    def _path_commands(self, path_mm, title=None, final_yaw_deg=None,
-                       fixed_yaw_deg=None):
+    def _path_commands(self, path_mm, title=None, fixed_yaw_deg=None):
         """世界系折线 → motion_planner 的 goto 指令（里程计系，米/度）。
 
-        final_yaw_deg: 到了最后一个航点要摆到的场地朝向（度）。
-                       作业点用"机械臂朝场外"的朝向；None = 沿路径方向。
+        fixed_yaw_deg: 整段路保持的场地朝向（度）。None = 保持车当前朝向。
+
+        全向底盘不需要"车头对着行驶方向"：整段锁定同一个朝向靠平移走，
+        朝向只在**去下一个节点的路上**顺便转过去，避免每个航点都甩一次车头。
+
+        中间航点带 arrive_yaw=False：只要求位置到点，不要求朝向先转到位；
+        最后一个航点才等"位置 + 朝向"都OK。这样出发时不会先原地转一圈。
         """
         wps = self._waypoints(path_mm)
         cmds = []
         if title:
             cmds.append({'cmd': 'comment', 'text': title})
+        if not wps:
+            return cmds
+        if fixed_yaw_deg is None:
+            fixed_yaw_deg = self._robot_field()[2]
         n = len(wps)
-        cur_deg = self._robot_field()[2]
         for i, (x, y) in enumerate(wps):
+            ox, oy, oth = self._field_to_odom(x, y, fixed_yaw_deg)
+            cmd = {'cmd': 'goto',
+                   'x_m': round(ox, 3),
+                   'y_m': round(oy, 3),
+                   'yaw_deg': round(math.degrees(oth), 1)}
             if i < n - 1:
-                hd = math.degrees(math.atan2(wps[i + 1][1] - y, wps[i + 1][0] - x))
-            elif n >= 2:
-                hd = math.degrees(math.atan2(y - wps[-2][1], x - wps[-2][0]))
-            else:
-                hd = cur_deg
-            if fixed_yaw_deg is not None:
-                # 全向底盘：整段保持同一朝向，靠平移走过去。
-                # 这样到作业点不用再原地转，转角也从"每段都转"降到"只在换朝向时转"。
-                hd = float(fixed_yaw_deg)
-            elif final_yaw_deg is not None and i == n - 1:
-                hd = float(final_yaw_deg)      # 到位后摆成作业要求的朝向
-            ox, oy, oth = self._field_to_odom(x, y, hd)
-            cmds.append({'cmd': 'goto',
-                         'x_m': round(ox, 3),
-                         'y_m': round(oy, 3),
-                         'yaw_deg': round(math.degrees(oth), 1)})
+                cmd['arrive_yaw'] = False
+            cmds.append(cmd)
         return cmds
 
     def _planner_missing(self):
@@ -1169,10 +2084,16 @@ class App:
                     f'整车状态是"{self.node.robot_status[0]}"（不是就绪/使能），'
                     f'现在下发导航车也不会动。仍要下发吗？'):
                 return
+        # 单点导航也整段保持一个朝向：是作业点就转成作业要求的朝向，
+        # 否则保持当前朝向平移过去，别跟着每个拐点甩车头。
+        yaw = self._outward_yaw(self.goal_world)
+        if yaw is None:
+            yaw = self._robot_field()[2]
         cmds = self._path_commands(
             self.plan['path_world'],
             f'导航 → {self.field.cell_name(*self.goal_world)} '
-            f'{self._odom_str(*self.goal_world)}')
+            f'{self._odom_str(*self.goal_world)}',
+            fixed_yaw_deg=yaw)
         if not self.node.send_sequence(cmds):
             self._planner_missing()
             return
@@ -1184,17 +2105,28 @@ class App:
         if not self.field.mission_route:
             self.mission_info.set('field.json 里没有 mission.route')
 
+    def _node_routes(self):
+        """九节点页里每点填的路线名；节点页才是任务的唯一来源。
+
+        必须保留空名字：节点和路线段是 1:1 的，过滤掉空节点会让后面的
+        节点动作错位到别的点上。
+        """
+        return [str(n.get('route', '')).strip() for n in self.nodes]
+
     def plan_mission(self):
-        if not self.field.mission_route:
-            self._set_status('field.json 里没有 mission.route')
+        routes = self._node_routes()
+        if not routes and not self.field.mission_route:
+            self._set_status('没有任务路线：在【节点动作序列】页填每点对应的路线名')
             return
         legs, total = mapping.plan_mission(
-            self.field, self.grid, self.mask, self.obstacles, None,
+            self.field, self.grid, self.mask, self.obstacles,
+            routes or self.field.mission_route,
             self.field.robot_radius, cell_block=self._cell_block(),
             cost_fn=self._cost_fn())
         self.mission_legs = legs
         self.mission_total = total
         self.plan = None
+        self._last_plan_kind = 'mission'
         # 作业点要求"机械臂侧朝场地外侧"，把该朝向挂到每段的终点上
         for leg in legs:
             leg["final_yaw"] = self._outward_yaw(leg.get("to_xy"))
@@ -1207,19 +2139,53 @@ class App:
                          + (f'；不通：{"；".join(bad)}' if bad else ''))
         self._redraw()
 
-    def execute_mission(self):
-        if not self.mission_legs:
-            self._set_status('先点【规划全程】')
+    def _append_node_actions(self, cmds, index):
+        """把第 index 个节点（0 起）到点后要执行的动作整段拼进指令列表。"""
+        if not (0 <= index < len(self.nodes)):
             return
-        # 注意：这里**不再**"一没里程计就弹窗退回"。
-        # 没里程计时走离线演练（把指令填进左侧列表，不下发），见本函数末尾。
+        node = self.nodes[index]
+        acts = node.get('actions') or []
+        if not acts:
+            cmds.append({'cmd': 'comment',
+                         'text': f'节点 {index + 1}：{node.get("route", "")}（无动作）'})
+            return
+        cmds.append({'cmd': 'comment',
+                     'text': f'节点 {index + 1}：{node.get("route", "")} 动作 {len(acts)} 条'})
+        for act in acts:
+            if isinstance(act, dict):
+                cmds.append(dict(act))
+
+    def execute_mission(self):
+        """底部【执行】在节点页：九点任务 = 走路径 + 每点自己的动作序列。
+
+        指令顺序：
+          先去第 1 点 → 第 1 点动作 → 第 1→2 段路径 → 第 2 点动作 → … → 第 9 点动作
+        pick/place 的宏展开在 motion_planner 载入时做；vision_pick/align 在
+        执行到那一条时启动视觉程序，并用程序输出的 JSON 改目标/插动作。
+        """
+        if not self.nodes:
+            messagebox.showwarning('没有节点', '【节点动作序列】页还没有任何节点')
+            return
+        routes = self._node_routes()
+        if len(routes) < 2:
+            messagebox.showwarning('节点太少', '至少需要 2 个节点才能组成路线')
+            return
+
+        self.plan_mission()
+        if not self.mission_legs:
+            return
         bad = [i for i, leg in enumerate(self.mission_legs) if not leg['ok']]
         if bad:
-            messagebox.showerror('有段不通', f'第 {",".join(str(i + 1) for i in bad)} 段规划失败，'
-                                             f'请先处理障碍或改路线。')
+            messagebox.showerror(
+                '有段不通',
+                f'第 {",".join(str(i + 1) for i in bad)} 段规划失败（共 '
+                f'{len(self.mission_legs)} 段）。\n先处理障碍，或在节点页改路线点。')
             return
-        cmds = [{'cmd': 'comment', 'text': '任务路线（雷达地图规划）'}]
-        # 车不在任务起点时，先规划一段过去
+
+        headings = self._mission_headings()
+        cmds = [{'cmd': 'comment',
+                 'text': f'九点任务：{len(self.nodes)} 个节点 / {len(self.mission_legs)} 段'}]
+        # 车不在第 1 点时，先规划一段过去，避免第一段从远处斜穿场地
         first = self.mission_legs[0]['from_xy']
         cur = self._robot_field()[:2]
         if math.hypot(cur[0] - first[0], cur[1] - first[1]) > 150.0:
@@ -1229,36 +2195,42 @@ class App:
                 self.field.robot_radius, cell_block=self._cell_block(),
                 cost_fn=self._cost_fn())
             if not res['path']:
-                messagebox.showerror('到不了起点', f'从当前位置到任务起点不通：{res["note"]}')
+                messagebox.showerror('到不了起点',
+                                     f'从当前位置到第 1 个节点不通：{res["note"]}')
                 return
-            cmds += self._path_commands(res['path_world'], '先去任务起点')
+            # 去起点的路上就提前转成第一段要求的朝向
+            cmds += self._path_commands(res['path_world'], '先去第 1 个节点',
+                                        fixed_yaw_deg=headings[0])
+        self._append_node_actions(cmds, 0)
         for i, leg in enumerate(self.mission_legs):
             cmds += self._path_commands(
                 leg['path'], f'{i + 1}. {leg["from_name"]} → {leg["to_name"]}',
-                final_yaw_deg=leg.get('final_yaw'))
-        # ---- 没有里程计 / 起点没标定：离线演练，不下发 ----
+                fixed_yaw_deg=headings[i])
+            self._append_node_actions(cmds, i + 1)
+
+        # ---- 没有里程计 / 起点没标定：只填序列，不下发 ----
         if self.node.odom is None or self.odom_start[2] is None:
-            self.commands = list(cmds)
-            self._reload_listbox()
             why = '还没收到 /odom' if self.node.odom is None else '车起点还没标定'
-            n_goto = sum(1 for c in cmds if c['cmd'] == 'goto')
+            self.commands = [dict(c) for c in cmds]
+            self._reload_listbox()
             self._set_status(
-                f'{why}：已把 {len(cmds)} 条指令（goto {n_goto} 个）填进左侧列表，'
-                f'未下发，改为**模拟执行**——车会在图上按路线一步步走。'
-                f'接上真车并标定起点后再点【执行全程】就会真正下发。')
-            self._play_mission()
+                f'{why}：九点任务共 {len(cmds)} 条指令，已填进【动作序列】页查看，'
+                f'未下发。接上真车并标定起点后再点【▶ 执行】。')
             return
-        # ---- 真车下发前，再确认整车就绪 ----
+
         if self.node.robot_status and self.node.robot_status[0] != 1:
             if not messagebox.askyesno(
                     '车还没就绪',
-                    '整车状态不是就绪/使能，现在下发车不会动。仍要下发吗？'):
+                    '整车当前不是就绪/使能状态。点【执行】会先重新使能再下发，'
+                    '确认周围安全后继续？'):
                 return
         if not self.node.send_sequence(cmds):
             self._planner_missing()
             return
-        self._set_status(f'已下发全程路线：{len(cmds)} 条指令（其中 goto '
-                         f'{sum(1 for c in cmds if c["cmd"] == "goto")} 个）')
+        n_goto = sum(1 for c in cmds if c['cmd'] == 'goto')
+        n_act = sum(1 for c in cmds if c['cmd'] not in ('goto', 'comment'))
+        self._set_status(
+            f'已下发九点任务：{n_goto} 个路点 + {n_act} 个节点动作，motion_planner 接管…')
 
     # ==================== 模拟执行（没有真车也能看车跑） ====================
 
@@ -1374,23 +2346,29 @@ class App:
         self.sim_pose = None
         self._redraw()
 
-    def _leg_yaw(self, index):
-        """第 index 段要保持的场地朝向。
+    def _mission_headings(self):
+        """每一段路径要用的固定车头朝向（场地系，度）。
 
-        规则：作业点用 leg["final_yaw"]（机械臂朝作业区）；
-        其余段沿用上一段的朝向。返回 None 表示不约束。
+        只看**目的地节点**要求什么朝向（leg["final_yaw"]，机械臂朝作业区）：
+          · 有要求 → 整段从出发就朝这个方向，车边走边转，到点正好摆好；
+          · 没要求 → 沿用上一段的朝向，完全不转；
+          · 第一段也没要求 → 保持发车时车头朝向。
+        全向底盘不需要车头对着路径方向，这样一路上不会跟着拐点来回甩。
         """
-        yaw = None
-        for leg in self.mission_legs[:index + 1]:
+        yaw = self._robot_field()[2]
+        out = []
+        for leg in self.mission_legs:
             fy = leg.get('final_yaw')
             if fy is not None:
                 yaw = float(fy)
-        return yaw
+            out.append(yaw)
+        return out
 
     def clear_route(self):
         self.mission_legs = []
         self.mission_total = 0.0
         self.plan = None
+        self._last_plan_kind = None
         self.mission_info.set('还没规划')
         self._redraw()
 
@@ -1599,10 +2577,9 @@ class App:
                 w = self.field.cell_center(*cr)
         self.goal_world = w
         self._set_status(f'目标 {self._odom_str(*w)}  '
-                         f'[场地格 {self.field.cell_name(*w)}]')
+                         f'[场地格 {self.field.cell_name(*w)}]（只规划，'
+                         f'点底部【▶ 执行】才动车）')
         self.plan_to_goal()
-        if self.var_auto.get() and self.plan and self.plan.get('path'):
-            self.navigate_plan()
 
     # ==================== 绘图 ====================
 
@@ -1879,9 +2856,20 @@ class App:
                 self._need_redraw = True
         self._last_odom = o
         self._update_labels()
+        self._sample_wave()
+        self._update_tune_ack()
+        if hasattr(self, 'gimbal_limit_vars'):
+            self._sync_gimbal_limits()
+        # 407 刚上电 / 刚重连：把界面上的参数整套重发，避免 407 静默回默认值
+        online = bool(self.node.online)
+        if online and not self._tune_was_online:
+            self._send_all_tune()
+        self._tune_was_online = online
         if got or self._need_redraw:
             self._redraw()
             self._need_redraw = False
+        if self._current_tab_title() == 'PID 调参':
+            self._redraw_wave()
         self.root.after(100, self._refresh)
 
     def close(self):
@@ -1891,43 +2879,14 @@ class App:
             self.stop_lidar()
         except Exception:
             pass
+        if self._tune_after is not None:
+            try:
+                self.root.after_cancel(self._tune_after)
+            except Exception:
+                pass
+            self._tune_after = None
 
-    # ==================== 动作序列编辑（和原来一样） ====================
-
-    def _on_type_change(self, name):
-        self.hint_label.config(text=f"参数：{COMMAND_TYPES[name]['hint']}")
-
-    def add_cmd(self):
-        try:
-            cmd = build_cmd(self.cmd_type.get(), self.param_entry.get())
-        except Exception as e:
-            messagebox.showerror('参数错误', f'参数解析失败：{e}')
-            return
-        self.listbox.insert(tk.END, cmd_to_text(cmd))
-        self.commands.append(cmd)
-
-    def move_cmd(self, direction):
-        sel = self.listbox.curselection()
-        if not sel:
-            return
-        i = sel[0]
-        j = i + direction
-        if not (0 <= j < len(self.commands)):
-            return
-        self.commands[i], self.commands[j] = self.commands[j], self.commands[i]
-        self._reload_listbox()
-
-    def del_cmd(self):
-        sel = self.listbox.curselection()
-        if not sel:
-            return
-        i = sel[0]
-        del self.commands[i]
-        self._reload_listbox()
-
-    def clear_cmds(self):
-        self.commands.clear()
-        self._reload_listbox()
+    # ==================== 动作序列编辑 ====================
 
     def _reload_listbox(self):
         self.listbox.delete(0, tk.END)
@@ -1964,14 +2923,6 @@ class App:
             messagebox.showwarning('空序列', '先添加几条指令')
             return
         if not self.node.send_sequence(self.commands):
-            self._planner_missing()
-
-    def run_selected(self):
-        sel = self.listbox.curselection()
-        if not sel:
-            messagebox.showwarning('未选择', '先在列表里选中一条指令')
-            return
-        if not self.node.send_sequence([self.commands[sel[0]]]):
             self._planner_missing()
 
 

@@ -16,6 +16,90 @@
 static ZdtMulti_t s_MultiCtx;
 Chassis_t Chassis;
 
+/* 已装进 PID 的调参版本号。PiTune.Version 变了才重装增益。 */
+static uint32_t s_TuneVersion = 0;
+
+/* 参数回显节奏：0=空闲，1..13=下一拍要回显的参数。
+   调参帧在串口中断里解析，只把 Version+1；回显放到这里逐拍发一条，
+   既避开了中断里阻塞发送，也不会在 5ms 控制周期里连发 13 帧把底盘卡住。*/
+static uint8_t s_TuneEchoStep = 0;
+
+/* 已装进底盘 PID 的增益。Version 只要变（哪怕是调云台 PID）都会进来，
+   所以底盘这里再比一次具体数值，避免白清积分。 */
+static float s_LastPosKp = -1.0f, s_LastPosKi = -1.0f, s_LastPosKd = -1.0f;
+static float s_LastHeadKp = -1.0f, s_LastHeadKi = -1.0f, s_LastHeadKd = -1.0f;
+
+/* 把上位机下发的增益装进两个环。只在参数真的变化时调用（PID_SetGains 会清积分）。 */
+static void Chassis_ApplyTune(void)
+{
+    if (PiTune.Version == s_TuneVersion)
+        return;
+    s_TuneVersion = PiTune.Version;
+
+    if (PiTune.PosKp != s_LastPosKp || PiTune.PosKi != s_LastPosKi ||
+        PiTune.PosKd != s_LastPosKd) {
+        s_LastPosKp = PiTune.PosKp;
+        s_LastPosKi = PiTune.PosKi;
+        s_LastPosKd = PiTune.PosKd;
+        PID_SetGains(&Chassis.PosPidX, PiTune.PosKp, PiTune.PosKi, PiTune.PosKd);
+        PID_SetGains(&Chassis.PosPidY, PiTune.PosKp, PiTune.PosKi, PiTune.PosKd);
+    }
+
+    if (PiTune.HeadingKp != s_LastHeadKp || PiTune.HeadingKi != s_LastHeadKi ||
+        PiTune.HeadingKd != s_LastHeadKd) {
+        s_LastHeadKp = PiTune.HeadingKp;
+        s_LastHeadKi = PiTune.HeadingKi;
+        s_LastHeadKd = PiTune.HeadingKd;
+        PID_SetGains(&Chassis.HeadingPid,
+                     PiTune.HeadingKp, PiTune.HeadingKi, PiTune.HeadingKd);
+    }
+
+    if (s_TuneEchoStep == 0)
+        s_TuneEchoStep = 1;             /* 开始把当前整套参数回报给上位机 */
+}
+
+/* 每拍最多回显一条参数，13 拍（65ms）走完一轮。连续拖动滑杆时循环滚动，
+   上位机最终能看到全部最新值。 */
+static void Chassis_TuneEchoTick(void)
+{
+    uint8_t id;
+    float v;
+
+    if (s_TuneEchoStep == 0)
+        return;
+
+    id = (uint8_t)(PI_TUNE_MAX_VX + (s_TuneEchoStep - 1));   /* id 连续 0x01..0x0D */
+    switch (id) {
+    case PI_TUNE_MAX_VX:    v = PiTune.MaxSpeedX;    break;
+    case PI_TUNE_MAX_VY:    v = PiTune.MaxSpeedY;    break;
+    case PI_TUNE_MAX_WZ:    v = PiTune.MaxSpeedW;    break;
+    case PI_TUNE_MAX_RPM:   v = PiTune.MaxWheelRpm;  break;
+    case PI_TUNE_POS_KP:    v = PiTune.PosKp;        break;
+    case PI_TUNE_POS_KI:    v = PiTune.PosKi;        break;
+    case PI_TUNE_POS_KD:    v = PiTune.PosKd;        break;
+    case PI_TUNE_HEAD_KP:   v = PiTune.HeadingKp;    break;
+    case PI_TUNE_HEAD_KI:   v = PiTune.HeadingKi;    break;
+    case PI_TUNE_HEAD_KD:   v = PiTune.HeadingKd;    break;
+    case PI_TUNE_GIMBAL_KP: v = PiTune.GimbalKp;     break;
+    case PI_TUNE_GIMBAL_KI: v = PiTune.GimbalKi;     break;
+    case PI_TUNE_GIMBAL_KD: v = PiTune.GimbalKd;     break;
+    default:
+        s_TuneEchoStep = 0;
+        return;
+    }
+
+    PiComm_SendTune(id, v);
+    s_TuneEchoStep = (s_TuneEchoStep >= 13) ? 0 : (uint8_t)(s_TuneEchoStep + 1);
+}
+
+/* 限幅工具：上限 <= 0 说明 PiTune 还没初始化，回退到宏，避免把车锁死。 */
+static float Chassis_Limit(float value, float limit, float fallback)
+{
+    if (limit <= 0.0f)
+        limit = fallback;
+    return ConstrainF(value, limit, -limit);
+}
+
 /* 每轮方向系数（按实际安装方向标定 ±1，见 RobotConfig.h） */
 static const int s_WheelDir[4] = { WHEEL_FL_DIR, WHEEL_FR_DIR, WHEEL_RL_DIR, WHEEL_RR_DIR };
 
@@ -35,16 +119,20 @@ static void Chassis_MecanumCalc(float* rpm)
         rpm[i] = v[i] / (2 * PI * WHEEL_RADIUS_M) * 60.f * s_WheelDir[i]; //换算成rpm
 }
 
-/* 等比例限幅（保证方向不失真） */
+/* 等比例限幅（保证方向不失真）。上限来自在线可调的 PiTune.MaxWheelRpm。 */
 static void Chassis_WheelRpmLimit(float* rpm)
 {
     float maxAbs = 0;
+    float limit = PiTune.MaxWheelRpm;
     for (int i = 0; i < 4; i++)
         if (fabsf(rpm[i]) > maxAbs)
             maxAbs = fabsf(rpm[i]);
 
-    if (maxAbs > CHASSIS_MAX_WHEEL_RPM) {
-        float scale = CHASSIS_MAX_WHEEL_RPM / maxAbs;
+    if (limit <= 0.0f)
+        limit = CHASSIS_MAX_WHEEL_RPM;   /* 调参还没下发时兜底，别把车锁死 */
+
+    if (maxAbs > limit) {
+        float scale = limit / maxAbs;
         for (int i = 0; i < 4; i++)
             rpm[i] *= scale;
     }
@@ -205,6 +293,11 @@ static void Chassis_PoseControl(float targetX, float targetY)
     Chassis.Move.Vx =  vxWorld * cosY + vyWorld * sinY;
     Chassis.Move.Vy = -vxWorld * sinY + vyWorld * cosY;
 
+    /* 位置环输出同样受"运动最大速度"限制：上位机把限幅调小后，
+       不管是摇杆速度模式还是自动导航的位置模式，都超不过去。 */
+    Chassis.Move.Vx = Chassis_Limit(Chassis.Move.Vx, PiTune.MaxSpeedX, CHASSIS_MAX_SPEED_X);
+    Chassis.Move.Vy = Chassis_Limit(Chassis.Move.Vy, PiTune.MaxSpeedY, CHASSIS_MAX_SPEED_Y);
+
     /* 蓝牙回零到位判定：距离零点足够近则停车、清请求、清积分 */
     if (PiCommand.ReturnHome &&
         sqrtf(Chassis.Pos.X * Chassis.Pos.X + Chassis.Pos.Y * Chassis.Pos.Y) < 0.0f)
@@ -256,6 +349,10 @@ void ChassisTask(void const* argument)
     {
         osDelayUntil(&PreviousWakeTime, CHASSIS_TASK_UPDATE_TICK);
 
+        /* ---- 在线调参：版本变了才重装 PID，平时只有一次比较 ---- */
+        Chassis_ApplyTune();
+        Chassis_TuneEchoTick();
+
         /* ---- 云台的一次性单机帧（使能 / 解除堵转 / 位置回传配置）----
                云台任务只置请求，这里由全总线唯一的发送者发出去：如果云台任务自己
                发，会和本任务连发的广播抢 CAN1 的 3 个发送邮箱，广播丢一包整帧作废
@@ -302,9 +399,11 @@ void ChassisTask(void const* argument)
             continue;
         }
 
-        /* ---- 车体速度：树莓派(PI_CMD_VEL) 或 蓝牙摇杆(BLE_ApplyToCommand) → PiCommand.Vel ---- */
-        Chassis.Move.Vx = PiCommand.Vel.Vx;
-        Chassis.Move.Vy = PiCommand.Vel.Vy;
+        /* ---- 车体速度：树莓派(PI_CMD_VEL) 或 蓝牙摇杆(BLE_ApplyToCommand) → PiCommand.Vel ----
+           上位机调参页的"运动最大速度 / 平移最大速度"在这里统一限幅，
+           不管指令来自手柄、树莓派还是动作序列，都绕不过去。 */
+        Chassis.Move.Vx = Chassis_Limit(PiCommand.Vel.Vx, PiTune.MaxSpeedX, CHASSIS_MAX_SPEED_X);
+        Chassis.Move.Vy = Chassis_Limit(PiCommand.Vel.Vy, PiTune.MaxSpeedY, CHASSIS_MAX_SPEED_Y);
 
 #if CHASSIS_HEADING_ENABLE
         /* ---- 航向控制：目标航向 + 转向输入积分 ----
@@ -342,6 +441,7 @@ void ChassisTask(void const* argument)
 
             PID_AngleCalc(&Chassis.HeadingPid, Imu.Yaw, s_HeadingTarget);
             Chassis.Move.Wz = CHASSIS_HEADING_YAW_DIR * Chassis.HeadingPid.Output * PI / 180.0f;   /* °/s → rad/s */
+            Chassis.Move.Wz = Chassis_Limit(Chassis.Move.Wz, PiTune.MaxSpeedW, CHASSIS_MAX_SPEED_W);
         }
         else
         {
@@ -351,6 +451,7 @@ void ChassisTask(void const* argument)
         }
 #else
         Chassis.Move.Wz = PiCommand.Vel.Wz;   /* 手动自旋指令（原逻辑，宏关闭时生效） */
+        Chassis.Move.Wz = Chassis_Limit(Chassis.Move.Wz, PiTune.MaxSpeedW, CHASSIS_MAX_SPEED_W);
 #endif
 
         /* ---- 位置闭环：Pi 位姿目标(PosTarget.Valid) 或 蓝牙回零(ReturnHome) → 覆盖 Vx/Vy ---- */

@@ -32,11 +32,36 @@
   calibrate{"cmd":"calibrate"}                 视觉校准钩子(占位，待接圆环识别)
   comment  {"cmd":"comment","text":"..."}      注释，什么都不做
 
+  ===== 复杂动作（本次新增，给节点动作序列用） =====
+
+  script   {"cmd":"script", "program":"python3", "args":"vision/main.py --device /dev/video0",
+            "cwd":"/home/pi/vision", "wait":true, "timeout_s":120}
+           启动任意程序。wait=false 时只启动、不等退出（适合常驻的视觉窗口）。
+  align    {"cmd":"align", "program":"python3", "args":"align.py", "timeout_s":30,
+            "result_file":"/tmp/align.json"}
+           视觉矫正：跑完程序后读它输出的 JSON（stdout 最后一行，或 result_file），
+           形如 {"dx_m":0.012,"dy_m":-0.008,"dyaw_deg":1.5}，在当前目标位姿上叠加
+           修正量并重新下发，然后等车到位。程序没输出 JSON 就跳过，不中断任务。
+  vision_pick {"cmd":"vision_pick", "program":"python3", "args":"pick.py", ...}
+           先跑视觉程序，读它输出的 {"yaw_deg":..,"lift_deg":..,"extend_deg":..}
+           （缺省字段沿用下面 pick 的默认值），随后自动执行一次 pick 抓取宏。
+  pick     {"cmd":"pick", "yaw_deg":0, "lift_deg":-40, "safe_lift_deg":0,
+            "extend_deg":150, "gripper_open":120, "gripper_close":35, "settle_ms":800}
+           抓取宏：张开夹爪 → 云台到安全位 → 降到抓取位 → 等稳定 → 夹紧 → 抬起。
+  place    参数同 pick，动作反过来：到安全位 → 降下 → 张开 → 抬起。
+
 坐标约定：车正前方为 +x，左侧为 +y，逆时针为正。和 F407 的里程计/陀螺仪一致。
+align 的修正量也在这个里程计世界系里（米 / 度）。
 """
 
 import json        # 解析/生成 JSON（指令序列就是 JSON）
 import math        # 三角函数、弧度换算
+import os          # 展开路径里的 ~ 和环境变量
+import queue       # 子程序输出用后台线程读，避免阻塞状态机
+import shlex       # 把 "程序 参数" 拆成 argv
+import subprocess  # 动作序列里"启动一个程序"（视觉脚本等）
+import threading   # 读子程序 stdout 的线程
+import time        # 超时判断
 
 import rclpy
 from rclpy.node import Node
@@ -58,11 +83,18 @@ class MotionPlannerNode(Node):
         self.declare_parameter('arrive_timeout_s', 20.0)  # 秒
         # 启动时自动加载的序列文件路径（空 = 不加载，等上位机下发）
         self.declare_parameter('sequence_file', '')
+        # 视觉程序的默认位置：动作序列里的 script / align / vision_pick 没写
+        # program 时就用这里，方便整机换目录时只改一处。
+        self.declare_parameter('vision_program', '')
+        self.declare_parameter('vision_args', '')
+        self.declare_parameter('vision_cwd', '')
+        self.declare_parameter('script_timeout_s', 60.0)
 
         self.arrive_tol_xy = float(self.get_parameter('arrive_tol_xy').value)
         self.arrive_tol_yaw = float(self.get_parameter('arrive_tol_yaw').value)
         self.arrive_timeout_s = float(self.get_parameter('arrive_timeout_s').value)
         sequence_file = str(self.get_parameter('sequence_file').value)
+        self.default_script_timeout = float(self.get_parameter('script_timeout_s').value)
 
         # ---- 发布的话题（本节点 -> 其他节点） ----
         self._pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)                     # 位姿目标
@@ -92,9 +124,22 @@ class MotionPlannerNode(Node):
         self.tx = 0.0
         self.ty = 0.0
         self.tyaw = 0.0
+        # 到达当前目标时是否必须等车头也转到位。goto 可以带 arrive_yaw=False：
+        # 中间航点只等位置，车头在行进中继续转（F407 航向环一直在跟 tyaw），
+        # 避免每到一个拐点就停下来原地甩车头。
+        self.wait_yaw = True
 
         # 舵机角度镜像（F407 上电默认：夹爪90 托盘0 相机90），供 plate/cam 单独设值时补齐整组
         self.servo = [90.0, 0.0, 90.0]
+
+        # ---- 动作序列里启动的子程序（script / align / vision_pick）----
+        self._proc = None              # subprocess.Popen
+        self._proc_lines = queue.Queue()   # 后台线程把 stdout 行丢进来
+        self._proc_kind = ''           # script / align / vision_pick
+        self._proc_cmd = {}            # 当前子程序对应的指令字典
+        self._proc_deadline = 0.0      # 超时时刻
+        self._proc_result = None       # 从 stdout / result_file 解析出的 JSON
+        self._proc_thread = None       # stdout 读取线程
 
         # 若有启动参数指定的序列文件，先加载（不自动开始，等上位机下发 start）
         if sequence_file:
@@ -125,6 +170,7 @@ class MotionPlannerNode(Node):
         重复处理会多发一次 POSE。
         """
         if bool(msg.data) and self.phase != 'idle':
+            self._kill_proc()                            # 停止时把视觉/脚本子进程也收掉
             self.phase = 'idle'
             self.index = -1
             self._pub_active.publish(Bool(data=False))   # 交还控制权给手柄
@@ -156,6 +202,8 @@ class MotionPlannerNode(Node):
         if not isinstance(self.commands, list):
             self._publish_state('序列格式错误：应为命令数组')
             return
+        # 抓取/放置宏展开成基本指令，状态机本体不用认识宏
+        self.commands = self._expand_macros(self.commands)
         self._publish_state(f'已加载 {len(self.commands)} 条指令，等待开始')
         self.get_logger().info(f'加载序列：{len(self.commands)} 条')
         self._start()
@@ -166,6 +214,7 @@ class MotionPlannerNode(Node):
             self._publish_state('还没收到里程计(F407 未回传)，无法开始，请检查串口')
             self.get_logger().error('无里程计，无法开始')
             return
+        self._kill_proc()                           # 上一条序列残留的脚本先收掉
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
         self.index = -1
         self.phase = 'stepping'                     # 进入执行循环
@@ -179,6 +228,13 @@ class MotionPlannerNode(Node):
         if self.phase == 'idle':
             return
         self._pub_active.publish(Bool(data=True))   # 占用控制权心跳（手柄靠它判断要不要让位）
+        if self.phase == 'proc':
+            # 等子程序跑完。完成时 _poll_proc 会把 phase 改成 stepping（继续）
+            # 或 moving（视觉校准后重新下发目标，等车到位）。
+            if not self._poll_proc():
+                return
+            if self.phase != 'stepping':
+                return
         if self.phase == 'moving':
             if not self._arrived():      # 还没到位，继续等
                 if self.move_deadline and self._now() > self.move_deadline:
@@ -212,6 +268,8 @@ class MotionPlannerNode(Node):
            - moving/waiting：阻塞型，等完成
            - stepping：非阻塞型，继续下一条
         """
+        # 默认要求位置和朝向都到位；goto 可以显式关掉朝向等待。
+        self.wait_yaw = True
         name = cmd.get('cmd')
         if name == 'move':            # 前进/后退
             d = float(cmd.get('dist_m', 0.0))
@@ -238,6 +296,8 @@ class MotionPlannerNode(Node):
             self.ty = float(cmd.get('y_m', self.ty))
             if cmd.get('yaw_deg') is not None:
                 self.tyaw = math.radians(float(cmd['yaw_deg']))
+            # 中间航点 arrive_yaw=False：到了位置就继续，车头还在转也不等
+            self.wait_yaw = bool(cmd.get('arrive_yaw', True))
             self._publish_pose(self.tx, self.ty, self.tyaw)
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] 去 '
@@ -271,10 +331,306 @@ class MotionPlannerNode(Node):
         elif name == 'calibrate':     # 视觉校准钩子（占位）
             self._calibrate()
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 视觉校准(占位)')
+        elif name == 'script':
+            wait = bool(cmd.get('wait', True))
+            if self._start_proc(cmd, 'script'):
+                n = self.index + 1
+                if wait:
+                    self._publish_state(f'[{n}/{len(self.commands)}] 运行程序（等待结束）')
+                    self.phase = 'proc'
+                else:
+                    self._publish_state(f'[{n}/{len(self.commands)}] 启动程序（后台）')
+            else:
+                self._publish_state(f'[{self.index+1}/{len(self.commands)}] 程序没启动起来，跳过')
+        elif name == 'align':
+            if self._start_proc(cmd, 'align'):
+                self._publish_state(f'[{self.index+1}/{len(self.commands)}] 视觉校准：运行程序…')
+                self.phase = 'proc'
+            else:
+                self._publish_state(f'[{self.index+1}/{len(self.commands)}] 视觉校准程序没启动，跳过')
+        elif name == 'vision_pick':
+            if self._start_proc(cmd, 'vision_pick'):
+                self._publish_state(f'[{self.index+1}/{len(self.commands)}] 视觉识别物料…')
+                self.phase = 'proc'
+            else:
+                self._publish_state(f'[{self.index+1}/{len(self.commands)}] 视觉识别程序没启动，跳过')
         elif name == 'comment':       # 注释，跳过
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 注释: {cmd.get("text", "")}')
         else:
             self.get_logger().warning(f'未知指令被跳过: {cmd}')
+
+    # ---------------- 抓取 / 放置宏 ----------------
+
+    def _expand_macros(self, commands: list) -> list:
+        """把 pick / place 这类"一条顶好几条"的宏展开成基本指令。
+
+        展开放在加载时做，状态机就不需要认识宏，也方便上位机把展开后的
+        完整动作显示出来（可选）。
+        """
+        out = []
+        for cmd in commands:
+            if not isinstance(cmd, dict):
+                continue
+            name = cmd.get('cmd')
+            if name in ('pick', 'place'):
+                out.extend(self._macro_pick(cmd, name))
+            else:
+                out.append(cmd)
+        return out
+
+    @staticmethod
+    def _macro_pick(cmd: dict, kind: str) -> list:
+        """抓取宏的具体动作序列。
+
+        参数（都有默认值，节点动作序列里可以只填想改的）：
+          yaw_deg / lift_deg / extend_deg  抓取位姿
+          safe_lift_deg                    抬起后的安全高度（默认 0）
+          gripper_open / gripper_close     夹爪张开/夹紧角度（默认 120 / 35）
+          settle_ms                        每个阶段等待时间（默认 800ms）
+        """
+        yaw = float(cmd.get('yaw_deg', 0.0))
+        lift = float(cmd.get('lift_deg', 0.0))
+        safe = float(cmd.get('safe_lift_deg', 0.0))
+        ext = float(cmd.get('extend_deg', 0.0))
+        g_open = float(cmd.get('gripper_open', 120.0))
+        g_close = float(cmd.get('gripper_close', 35.0))
+        settle = int(cmd.get('settle_ms', 800))
+
+        def gimbal(deg_lift):
+            return {'cmd': 'gimbal', 'yaw_deg': yaw,
+                    'lift_deg': deg_lift, 'extend_deg': ext}
+
+        def grip(deg):
+            return {'cmd': 'gripper', 'deg': deg}
+
+        def wait(ms=settle):
+            return {'cmd': 'delay', 'ms': ms}
+
+        if kind == 'pick':
+            return [
+                grip(g_open),
+                gimbal(safe), wait(),
+                gimbal(lift), wait(),
+                grip(g_close), wait(),
+                gimbal(safe),
+            ]
+        return [                       # place
+            gimbal(safe), wait(),
+            gimbal(lift), wait(),
+            grip(g_open), wait(),
+            gimbal(safe),
+        ]
+
+    # ---------------- 子程序（script / align / vision_pick） ----------------
+
+    def _start_proc(self, cmd: dict, kind: str) -> bool:
+        """启动一条指令对应的子程序。返回 False = 没启动（状态机跳过这条）。"""
+        program = str(cmd.get('program') or
+                      self.get_parameter('vision_program').value or '').strip()
+        args = cmd.get('args')
+        if args is None:
+            args = self.get_parameter('vision_args').value or ''
+        if isinstance(args, (list, tuple)):
+            argv = [str(a) for a in args]
+        else:
+            argv = shlex.split(str(args))
+
+        cwd = str(cmd.get('cwd') or
+                  self.get_parameter('vision_cwd').value or '').strip() or None
+        if cwd:
+            cwd = os.path.expandvars(os.path.expanduser(cwd))
+        if not program:
+            self.get_logger().warning(f'{kind}: 没有配置 program，跳过')
+            return False
+        program = os.path.expandvars(os.path.expanduser(program))
+
+        # 同一时刻只保留一个子程序：上一条还是后台模式没退出时，先收掉，
+        # 否则 _proc 被覆盖，旧进程就再也停不下来了。
+        if self._proc is not None:
+            self._kill_proc()
+
+        env = os.environ.copy()
+        env.setdefault('PYTHONUNBUFFERED', '1')   # 让脚本 print 立刻出来
+        try:
+            self._proc = subprocess.Popen(
+                [program, *argv], cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except Exception as e:  # noqa: BLE001 - 路径错/没权限都不该拖垮状态机
+            self._proc = None
+            self.get_logger().error(f'{kind}: 启动 {program} 失败：{e}')
+            return False
+
+        self._proc_lines = queue.Queue()
+        self._proc_kind = kind
+        self._proc_cmd = dict(cmd)
+        self._proc_result = None
+        try:
+            timeout = float(cmd.get('timeout_s', self.default_script_timeout))
+        except (TypeError, ValueError):
+            timeout = self.default_script_timeout
+        self._proc_deadline = time.monotonic() + max(1.0, timeout)
+
+
+        self._proc_thread = threading.Thread(
+            target=self._read_proc, args=(self._proc, self._proc_lines),
+            daemon=True, name=f'{kind}-reader')
+        self._proc_thread.start()
+        self.get_logger().info(f'{kind}: 已启动 {program} {" ".join(argv)}')
+        return True
+
+    @staticmethod
+    def _read_proc(proc, lines: queue.Queue) -> None:
+        """后台线程：把子程序输出逐行塞进队列（不阻塞 ROS 执行器）。"""
+        try:
+            for line in proc.stdout:
+                lines.put(line.rstrip('\n'))
+        except Exception:  # noqa: BLE001 - 进程被杀时读管道会抛，忽略
+            pass
+
+    def _poll_proc(self) -> bool:
+        """检查子程序是否结束。返回 True = 结束并已处理，False = 还在跑。"""
+        if self._proc is None:
+            self.phase = 'stepping'
+            return True
+
+        timed_out = time.monotonic() > self._proc_deadline
+        if self._proc.poll() is None and not timed_out:
+            return False
+
+        if timed_out and self._proc.poll() is None:
+            self.get_logger().warning(f'{self._proc_kind}: 运行超时，强制结束')
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                try:
+                    self._proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        code = self._proc.poll()
+        self._proc = None
+        kind = self._proc_kind
+        self._proc_kind = ''
+        # 进程退出和读线程收完管道之间有几毫秒空档；不等它就可能漏掉
+        # 最后一行 JSON（视觉结果通常在最后一行）。
+        thr = self._proc_thread
+        self._proc_thread = None
+        if thr is not None:
+            thr.join(timeout=1.0)
+        self._proc_result = self._parse_proc_result()
+
+        if kind == 'align':
+            self._apply_align()
+        elif kind == 'vision_pick':
+            self._apply_vision_pick()
+        else:
+            self._publish_state(f'程序结束（退出码 {code}）')
+            self.phase = 'stepping'
+        return True
+
+    def _parse_proc_result(self):
+        """从子程序的 stdout 最后一行 / result_file 里找 JSON 对象。
+
+        约定：脚本要回传结果时，在最后一行打印一个 JSON 对象即可，例如
+            print(json.dumps({"dx_m": 0.01, "dy_m": -0.02, "dyaw_deg": 1.5}))
+        也可以写进 result_file，避免 stdout 混着日志不好挑。
+        """
+        cmd = self._proc_cmd or {}
+        path = str(cmd.get('result_file', '') or '').strip()
+        if path:
+            try:
+                with open(os.path.expanduser(os.path.expandvars(path)),
+                          'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception:  # noqa: BLE001 - 没有结果文件是正常情况
+                pass
+
+        lines = []
+        while True:
+            try:
+                lines.append(self._proc_lines.get_nowait())
+            except queue.Empty:
+                break
+        for line in reversed(lines):
+            text = line.strip()
+            if not text.startswith('{'):
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
+
+    def _apply_align(self):
+        """视觉矫正：把结果里的 dx/dy/dyaw 叠加到当前目标位姿，并重新下发。"""
+        data = self._proc_result or {}
+        try:
+            dx = float(data.get('dx_m', 0.0))
+            dy = float(data.get('dy_m', 0.0))
+            dyaw = math.radians(float(data.get('dyaw_deg', 0.0)))
+        except (TypeError, ValueError):
+            data = {}
+            dx = dy = dyaw = 0.0
+
+        if not data:
+            self._publish_state('视觉校准没有返回 JSON，跳过（目标位姿不变）')
+            self.phase = 'stepping'
+            return
+
+        self.tx += dx
+        self.ty += dy
+        self.tyaw += dyaw
+        self._publish_pose(self.tx, self.ty, self.tyaw)
+        self.move_deadline = time.monotonic() + self.arrive_timeout_s
+        self._publish_state(
+            f'视觉校准：修正 dx={dx:+.3f}m dy={dy:+.3f}m '
+            f'dyaw={math.degrees(dyaw):+.1f}°，重新到位')
+        self.phase = 'moving'
+
+    def _apply_vision_pick(self):
+        """视觉定点抓取：把识别出的云台角度填进 pick 宏，插到当前指令后面执行。"""
+        data = self._proc_result or {}
+        pick = {'cmd': 'pick'}
+        for key in ('yaw_deg', 'lift_deg', 'safe_lift_deg', 'extend_deg',
+                    'gripper_open', 'gripper_close', 'settle_ms'):
+            if key in data:
+                pick[key] = data[key]
+
+        if not data:
+            self._publish_state('视觉识别没有返回 JSON，使用默认抓取位')
+        else:
+            self._publish_state(
+                f'视觉识别：yaw={pick.get("yaw_deg", 0)}° '
+                f'lift={pick.get("lift_deg", 0)}° '
+                f'ext={pick.get("extend_deg", 0)}°，开始抓取')
+
+        expanded = self._macro_pick(pick, 'pick')
+        self.commands[self.index + 1:self.index + 1] = expanded
+        self.phase = 'stepping'
+
+    def _kill_proc(self):
+        """立即结束正在跑的子程序（停止 / 超时 / 任务结束）。"""
+        proc = self._proc
+        self._proc = None
+        self._proc_kind = ''
+        self._proc_thread = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _calibrate(self):
         """视觉校准占位：以后在这里接入"圆环在画面中的位置 -> 修正 tx/ty/tyaw"。
@@ -287,6 +643,7 @@ class MotionPlannerNode(Node):
         把当前位置设成目标位姿，让 F407 原地锁住，然后交还控制权给手柄。
         剩下的指令不再执行——半路停下比硬着头皮跑完安全。
         """
+        self._kill_proc()
         self.phase = 'idle'
         self.index = -1
         self.move_deadline = 0.0
@@ -301,14 +658,23 @@ class MotionPlannerNode(Node):
     # ---------------- 工具函数 ----------------
 
     def _arrived(self) -> bool:
-        """判断里程计是否到达绝对目标 (tx, ty, tyaw)。"""
+        """判断里程计是否到达绝对目标 (tx, ty, tyaw)。
+
+        wait_yaw=False 时只要求位置到点：中间航点不等车头转完，
+        这样朝向变化会摊到整段行走过程里，而不是每个拐点原地转。
+        最后一个航点仍然要求位置+朝向都到位。
+        """
         if self.odom is None:
             return False
         ox, oy, ot = self.odom
         dx = ox - self.tx
         dy = oy - self.ty
+        if (dx * dx + dy * dy) >= self.arrive_tol_xy ** 2:
+            return False
+        if not self.wait_yaw:
+            return True
         dh = abs(self._angle_diff(ot, self.tyaw))
-        return (dx * dx + dy * dy) < self.arrive_tol_xy ** 2 and dh < self.arrive_tol_yaw
+        return dh < self.arrive_tol_yaw
 
     @staticmethod
     def _angle_diff(a: float, b: float) -> float:
@@ -328,6 +694,7 @@ class MotionPlannerNode(Node):
         self._pub_state.publish(s)
 
     def _finish(self):
+        self._kill_proc()
         self.phase = 'idle'
         self._pub_active.publish(Bool(data=False))       # 交还控制权给手柄
         self._publish_state('全部完成')

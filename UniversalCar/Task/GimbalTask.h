@@ -3,8 +3,12 @@
 
 /**
  * @attention   采用UTF-8字符集编码
- * @brief       云台控制任务（三轴纯速度控制，只计算不发送 + 夹爪/摄像头舵机）
- * @details     云台三轴和底盘轮子一样只收速度（F6），没有任何位置/回零/置零指令。
+ * @brief       云台控制任务（速度环底 + 软件位置环 + 夹爪/摄像头舵机）
+ * @details     电机本身只有速度模式（F6），位置环在本任务里做：
+ *                PI_CMD_GIMBAL_TARGET → 角度目标 → PID(误差 ° → 速度 °/s) → F6
+ *              位置目标有效期见 GIMBAL_POS_HOLD_MS；期间速度指令让位，过期后
+ *              手柄速度重新生效。PI_CMD_GIMBAL_ZERO 把当前位置定义成 0 点
+ *              （电机掉电不保存位置，每次上电人工摆到固定位再置零）。
  *              全总线只允许底盘任务发帧：云台任务把三轴目标转速写进 GimbalTx，
  *              底盘任务在 4 轮 0xAA 广播之后，用 Gimbal_SendAxisSpeedFrames()
  *              给三轴各发一条 F6 单机帧（不放广播里，见该函数注释）。
@@ -58,8 +62,11 @@ void Gimbal_TxService(void);
 /// @brief 给三轴各发一条 F6 速度单机帧（底盘任务每拍调用，失能时 Rpm 为 0）
 void Gimbal_SendAxisSpeedFrames(void);
 
-/// @brief 取三轴当前位置（相对上电中位，°）。遥测回传和限位示教都用这个坐标。
+/// @brief 取三轴当前位置（相对 0 点，°）。遥测回传和限位示教都用这个坐标。
 void Gimbal_GetRelDeg(float out[3]);
+
+/// @brief 取三轴当前生效的软限位（相对 0 点，°）
+void Gimbal_GetLimits(float minDeg[3], float maxDeg[3]);
 
 void GimbalTask(void const* argument);
 

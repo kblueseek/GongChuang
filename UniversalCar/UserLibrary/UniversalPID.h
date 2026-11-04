@@ -56,6 +56,11 @@ typedef struct
 } PID_t;
 
 void PID_Init(PID_t* pid, PID_InitStruct_t* pidParam);
+
+/// @brief 在线改三项增益（不重新初始化限幅/死区，但会清一次积分状态）
+/// @note  kI、kD 在 PID_t 里预乘了 DeltaTime，不能直接赋值，必须走这个接口。
+void PID_SetGains(PID_t* pid, float kP, float kI, float kD);
+
 void PID_Calc(PID_t* pid, float real, float set);
 void PID_AngleCalc(PID_t* pid, float real, float set);
 void PID_Clear(PID_t* pid);
