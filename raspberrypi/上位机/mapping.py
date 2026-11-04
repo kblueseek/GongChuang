@@ -274,7 +274,15 @@ class FieldModel:
     def resolve_waypoint(self, name):
         """把名字换成坐标。START = 雷达所在的那个启停区。找不到返回 None。"""
         if name in ("START", "start", "起点"):
-            name = self.lidar_mount or (self.start_zones[0]["name"] if self.start_zones else "")
+            # mount 只是给人看的标签，填"自定义"之类对不上启停区名字时，
+            # 直接退回首启停区，别让整条九点路线因为一个标签解析失败。
+            want = self.lidar_mount
+            for z in self.start_zones:
+                if z["name"] == want:
+                    return (z["cx"], z["cy"])
+            if self.start_zones:
+                return (self.start_zones[0]["cx"], self.start_zones[0]["cy"])
+            return None
         for z in self.start_zones:
             if z["name"] == name:
                 return (z["cx"], z["cy"])

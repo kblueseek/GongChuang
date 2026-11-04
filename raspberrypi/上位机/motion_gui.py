@@ -2057,17 +2057,27 @@ class App:
         out.append(ded[-1])
         return out
 
-    def _path_commands(self, path_mm, title=None, fixed_yaw_deg=None):
+    def _seg_heading(self, seg, prev):
+        """段行驶方向 seg（度）→ 车头朝向：seg 或 seg+180 里选离 prev 更近的。
+
+        麦轮正着走/倒着走都比横着走直，所以让车头或车尾对着行驶方向，
+        并且选转弯更小的那一头（少打方向、少磨轮子）。
+        """
+        d_fwd = wrap_deg(seg - prev)
+        d_bwd = wrap_deg(seg + 180.0 - prev)
+        return wrap_deg(seg + 180.0) if abs(d_bwd) < abs(d_fwd) else wrap_deg(seg)
+
+    def _path_commands(self, path_mm, title=None, fixed_yaw_deg=None,
+                       start_yaw_deg=None):
         """世界系折线 → motion_planner 的 goto 指令（里程计系，米/度）。
 
-        fixed_yaw_deg: 终点要求的场地朝向（度）。None = 保持车当前朝向。
+        start_yaw_deg: 出发时的车头朝向（场地系，度）。None = 车当前朝向。
+        fixed_yaw_deg: 终点作业朝向（度）。None = 到站后保持最后一段的行驶朝向。
 
-        全向底盘不需要"车头对着行驶方向"：整段路保持出发时的车头朝向纯平移，
-        一路不旋转；走到最后一个航点站定后，才原地转到 fixed_yaw_deg。
-        这样避免"边走边转"——麦轮边平移边转容易打滑，里程计会明显漂。
-
-        中间航点带 arrive_yaw=False：只走平移段，不等朝向、也不转；
-        最后一个航点才等位置 + 朝向都到位（到位后原地转）。
+        麦轮能横移，但横着走没有正着走直、更容易打滑。所以改成**不横移**：
+        每个拐点先原地把车头（或车尾，选转弯更小的一头）摆到下一段的行驶
+        方向，再沿这段只前/后直行；走到最后一个航点站定后，才原地转到
+        fixed_yaw_deg（作业朝向）。所有转体都是原地完成，不边走边转。
         """
         wps = self._waypoints(path_mm)
         cmds = []
@@ -2075,18 +2085,31 @@ class App:
             cmds.append({'cmd': 'comment', 'text': title})
         if not wps:
             return cmds
-        if fixed_yaw_deg is None:
-            fixed_yaw_deg = self._robot_field()[2]
+        if start_yaw_deg is None:
+            start_yaw_deg = self._robot_field()[2]
+        prev = wrap_deg(start_yaw_deg)
         n = len(wps)
+        hdgs = []
         for i, (x, y) in enumerate(wps):
-            ox, oy, oth = self._field_to_odom(x, y, fixed_yaw_deg)
-            cmd = {'cmd': 'goto',
-                   'x_m': round(ox, 3),
-                   'y_m': round(oy, 3),
-                   'yaw_deg': round(math.degrees(oth), 1)}
             if i < n - 1:
-                cmd['arrive_yaw'] = False
-            cmds.append(cmd)
+                seg = math.degrees(math.atan2(wps[i + 1][1] - y,
+                                              wps[i + 1][0] - x))
+                hdg = self._seg_heading(seg, prev)
+            elif fixed_yaw_deg is not None:
+                hdg = wrap_deg(fixed_yaw_deg)
+            elif hdgs:
+                hdg = hdgs[-1]      # 没有作业朝向：到站就停，别再多转一下
+            else:
+                hdg = prev
+            hdgs.append(hdg)
+            prev = hdg
+        for (x, y), hdg in zip(wps, hdgs):
+            ox, oy, oth = self._field_to_odom(x, y, hdg)
+            cmds.append({'cmd': 'goto',
+                         'x_m': round(ox, 3),
+                         'y_m': round(oy, 3),
+                         'yaw_deg': round(math.degrees(oth), 1),
+                         'arrive_yaw': True})
         return cmds
 
     def _planner_missing(self):
@@ -2119,11 +2142,9 @@ class App:
                     f'整车状态是"{self.node.robot_status[0]}"（不是就绪/使能），'
                     f'现在下发导航车也不会动。仍要下发吗？'):
                 return
-        # 单点导航也整段保持一个朝向：是作业点就转成作业要求的朝向，
-        # 否则保持当前朝向平移过去，别跟着每个拐点甩车头。
+        # 单点导航：每个拐点原地摆正车头（或车尾）对着下一段行驶方向，
+        # 到目标再转成作业朝向（不是作业点就保持到达时的朝向）。
         yaw = self._outward_yaw(self.goal_world)
-        if yaw is None:
-            yaw = self._robot_field()[2]
         cmds = self._path_commands(
             self.plan['path_world'],
             f'导航 → {self.field.cell_name(*self.goal_world)} '
@@ -2233,14 +2254,15 @@ class App:
                 messagebox.showerror('到不了起点',
                                      f'从当前位置到第 1 个节点不通：{res["note"]}')
                 return
-            # 去起点的路上就提前转成第一段要求的朝向
+            # 到第 1 个节点时，车头已经摆成第一段出发的朝向
             cmds += self._path_commands(res['path_world'], '先去第 1 个节点',
                                         fixed_yaw_deg=headings[0])
         self._append_node_actions(cmds, 0)
         for i, leg in enumerate(self.mission_legs):
             cmds += self._path_commands(
                 leg['path'], f'{i + 1}. {leg["from_name"]} → {leg["to_name"]}',
-                fixed_yaw_deg=headings[i])
+                start_yaw_deg=headings[i],
+                fixed_yaw_deg=leg.get('final_yaw'))
             self._append_node_actions(cmds, i + 1)
 
         # ---- 没有里程计 / 起点没标定：只填序列，不下发 ----
@@ -2272,13 +2294,9 @@ class App:
     def _play_mission(self):
         """把整条任务路线按固定步长采样成位姿序列，用 tk.after 一步步播放。
 
-        **朝向**：车头始终朝**行驶方向**，拐弯处用前向限速平滑
-        （每步 ≤ max_dyaw），所以 90° 的弯会摊到接下来几步里边开边转，
-        不会原地甩头。
-
-        注意：这里只管"看着像在开"。**到作业点要摆成什么朝向由真车指令保证**
-        （`_path_commands` 会把该段最后一个 goto 的 yaw_deg 设成 final_yaw），
-        两件事不要混在一起，否则动画里的车头会跟行驶方向拧着走。
+        **朝向**：和真车指令一致——每到拐点先**原地**把车头（或车尾，选
+        转弯小的一头）摆到下一段行驶方向，再沿这段直着开过去；到作业点
+        再原地转成作业朝向（final_yaw）。所以动画里不会出现横移。
 
         采样按 60mm 定长沿折线插值：路径大多是一大段直线，共线点被压掉后
         两个航点能隔 500mm 以上，按航点播就是"一步跳半米"。
@@ -2288,62 +2306,52 @@ class App:
             return
 
         step_mm = 60.0
-        max_dyaw = 10.0          # 每步最多转多少度 → 转弯快慢
+        spin_deg = 20.0          # 原地转：每步最多转多少度
 
         pos, tgt = [], []
-        prev_yaw = None
+        yaw = self._robot_field()[2]
+
+        def spin_to(target):
+            """原地转到 target（分成若干步，每步 ≤ spin_deg）。"""
+            nonlocal yaw
+            d = wrap_deg(target - yaw)
+            if abs(d) < 0.05:
+                return
+            n_spin = max(1, int(abs(d) / spin_deg) + 1)
+            for k in range(1, n_spin + 1):
+                pos.append(pos[-1] if pos else (0.0, 0.0))
+                tgt.append(wrap_deg(yaw + d * k / n_spin))
+            yaw = wrap_deg(target)
 
         for leg in self.mission_legs:
             wps = self._waypoints(leg.get('path') or [], min_step_mm=10.0)
             if not wps:
                 continue
-            seg = []
+            # 段与段的衔接点和上一段终点重合：采样从 step_mm 起跳，
+            # 不会在原地多插一步（但这一段本身不能丢）
+            if not pos:
+                pos.append((float(wps[0][0]), float(wps[0][1])))
+                tgt.append(yaw)
             for k in range(len(wps) - 1):
                 x0, y0 = wps[k]
                 x1, y1 = wps[k + 1]
                 d = math.hypot(x1 - x0, y1 - y0)
                 if d <= 1e-6:
                     continue
-                hd = math.degrees(math.atan2(y1 - y0, x1 - x0))   # 行驶方向
-                t = 0.0
+                hd = self._seg_heading(
+                    math.degrees(math.atan2(y1 - y0, x1 - x0)), yaw)
+                spin_to(hd)                       # 先原地摆正车头/车尾
+                t = step_mm
                 while t < d:
                     r = t / d
-                    seg.append((x0 + (x1 - x0) * r, y0 + (y1 - y0) * r, hd))
+                    pos.append((x0 + (x1 - x0) * r, y0 + (y1 - y0) * r))
+                    tgt.append(yaw)
                     t += step_mm
-            lx, ly = wps[-1]
-            eh = (math.degrees(math.atan2(ly - wps[-2][1], lx - wps[-2][0]))
-                  if len(wps) >= 2 else self.robot_start[2])
-            seg.append((float(lx), float(ly), float(eh)))
-            # 段与段的衔接点会和上一段终点重合，不去掉就会"停一步只转头"
-            if pos and seg and math.hypot(seg[0][0] - pos[-1][0],
-                                          seg[0][1] - pos[-1][1]) < 1.0:
-                seg = seg[1:]
-            # ---- 段首：如果和上一段末朝向差得多，就地快速摆正 ----
-            # 段与段之间是在作业点**停车**换向的，这时候让它"边开边转"会变成
-            # 倒着开十几步，更难看。这里做一次短促的原地摆正（30°/步，
-            # 180° 也就 6 步 ≈ 0.8 秒），不是一路打转。
-            if prev_yaw is not None:
-                dd = wrap_deg(seg[0][2] - prev_yaw)
-                if abs(dd) > max_dyaw:
-                    n_spin = min(int(abs(dd) / 30.0) + 1, 8)
-                    for k in range(1, n_spin + 1):
-                        pos.append((seg[0][0], seg[0][1]))
-                        tgt.append(wrap_deg(prev_yaw + dd * k / n_spin))
-
-            # ---- 本段内做前向限速：拐角摊到之后几步，车一直在动 ----
-            seg_yaw = seg[0][2]
-            for k, (x, y, hd) in enumerate(seg):
-                if k == 0:
-                    seg_yaw = hd
-                else:
-                    d = wrap_deg(hd - seg_yaw)
-                    if abs(d) > max_dyaw:
-                        seg_yaw = wrap_deg(seg_yaw + max_dyaw * (1 if d > 0 else -1))
-                    else:
-                        seg_yaw = hd
-                pos.append((x, y))
-                tgt.append(seg_yaw)
-            prev_yaw = seg_yaw
+                pos.append((float(x1), float(y1)))
+                tgt.append(yaw)
+            fy = leg.get('final_yaw')
+            if fy is not None:
+                spin_to(float(fy))                # 到作业点再原地转成作业朝向
 
         if not pos:
             self._set_status('没有可播放的路径')
@@ -2382,22 +2390,20 @@ class App:
         self._redraw()
 
     def _mission_headings(self):
-        """每一段路径要用的固定车头朝向（场地系，度）。
+        """每一段路径**出发时**的车头朝向（场地系，度）。
 
-        只看**目的地节点**要求什么朝向（leg["final_yaw"]，机械臂朝作业区）：
-          · 有要求 → 整段保持出发朝向平移，到点站定后再原地转到这个方向；
-          · 没要求 → 沿用上一段的朝向，完全不转；
-          · 第一段也没要求 → 保持发车时车头朝向。
-        全向底盘不需要车头对着路径方向，这样一路上不会跟着拐点来回甩，
-        也不会边走边转把里程计带漂。
+        上一段在作业点已经原地转成本段作业朝向（leg["final_yaw"]），
+        这一段就从那个朝向出发；第一段从发车时的车头朝向出发。
+        段内拐点由 _path_commands 逐段摆正（车头或车尾对着行驶方向），
+        到终点再原地转成本段的 final_yaw。
         """
         yaw = self._robot_field()[2]
         out = []
         for leg in self.mission_legs:
+            out.append(yaw)
             fy = leg.get('final_yaw')
             if fy is not None:
                 yaw = float(fy)
-            out.append(yaw)
         return out
 
     def clear_route(self):
