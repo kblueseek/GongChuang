@@ -19,10 +19,6 @@
   move     {"cmd":"move",   "dist_m":0.5}      前进(负=后退)
   strafe   {"cmd":"strafe", "dist_m":0.3}      横向平移(正=左)
   turn     {"cmd":"turn",   "deg":90}          原地转(正=逆时针/左转，负=右转)
-  goto     {"cmd":"goto",   "x_m":0.35, "y_m":-0.12, "yaw_deg":-90}
-                                                绝对位姿(里程计系, 米/度)。
-                                                上位机按雷达地图算出的航点就是这种；
-                                                全向底盘一次到位，不用拆成 move/strafe。
   gimbal   {"cmd":"gimbal", "yaw_deg":-30, "lift_deg":50}  云台轴角度(可缺省)
   gripper  {"cmd":"gripper","deg":45}          夹爪舵机
   plate    {"cmd":"plate",  "deg":90}          载物盘舵机
@@ -65,6 +61,7 @@ class MotionPlannerNode(Node):
         self._pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)        # 舵机 [夹爪,托盘,相机]
         self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)      # 云台 [yaw,lift,extend]
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)                   # 使能
+        self._pub_unlock = self.create_publisher(Bool, '/cmd_unlock', 10)                   # 解除失能锁存
         self._pub_state = self.create_publisher(String, '/motion_state', 10)                # 进度状态(给上位机/屏幕看)
 
         # ---- 订阅的话题（其他节点 -> 本节点） ----
@@ -208,7 +205,6 @@ class MotionPlannerNode(Node):
             self.phase = 'moving'
         elif name == 'goto':          # 绝对位姿（上位机按场地路径算出来的航点）
             # move/strafe/turn 都是在当前目标上做增量；goto 直接把目标设成绝对值。
-            # 到位判定还是 _arrived()，和别的走法完全一样。
             self.tx = float(cmd.get('x_m', self.tx))
             self.ty = float(cmd.get('y_m', self.ty))
             yaw_deg = cmd.get('yaw_deg')
@@ -241,6 +237,8 @@ class MotionPlannerNode(Node):
         elif name == 'enable':        # 使能/失能
             b = Bool()
             b.data = bool(cmd.get('en', True))
+            if b.data:
+                self._pub_unlock.publish(Bool(data=True))   # 使能前先解除失能锁存
             self._pub_enable.publish(b)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 使能={b.data}')
         elif name == 'calibrate':     # 视觉校准钩子（占位）

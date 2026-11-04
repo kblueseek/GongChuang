@@ -27,6 +27,9 @@ if ! dpkg -s "ros-${ROS_DISTRO}-desktop" >/dev/null 2>&1; then
 fi
 echo "  ROS2 ${ROS_DISTRO} 已安装。"
 
+echo "==> 2b/6 手柄驱动 joy 包（USB 手柄 -> /joy）"
+sudo apt-get install -y "ros-${ROS_DISTRO}-joy"
+
 echo "==> 3/6 串口（Pi <-> F407 USART6）"
 # 使能主 UART；Ubuntu 下 config.txt 可能位于 /boot/firmware 或 /boot
 CONFIG_TXT=/boot/firmware/config.txt

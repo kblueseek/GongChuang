@@ -607,6 +607,8 @@ def main():
 
     last_ms = 0.0
     last_key_frame = None
+    frame_times = []
+    measured_fps = 0.0
 
     while True:
         num, title, mode_name, note = STEPS[index]
@@ -647,9 +649,17 @@ def main():
                 result = {"error": f"{type(exc).__name__}: {exc}"}
             last_ms = (time.perf_counter() - started) * 1000.0
 
+        # 实测帧率：取最近 30 帧的时间窗，包含采集 + 处理 + 显示全过程
+        now = time.monotonic()
+        frame_times.append(now)
+        if len(frame_times) > 30:
+            frame_times.pop(0)
+        span = frame_times[-1] - frame_times[0] if len(frame_times) >= 2 else 0.0
+        measured_fps = (len(frame_times) - 1) / span if span > 0.0 else 0.0
+
         header = [
             f"[{num:>2}] {title}   mode={mode_name or 'none'}   "
-            f"cam={src or '-'}   {last_ms:.1f}ms",
+            f"cam={src or '-'}   {measured_fps:5.1f} FPS   {last_ms:.1f}ms",
             f"    {_UNDISTORT['note']}",
         ]
         body = [f"    {k} : {v}" for k, v in result.items()]

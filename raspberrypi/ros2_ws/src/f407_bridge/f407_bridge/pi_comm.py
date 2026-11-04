@@ -53,6 +53,8 @@ CMD_CAM = 0x06        # 相机舵机
 CMD_ENABLE = 0x07     # 电机使能（上电/断电）
 CMD_ESTOP = 0x08      # 急停（不带内容=置急停；带一个字节 0=解除急停）
 CMD_POSE = 0x09       # 位姿目标（走到世界系 (x,y) 并转到朝向 yaw，底盘位置+航向闭环）
+CMD_LED = 0x0A        # 补光灯亮度（0~100%，PWM 调光）
+CMD_UNLOCK = 0x0B     # 解除失能锁存（允许重新使能）
 CMD_HEARTBEAT = 0x10  # 心跳（定期发一次，告诉 F407 "我还活着"）
 
 # ==================== 回传数据编号 ====================
@@ -195,6 +197,13 @@ def encode_servo(pos_deg: float) -> bytes:
     return bytes([int(round(pos_deg))])   # 四舍五入成整数，塞进 1 个字节
 
 
+def encode_led(brightness_percent: float) -> bytes:
+    """补光灯亮度内容：一个字节，0~100（百分比）。"""
+    if not 0.0 <= brightness_percent <= 100.0:
+        raise PiCommError(f"补光灯亮度越界：{brightness_percent}")
+    return bytes([int(round(brightness_percent))])   # 四舍五入成整数，塞进 1 个字节
+
+
 def encode_enable(en: bool, mask: int = 0x7F) -> bytes:
     """使能指令内容：第1字节=是否使能(1/0)，第2字节=哪些电机(bit0~6 对应电机1~7)。
 
@@ -332,6 +341,12 @@ class PiCommLink:
 
     def send_cam(self, deg: float) -> bool:
         return self._send(CMD_CAM, encode_servo(deg))
+
+    def send_led(self, brightness_percent: float) -> bool:
+        return self._send(CMD_LED, encode_led(brightness_percent))
+
+    def send_unlock(self) -> bool:
+        return self._send(CMD_UNLOCK)   # 解除失能锁存（使能前必须先发）
 
     def send_enable(self, en: bool, mask: int = 0x7F) -> bool:
         return self._send(CMD_ENABLE, encode_enable(en, mask))

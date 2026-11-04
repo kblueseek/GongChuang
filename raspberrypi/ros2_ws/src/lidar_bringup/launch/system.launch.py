@@ -43,4 +43,19 @@ def generate_launch_description():
             name='motion_planner',
             output='screen',
         ),
+        # 5. 手柄驱动（USB 手柄 -> /joy，autorepeat 让摇杆按住时持续上报）
+        Node(
+            package='joy',
+            executable='joy_node',
+            name='joy_node',
+            output='screen',
+            parameters=[{'autorepeat_rate': 20.0}],
+        ),
+        # 6. 手柄控制（/joy -> 整车控制话题：运动/使能/云台/舵机/补光灯）
+        Node(
+            package='joy_control',
+            executable='joy_control_node',
+            name='joy_control',
+            output='screen',
+        ),
     ])

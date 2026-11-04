@@ -38,7 +38,7 @@
    目标恒为里程计零点 (0,0)，即上电位置。KP/KI 单位 (m/s)/m。 */
 #define CHASSIS_RETURN_KP        1.5f    /* 比例：1m 误差给 1.5 m/s（被 MAX_V 限住） */
 #define CHASSIS_RETURN_KI        0.3f    /* 积分：消除稳态误差，让车真正压到零点 */
-#define CHASSIS_RETURN_KD        0.0f    /* 微分：先关 */
+#define CHASSIS_RETURN_KD        0.2f    /* 微分：先关 */
 #define CHASSIS_RETURN_MAX_V     0.5f    /* 回零最大速度 m/s */
 #define CHASSIS_RETURN_I_MAX     0.3f    /* 积分项限幅 m/s */
 #define CHASSIS_RETURN_INTEGRAL_BAND 1.0f /* m，误差小于此值才积分，防大误差积分饱和 */

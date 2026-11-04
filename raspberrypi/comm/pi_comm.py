@@ -53,7 +53,10 @@ CMD_CAM = 0x06        # 相机舵机
 CMD_ENABLE = 0x07     # 电机使能（上电/断电）
 CMD_ESTOP = 0x08      # 急停（不带内容=置急停；带一个字节 0=解除急停）
 CMD_POSE = 0x09       # 位姿目标（走到世界系 (x,y) 并转到朝向 yaw，底盘位置+航向闭环）
+CMD_LED = 0x0A        # 补光灯亮度（0~100%，PWM 调光）
+CMD_UNLOCK = 0x0B     # 解除失能锁存（允许重新使能）
 CMD_HEARTBEAT = 0x10  # 心跳（定期发一次，告诉 F407 "我还活着"）
+CMD_VISION_STEP = 0x20  # 一个视觉步骤的结果。**调试/链路验证用**，F407 侧不实现这个命令
 
 # ==================== 回传数据编号 ====================
 # 这些是 F407 主动发给树莓派的"数据编号"（方向反过来）。编号都 >= 0x80，用最高位区分方向。
@@ -195,12 +198,58 @@ def encode_servo(pos_deg: float) -> bytes:
     return bytes([int(round(pos_deg))])   # 四舍五入成整数，塞进 1 个字节
 
 
+def encode_led(brightness_percent: float) -> bytes:
+    """补光灯亮度内容：一个字节，0~100（百分比）。"""
+    if not 0.0 <= brightness_percent <= 100.0:
+        raise PiCommError(f"补光灯亮度越界：{brightness_percent}")
+    return bytes([int(round(brightness_percent))])   # 四舍五入成整数，塞进 1 个字节
+
+
 def encode_enable(en: bool, mask: int = 0x7F) -> bytes:
     """使能指令内容：第1字节=是否使能(1/0)，第2字节=哪些电机(bit0~6 对应电机1~7)。
 
     mask 默认 0x7F = 二进制 0111 1111 = 7 个电机全选。
     """
     return bytes([1 if en else 0, mask & 0x7F])
+
+
+def encode_vision_step(step: int, rings=(), err_x_mm: float = 0.0,
+                       err_y_mm: float = 0.0, yaw_deg: float = 0.0) -> bytes:
+    """打包"一个视觉步骤的结果"（0x20），共 20 字节。
+
+    这个命令专门用来**验证数据链路**（树莓派 -> F103 -> 电脑），不是给 F407 用的：
+    帧格式和其它命令完全一样，只是内容换成视觉结果，方便串口助手直接看。
+
+    参数：
+        step     = 步骤号 1~13，0 表示行车
+        rings    = 环心像素坐标列表 [(x, y), ...]，最多 3 个，多给的会截掉
+        err_x_mm = 横向误差（毫米），内部乘 100 存成整数，即精度 0.01mm
+        err_y_mm = 纵向误差（毫米）
+        yaw_deg  = 工位航向（度），同样乘 100
+
+    内容布局（全部大端）：
+        0  u8  step        1  u8  rings
+        2  i16 ring0_x     4  i16 ring0_y
+        6  i16 ring1_x     8  i16 ring1_y
+       10  i16 ring2_x    12  i16 ring2_y
+       14  i16 err_x×100  16  i16 err_y×100   18  i16 yaw×100
+
+    没检出的环坐标填 0，靠 rings 字段说明实际有几个有效。
+    """
+    points = list(rings)[:3]                 # 最多 3 个环
+    while len(points) < 3:                   # 不足的补 0，保证固定 20 字节
+        points.append((0, 0))
+
+    payload = bytearray()                    # 和 build_frame 里一样，用可追加的容器
+    payload.append(step & 0xFF)              # 步骤号
+    payload.append(min(len(rings), 3))       # 实际有效环数
+    for x_px, y_px in points:                # 三组环心，各两个 16 位有符号整数
+        payload.extend(struct.pack(">hh", int(round(x_px)), int(round(y_px))))
+    payload.extend(struct.pack(">hhh",       # 误差和航向，各放大 100 倍存整数
+                               int(round(err_x_mm * 100)),
+                               int(round(err_y_mm * 100)),
+                               int(round(yaw_deg * 100))))
+    return bytes(payload)
 
 
 # ==================== 回传数据的解析 ====================
@@ -333,6 +382,12 @@ class PiCommLink:
     def send_cam(self, deg: float) -> bool:
         return self._send(CMD_CAM, encode_servo(deg))
 
+    def send_led(self, brightness_percent: float) -> bool:
+        return self._send(CMD_LED, encode_led(brightness_percent))
+
+    def send_unlock(self) -> bool:
+        return self._send(CMD_UNLOCK)   # 解除失能锁存（使能前必须先发）
+
     def send_enable(self, en: bool, mask: int = 0x7F) -> bool:
         return self._send(CMD_ENABLE, encode_enable(en, mask))
 
@@ -344,6 +399,13 @@ class PiCommLink:
 
     def send_heartbeat(self) -> bool:
         return self._send(CMD_HEARTBEAT)
+
+    def send_vision_step(self, step: int, rings=(), err_x_mm: float = 0.0,
+                         err_y_mm: float = 0.0, yaw_deg: float = 0.0) -> bool:
+        """发一个视觉步骤的结果（0x20），用于链路验证。"""
+        return self._send(CMD_VISION_STEP,
+                          encode_vision_step(step, rings, err_x_mm,
+                                             err_y_mm, yaw_deg))
 
     # ---------- 接收 ----------
     def poll(self) -> list[tuple[int, bytes]]:
@@ -411,28 +473,65 @@ class PiCommLink:
 
 if __name__ == "__main__":
     # 直接运行这个文件（不通过 ROS2），用来单独测试串口和协议是否打通：
-    #   python3 comm/pi_comm.py /dev/ttyAMA0
-    # 它会每秒发一次心跳，并把收到的帧打印出来。
+    #   python3 comm/pi_comm.py /dev/ttyAMA0              # 每秒发一次心跳
+    #   python3 comm/pi_comm.py /dev/ttyAMA0 --vision     # 循环发 13 步视觉帧
     import sys
 
-    device = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyAMA0"  # 从命令行读设备名
+    argv = sys.argv[1:]
+    vision_test = "--vision" in argv                          # 有没有 --vision
+    positional = [item for item in argv if not item.startswith("--")]
+    device = positional[0] if positional else "/dev/ttyAMA0"  # 从命令行读设备名
+
+    # 13 步的"模拟视觉结果"：(步骤号, 环心列表, err_x_mm, err_y_mm, yaw_deg)
+    # 接真实视觉时，把下面这张表换成 flow_state_machine 每步的检测结果即可。
+    VISION_STEPS = [
+        (1,  [],                                          0.0,  0.0,  0.0),  # 扫码
+        (2,  [],                                          0.0,  0.0,  0.0),  # 转盘对准
+        (3,  [],                                          0.0,  0.0,  0.0),  # 识别物料
+        (4,  [(380, 321), (633, 321), (889, 321)],       -0.3, -0.4,  0.0),  # 对准圆环2
+        (5,  [(380, 321), (633, 321), (889, 321)],       -0.2, -0.5,  0.0),  # 放料
+        (6,  [(380, 321), (633, 321), (889, 321)],       -0.2, -0.4,  0.0),  # 夹回
+        (7,  [(380, 321), (633, 321), (889, 321)],       -0.3, -0.3,  0.0),  # 暂存区
+        (8,  [],                                          0.0,  0.0,  0.0),  # 回转盘
+        (9,  [],                                          0.0,  0.0,  0.0),  # 第二批物料
+        (10, [(380, 321), (633, 321), (889, 321)],       -0.4, -0.2,  0.0),  # 对准圆环2
+        (11, [(380, 321), (633, 321), (889, 321)],       -0.3, -0.3,  0.0),  # 放料
+        (12, [(380, 321), (633, 321), (889, 321)],       -0.2, -0.4,  0.0),  # 夹回
+        (13, [(633, 321)],                                0.0,  0.0,  0.0),  # 码垛
+        (0,  [],                                          0.0,  0.0,  0.0),  # 行车
+    ]
+
     link = PiCommLink(device=device)
-    print(f"PiComm 自检：{device} @ {link.baudrate}，Ctrl-C 退出")
+    mode_text = "13 步视觉帧" if vision_test else "1Hz 心跳"
+    print(f"PiComm 自检：{device} @ {link.baudrate}，发送模式={mode_text}，Ctrl-C 退出")
+
+    vision_index = 0
+    last_send = 0.0
     last_hb = 0.0
     try:
         while True:
-            for cmd, data in link.poll():   # 收数据并打印
+            for cmd, data in link.poll():          # 收数据并打印
                 if cmd == RPT_ODOM:
                     print(f"  里程计: {parse_odom(data)}")
                 elif cmd == RPT_STATUS:
                     print(f"  状态: {parse_status(data)}")
                 else:
                     print(f"  帧: cmd=0x{cmd:02X} data={data.hex()}")
+
             now = time.monotonic()
-            if now - last_hb >= 1.0:        # 每秒发一次心跳
-                last_hb = now
-                link.send_heartbeat()
-                print(f"[{now:.0f}] heartbeat sent, connected={link.connected}")
+            if vision_test:
+                if now - last_send >= 0.2:         # 5Hz，跑完 14 帧约 2.8 秒一轮
+                    step, rings, ex, ey, yaw = VISION_STEPS[vision_index]
+                    ok = link.send_vision_step(step, rings, ex, ey, yaw)
+                    print(f"  step {step:>2}  rings={len(rings)}  "
+                          f"sent={ok}  connected={link.connected}")
+                    vision_index = (vision_index + 1) % len(VISION_STEPS)
+                    last_send = now
+            else:
+                if now - last_hb >= 1.0:           # 每秒发一次心跳
+                    last_hb = now
+                    link.send_heartbeat()
+                    print(f"[{now:.0f}] heartbeat sent, connected={link.connected}")
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("\n退出")
