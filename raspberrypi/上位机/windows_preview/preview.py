@@ -41,6 +41,7 @@ TICK_MS = 50            # 模拟器步长
 MAX_V = 0.9             # m/s，演示用，比实车快一点
 MAX_W_DEG = 120.0       # °/s
 DELAY_SCALE = 0.35      # 动作里的等待时间按比例缩短，演示不干等
+TURN_SETTLE = 0.15      # s，到点停稳后再原地转（和 motion_planner 一致）
 GIMBAL_RATE = 150.0     # °/s
 SCRIPT_WAIT = 0.8       # script/align/vision_pick 在预览里只停一下
 EPS_M = 0.004
@@ -64,6 +65,9 @@ class PreviewSim:
         self.yaw = 0.0
         self.target = None          # (x, y, yaw_rad)，正在逼近的位姿
         self.wait_yaw = True        # 到点是否必须等车头也转好（中间航点为 False）
+        self.hold_yaw = 0.0         # 行进段锁住的车头朝向（出发时的 yaw）
+        self.sub = 'move'           # move / settle / turn：先走到位，再原地转
+        self.sub_until = 0.0        # settle 的结束时刻
         self.gimbal = [0.0, 0.0, 0.0]
         self.gimbal_tgt = [0.0, 0.0, 0.0]
         self.gripper = 120.0
@@ -136,6 +140,7 @@ class PreviewSim:
             self.cmds = [c for c in cmds if isinstance(c, dict)]
             self.i = 0
             self.target = None
+            self.sub = 'move'
             self.wait_until = 0.0
             self._set_state('moving' if self.cmds else 'idle')
 
@@ -147,6 +152,7 @@ class PreviewSim:
                 self.cmds = []
                 self.i = 0
                 self.target = None
+                self.sub = 'move'
                 self.wait_until = 0.0
                 self._set_state('idle')
 
@@ -210,8 +216,11 @@ class PreviewSim:
             if self.target is None:
                 self.target = self._target_of(cmd)
                 self.wait_yaw = bool(cmd.get('arrive_yaw', True))
+                # 先走到位、再转向：行进段锁住出发朝向，到点停稳后才原地转。
+                self.hold_yaw = self.yaw
+                self.sub = 'move'
                 self._set_state('moving')
-            if self._step_toward(dt):
+            if self._step_toward(now, dt):
                 self.i += 1
                 self.target = None
             else:
@@ -271,32 +280,40 @@ class PreviewSim:
                     self.yaw + math.radians(float(cmd.get('deg', 0) or 0)))
         return (self.x, self.y, self.yaw)
 
-    def _step_toward(self, dt):
-        """朝 target 直线靠近，同时限速转向；到了返回 True。"""
+    def _step_toward(self, now, dt):
+        """先平移到位（车头锁住不转），停稳后再原地转向；全部完成返回 True。"""
         tx, ty, tyaw = self.target
         dx, dy = tx - self.x, ty - self.y
         dist = math.hypot(dx, dy)
+
+        if self.sub == 'move':
+            if dist > EPS_M:
+                step = min(MAX_V * dt, dist)
+                self.x += dx / dist * step
+                self.y += dy / dist * step
+                return False
+            self.x, self.y = tx, ty
+            if not self.wait_yaw or abs(wrap_deg(math.degrees(tyaw - self.yaw))) <= EPS_DEG:
+                self.yaw = tyaw
+                return True
+            # 位置到了但要转向：先停稳
+            self.sub = 'settle'
+            self.sub_until = now + TURN_SETTLE
+            return False
+
+        if self.sub == 'settle':
+            if now < self.sub_until:
+                return False
+            self.sub = 'turn'
+            return False
+
+        # turn：原地转，位置保持不变
         dyaw = wrap_deg(math.degrees(tyaw - self.yaw))
-
-        done_xy = dist <= EPS_M
-        done_yaw = abs(dyaw) <= EPS_DEG
-        if done_xy and (done_yaw or not self.wait_yaw):
-            if done_yaw:
-                self.x, self.y, self.yaw = tx, ty, tyaw
-            else:
-                # 中间航点：位置到了就继续，车头在去下一点的路上接着转
-                self.x, self.y = tx, ty
+        if abs(dyaw) <= EPS_DEG:
+            self.yaw = tyaw
             return True
-
-        if not done_xy:
-            step = min(MAX_V * dt, dist)
-            self.x += dx / dist * step
-            self.y += dy / dist * step
-
-        if not done_yaw:
-            wstep = MAX_W_DEG * dt
-            self.yaw += math.radians(max(-wstep, min(wstep, dyaw)))
-
+        wstep = MAX_W_DEG * dt
+        self.yaw += math.radians(max(-wstep, min(wstep, dyaw)))
         self.yaw = math.radians(wrap_deg(math.degrees(self.yaw)))
         return False
 
@@ -313,6 +330,8 @@ class PreviewSim:
 
     def _publish_target(self):
         tx, ty, tyaw = self.target or (self.x, self.y, self.yaw)
+        if self.target is not None and self.sub in ('move', 'settle'):
+            tyaw = self.hold_yaw     # 行进/停稳阶段车头锁在出发朝向
         m = Pose2D()
         m.x, m.y, m.theta = tx, ty, tyaw
         self.node._cb_pose_target(m)

@@ -52,6 +52,20 @@
 
 坐标约定：车正前方为 +x，左侧为 +y，逆时针为正。和 F407 的里程计/陀螺仪一致。
 align 的修正量也在这个里程计世界系里（米 / 度）。
+
+================ 动作执行策略：先走到位，再原地转向 ================
+
+F407 的位置环和航向环是同时收敛的：一个 POSE 帧里同时给 (x, y, yaw)，
+车会一边平移一边转。麦轮边走边转时轮子打滑，里程计（车体位移按 IMU yaw
+旋转到世界系）误差会明显变大。
+
+所以走 / 去某点分两段执行：
+  1. 行进段：目标位置 = 终点，目标朝向 = **出发时的当前朝向**。车头锁住、
+     只平移（全向底盘可以直接横移），不旋转 → 里程计干净。
+  2. 到点后按 turn_settle_s 停稳，再把目标朝向改成终点要求的 yaw，
+     原地转向到位；还要连续 turn_hold_s 稳定在容差内才允许走下一步。
+中间的航点（goto 带 arrive_yaw=false）只走第 1 段：一路保持出发朝向，
+既不在半路转，也不等朝向，直到最后一个航点才原地转。
 """
 
 import json        # 解析/生成 JSON（指令序列就是 JSON）
@@ -81,6 +95,12 @@ class MotionPlannerNode(Node):
         # 单个走/转/去指令最多等多久。到位判据很严（2cm/3°），F407 超调后
         # 可能来回摆很久；不设上限的话状态机会永远卡在这一条。
         self.declare_parameter('arrive_timeout_s', 20.0)  # 秒
+        # 位置到位后、原地转向前的停稳时间：让底盘先把平移速度收干净，
+        # 避免"还在往前滑的时候开始转"带偏位置。
+        self.declare_parameter('turn_settle_s', 0.3)      # 秒
+        # 转向到位后的确认时间：必须连续这么久都在容差内，才允许开始下一条
+        # （否则车还有角速度、或 odom 噪声恰好扫过容差，就会"没转到位就开走"）。
+        self.declare_parameter('turn_hold_s', 0.3)        # 秒
         # 启动时自动加载的序列文件路径（空 = 不加载，等上位机下发）
         self.declare_parameter('sequence_file', '')
         # 视觉程序的默认位置：动作序列里的 script / align / vision_pick 没写
@@ -93,6 +113,8 @@ class MotionPlannerNode(Node):
         self.arrive_tol_xy = float(self.get_parameter('arrive_tol_xy').value)
         self.arrive_tol_yaw = float(self.get_parameter('arrive_tol_yaw').value)
         self.arrive_timeout_s = float(self.get_parameter('arrive_timeout_s').value)
+        self.turn_settle_s = float(self.get_parameter('turn_settle_s').value)
+        self.turn_hold_s = float(self.get_parameter('turn_hold_s').value)
         sequence_file = str(self.get_parameter('sequence_file').value)
         self.default_script_timeout = float(self.get_parameter('script_timeout_s').value)
 
@@ -116,17 +138,24 @@ class MotionPlannerNode(Node):
         self.odom = None            # 最新里程计 (x, y, theta)，单位 米/米/弧度
         self.commands = []          # 指令序列（list of dict）
         self.index = -1             # 当前执行到第几条（-1 = 还没开始）
-        self.phase = 'idle'         # 状态机状态：idle/moving/waiting/stepping
+        # 状态机状态：
+        #   idle 空闲 / stepping 连续执行 / moving 平移中 / settling 到点停稳
+        #   turning 原地转向 / waiting 等延时 / proc 等子程序
+        self.phase = 'idle'
         self.deadline = 0.0         # delay 指令的到期时间
-        self.move_deadline = 0.0    # 本条走/转/去指令的超时时间
+        self.move_deadline = 0.0    # 当前阶段（走/停稳/转）的超时时间
 
         # 绝对位姿目标（世界系）：从"当前里程计"出发，逐条指令累计
         self.tx = 0.0
         self.ty = 0.0
         self.tyaw = 0.0
+        # 行进段锁定的车头朝向：出发那一刻的里程计 yaw。平移期间 POSE 帧的
+        # theta 一直发它，F407 航向环把车头锁住，车只平移不转。
+        self.move_yaw = 0.0
+        # 转向到位后开始计时的时刻；必须连续稳定 turn_hold_s 才放行。
+        self.yaw_stable_since = 0.0
         # 到达当前目标时是否必须等车头也转到位。goto 可以带 arrive_yaw=False：
-        # 中间航点只等位置，车头在行进中继续转（F407 航向环一直在跟 tyaw），
-        # 避免每到一个拐点就停下来原地甩车头。
+        # 中间航点只走平移段，不转向、也不等朝向；最后一个航点才原地转。
         self.wait_yaw = True
 
         # 舵机角度镜像（F407 上电默认：夹爪90 托盘0 相机90），供 plate/cam 单独设值时补齐整组
@@ -216,6 +245,7 @@ class MotionPlannerNode(Node):
             return
         self._kill_proc()                           # 上一条序列残留的脚本先收掉
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
+        self.yaw_stable_since = 0.0
         self.index = -1
         self.phase = 'stepping'                     # 进入执行循环
         self._pub_active.publish(Bool(data=True))   # 立刻占控制权，别等到第一个 _tick
@@ -236,15 +266,58 @@ class MotionPlannerNode(Node):
             if self.phase != 'stepping':
                 return
         if self.phase == 'moving':
-            if not self._arrived():      # 还没到位，继续等
+            if not self._arrived_xy():   # 位置还没到，继续平移
                 if self.move_deadline and self._now() > self.move_deadline:
                     self._abort_timeout()   # 超时：锁定当前位置，交还控制权
                     return
                 # 周期重发目标位姿：F407 收到任何 VEL 帧都会清掉 PosTarget.Valid，
                 # 重发能保证偶发的速度帧（比如 B 键失能那一帧）不会让闭环中断。
+                # 注意 theta 发 move_yaw（出发朝向），行进段不转车头。
+                self._publish_pose(self.tx, self.ty, self.move_yaw)
+                return
+            # 位置到点了。不需要转 / 朝向已经够准 → 直接下一条；
+            # 否则先停稳，再原地转向。
+            if not self.wait_yaw or self._arrived_yaw():
+                self.phase = 'stepping'
+            else:
+                self._publish_pose(self.tx, self.ty, self.move_yaw)
+                self.phase = 'settling'
+                self.move_deadline = self._now() + max(0.0, self.turn_settle_s)
+                self._publish_state(
+                    f'位置到位，停稳 {max(0.0, self.turn_settle_s):.1f}s 后原地转向 '
+                    f'{math.degrees(self.tyaw):+.0f}°')
+                return
+        elif self.phase == 'settling':
+            if self._now() < self.move_deadline:   # 还在停稳
+                self._publish_pose(self.tx, self.ty, self.move_yaw)
+                return
+            # 停稳结束：下发最终朝向，车原地转。
+            self._publish_pose(self.tx, self.ty, self.tyaw)
+            self.phase = 'turning'
+            self.move_deadline = self._now() + self.arrive_timeout_s
+            self.yaw_stable_since = 0.0
+            self._publish_state(f'原地转向 {math.degrees(self.tyaw):+.0f}°')
+            return
+        elif self.phase == 'turning':
+            if self._arrived_yaw():
+                # 进入容差只是"可能到了"：F407 可能还带着角速度，odom 噪声
+                # 也可能恰好扫过容差。必须连续 turn_hold_s 都在容差内才放行，
+                # 否则下一段平移会和残余转动叠在一起（看起来就是没转到位就开走）。
+                if self.yaw_stable_since <= 0.0:
+                    self.yaw_stable_since = self._now()
+                if self._now() - self.yaw_stable_since >= max(0.0, self.turn_hold_s):
+                    self.yaw_stable_since = 0.0
+                    self.phase = 'stepping'
+                else:
+                    self._publish_pose(self.tx, self.ty, self.tyaw)
+                    return
+            else:
+                self.yaw_stable_since = 0.0   # 又转出容差了，重新计时
+                if self.move_deadline and self._now() > self.move_deadline:
+                    self._abort_timeout()
+                    return
                 self._publish_pose(self.tx, self.ty, self.tyaw)
                 return
-            self.phase = 'stepping'      # 到位了，去取下一条
         elif self.phase == 'waiting':
             if self._now() < self.deadline:   # 还没到时间，继续等
                 return
@@ -257,16 +330,17 @@ class MotionPlannerNode(Node):
                 self._finish()
                 return
             self._execute(self.commands[self.index])
-            if self.phase == 'moving':
-                # 从这一条开始计时。到位后 phase 变 stepping，下一条重新计时。
+            if self.phase in ('moving', 'turning'):
+                # 从这一条开始计时。本阶段结束/转段时会重新计时。
                 self.move_deadline = self._now() + self.arrive_timeout_s
             else:
                 self.move_deadline = 0.0
 
     def _execute(self, cmd: dict):
         """执行一条指令。返回后 self.phase 会是：
-           - moving/waiting：阻塞型，等完成
+           - moving/turning/waiting：阻塞型，等完成
            - stepping：非阻塞型，继续下一条
+        moving 到位后若还要转，会由 _tick 转成 settling → turning。
         """
         # 默认要求位置和朝向都到位；goto 可以显式关掉朝向等待。
         self.wait_yaw = True
@@ -275,30 +349,36 @@ class MotionPlannerNode(Node):
             d = float(cmd.get('dist_m', 0.0))
             self.tx += d * math.cos(self.tyaw)
             self.ty += d * math.sin(self.tyaw)
-            self._publish_pose(self.tx, self.ty, self.tyaw)
+            # 行进段锁住出发时的车头朝向，只平移不转（tyaw 本身没变）。
+            self.move_yaw = self._hold_yaw()
+            self._publish_pose(self.tx, self.ty, self.move_yaw)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 前进 {d:+.2f}m')
             self.phase = 'moving'
         elif name == 'strafe':        # 横向平移（正=左）
             d = float(cmd.get('dist_m', 0.0))
             self.tx += d * math.cos(self.tyaw + math.pi / 2.0)
             self.ty += d * math.sin(self.tyaw + math.pi / 2.0)
-            self._publish_pose(self.tx, self.ty, self.tyaw)
+            self.move_yaw = self._hold_yaw()
+            self._publish_pose(self.tx, self.ty, self.move_yaw)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 横移 {d:+.2f}m')
             self.phase = 'moving'
-        elif name == 'turn':          # 原地转
+        elif name == 'turn':          # 原地转：位置不变，直接进转向段
             d = math.radians(float(cmd.get('deg', 0.0)))
             self.tyaw += d
             self._publish_pose(self.tx, self.ty, self.tyaw)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 转向 {cmd.get("deg", 0):+.0f}°')
-            self.phase = 'moving'
+            self.yaw_stable_since = 0.0
+            self.phase = 'turning'
         elif name == 'goto':          # 绝对位姿（里程计世界系，米/度）
             self.tx = float(cmd.get('x_m', self.tx))
             self.ty = float(cmd.get('y_m', self.ty))
             if cmd.get('yaw_deg') is not None:
                 self.tyaw = math.radians(float(cmd['yaw_deg']))
-            # 中间航点 arrive_yaw=False：到了位置就继续，车头还在转也不等
+            # 中间航点 arrive_yaw=False：只走平移段，不转向、也不等朝向
             self.wait_yaw = bool(cmd.get('arrive_yaw', True))
-            self._publish_pose(self.tx, self.ty, self.tyaw)
+            # 第一段：位置去终点，朝向锁在出发朝向 → 先走到，再转
+            self.move_yaw = self._hold_yaw()
+            self._publish_pose(self.tx, self.ty, self.move_yaw)
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] 去 '
                 f'({self.tx:+.2f},{self.ty:+.2f})m '
@@ -587,7 +667,12 @@ class MotionPlannerNode(Node):
         self.tx += dx
         self.ty += dy
         self.tyaw += dyaw
-        self._publish_pose(self.tx, self.ty, self.tyaw)
+        # 视觉校准必须把位置和朝向都修正到位。wait_yaw 是上一条指令留下的，
+        # 如果上一条是中间航点(arrive_yaw=False)，这里会被误判成"不用转"。
+        self.wait_yaw = True
+        # 同样先平移到位、再原地修正朝向。
+        self.move_yaw = self._hold_yaw()
+        self._publish_pose(self.tx, self.ty, self.move_yaw)
         self.move_deadline = time.monotonic() + self.arrive_timeout_s
         self._publish_state(
             f'视觉校准：修正 dx={dx:+.3f}m dy={dy:+.3f}m '
@@ -657,24 +742,27 @@ class MotionPlannerNode(Node):
 
     # ---------------- 工具函数 ----------------
 
-    def _arrived(self) -> bool:
-        """判断里程计是否到达绝对目标 (tx, ty, tyaw)。
-
-        wait_yaw=False 时只要求位置到点：中间航点不等车头转完，
-        这样朝向变化会摊到整段行走过程里，而不是每个拐点原地转。
-        最后一个航点仍然要求位置+朝向都到位。
-        """
+    def _arrived_xy(self) -> bool:
+        """位置是否到达绝对目标 (tx, ty)。行进段只判位置，不判朝向。"""
         if self.odom is None:
             return False
-        ox, oy, ot = self.odom
+        ox, oy, _ = self.odom
         dx = ox - self.tx
         dy = oy - self.ty
-        if (dx * dx + dy * dy) >= self.arrive_tol_xy ** 2:
+        return (dx * dx + dy * dy) < self.arrive_tol_xy ** 2
+
+    def _arrived_yaw(self) -> bool:
+        """车头是否转到绝对目标 tyaw。"""
+        if self.odom is None:
             return False
-        if not self.wait_yaw:
-            return True
-        dh = abs(self._angle_diff(ot, self.tyaw))
-        return dh < self.arrive_tol_yaw
+        return abs(self._angle_diff(self.odom[2], self.tyaw)) < self.arrive_tol_yaw
+
+    def _hold_yaw(self) -> float:
+        """行进段要锁住的车头朝向 = 出发那一刻的里程计 yaw。
+
+        还没有里程计（理论上一开始就会拦）时退回当前目标朝向。
+        """
+        return self.odom[2] if self.odom is not None else self.tyaw
 
     @staticmethod
     def _angle_diff(a: float, b: float) -> float:
