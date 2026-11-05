@@ -38,6 +38,7 @@
 #include "Servo.h"
 #include "Led.h"
 #include "JY901S.h"
+#include "MSPM0imu.h"
 #include "PiComm.h"
 #if BLE_CONTROL_ENABLE
 #include "BleControl.h"

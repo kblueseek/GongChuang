@@ -49,9 +49,21 @@ enum
 
 /* ==================== 底盘（麦克纳姆 X 布局） ==================== */
 
-#define WHEEL_RADIUS_M          0.03925f /* 轮半径 m（实测直径 78.5mm） */
-#define WHEEL_HALF_WHEELBASE_M  0.15f   /* 半轴距 m（前后轮距/2） */
-#define WHEEL_HALF_TRACK_M      0.15f   /* 半轮距 m（左右轮距/2） */
+#define WHEEL_RADIUS_M          0.039f  /* 轮半径 m（实测直径 78mm；精确标定用 scripts/calibrate_wheel.py 反算） */
+#define WHEEL_HALF_WHEELBASE_M  0.1075f /* 半轴距 m = 前后轮距 21.5cm / 2（实测）
+                                           ⚠ 影响旋转项：麦轮逆解算 Wz·(Lx+Ly) 和里程计 dθ。
+                                           配错会让"发多少转多少"差出几十个百分点 */
+#define WHEEL_HALF_TRACK_M      0.11f   /* 半轮距 m = 左右轮距 22cm / 2（实测） */
+
+/* 位置环 前进/横移 方向增益补偿（各向异性补偿）。
+   麦轮横移靠辊子摩擦，同样轮速下实际横移比前移慢（实测约 5~15%，辊子角
+   偏离 45° 也会体现为这个偏差）。不补偿时，斜向行驶的速度向量被拧偏 →
+   走弧线收进目标；补偿后位置环看到的 plant 各向同性。
+   标定法（手柄速度模式）：0.2m/s 前移 1m 计时 t_x；0.2m/s 横移 1m 计时 t_y；
+   AXIS_GAIN_Y ≈ t_y / t_x（横移慢 → 比值 > 1）。
+   只作用于位置环输出；手柄速度模式保持原始手感。 */
+#define CHASSIS_AXIS_GAIN_X     1.00f
+#define CHASSIS_AXIS_GAIN_Y     1.00f
 
 #define CHASSIS_MAX_SPEED_X     1.0f    /* 前进最大速度 m/s（摇杆满量程对应的值） */
 #define CHASSIS_MAX_SPEED_Y     1.0f    /* 平移最大速度 m/s（摇杆满量程对应的值） */
@@ -159,9 +171,15 @@ enum
 #define PI_GIMBAL_RPT_FREQ_HZ   20   /* 云台三轴位置回传频率 */
 #define PI_STATUS_FREQ_MS       200  /* 状态回传周期（5Hz） */
 
-/* ==================== JY901S 陀螺仪（USART3） ==================== */
+/* ==================== 陀螺仪选型（USART3，两种模组都用 115200） ====================
+   1 = MSPM0G3507 + XV7011 单轴(Z)模组（新；上电自动把输出率提到 200Hz）
+   0 = JY901S 九轴（旧；输出率取决于模块自身配置，默认 ~10Hz）
+   接线不同：M0 模组 TX→PA10 即可；切回 JY901S 时模块需已用维特工具改成 115200。
+   切换只改这一个宏，重新编译烧录。 */
 
-#define JY901S_OFFLINE_MS   200     /* 陀螺仪失联判定 */
+#define IMU_USE_MSPM0       1
+
+#define JY901S_OFFLINE_MS   200     /* 陀螺仪失联判定（两种模组通用） */
 
 /* ==================== 旧版小程序蓝牙遥控（USART2，已停用） ==================== */
 /* 这个是早期的微信小程序文本协议（[joystick,...]）。现在 USART2 已经用作

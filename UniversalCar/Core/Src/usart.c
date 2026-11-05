@@ -550,7 +550,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 #endif
         HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
     } else if (huart->Instance == USART3) {
-        JY901S_RxByte(uart3_rx_byte);
+#if IMU_USE_MSPM0
+        MSPM0IMU_RxByte(uart3_rx_byte);   /* MSPM0+XV7011 单轴陀螺仪模组 */
+#else
+        JY901S_RxByte(uart3_rx_byte);     /* JY901S 九轴陀螺仪 */
+#endif
         HAL_UART_Receive_IT(&huart3, &uart3_rx_byte, 1);
     }
     /* UART5 不再用于电机（已切回 CAN），不在此处理 */

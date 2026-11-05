@@ -22,7 +22,7 @@ void DebugTask(void const* argument)
     {
         osDelayUntil(&PreviousWakeTime, DEBUG_TASK_UPDATE_TICK);
         DebugData.Value[0] = PiCommand.Enabled;      // 0=失能 1=使能
-        DebugData.Value[1] = JY901S.Angle[2];
+        DebugData.Value[1] = Imu.Yaw;                // 陀螺仪 yaw（新 MSPM0+XV7011，经 Imu_t 统一出口）
         DebugData.Value[2] = Chassis.HeadingPid.Output;
         DebugData.Value[3] = PiCommand.Gripper;
         DebugData.Value[4] = Chassis.Wheel[0].Position.Real;

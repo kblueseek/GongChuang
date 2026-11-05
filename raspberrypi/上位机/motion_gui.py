@@ -774,6 +774,8 @@ class App:
         ttk.Button(row, text='导出', command=self._export_nodes).pack(side=tk.LEFT, padx=2)
         ttk.Button(row, text='用当前序列填充', command=self._copy_seq_to_node).pack(
             side=tk.LEFT, padx=2)
+        ttk.Button(row, text='预览完整序列', command=self._preview_mission_sequence).pack(
+            side=tk.LEFT, padx=2)
 
         self._reload_node_list()
         if self.nodes:
@@ -953,7 +955,8 @@ class App:
 
         wf = ttk.LabelFrame(tab, text='右边波形', padding=3)
         wf.pack(fill=tk.X, pady=(4, 0))
-        for text, value in (('位置环', 'pos'), ('转向环', 'yaw'), ('云台环', 'gimbal')):
+        for text, value in (('位置环', 'pos'), ('转向环', 'yaw'),
+                            ('云台环', 'gimbal'), ('XY轨迹', 'xy')):
             ttk.Radiobutton(wf, text=text, value=value, variable=self.wave_mode,
                             command=self._redraw_wave).pack(side=tk.LEFT, padx=2)
         self.cb_wave_axis = ttk.Combobox(wf, width=7, state='readonly',
@@ -1167,6 +1170,16 @@ class App:
                     f'误差 {wrap_deg(ty - ay):+.1f}°')
             else:
                 self.wave_info.set('转向环：等待 /cmd_pose 与 /odom…')
+        elif mode == 'xy':
+            if self.wave_pos:
+                tx, ty, ax, ay = self.wave_pos[-1]
+                self.wave_info.set(
+                    f'XY 轨迹   目标 ({tx:+.3f}, {ty:+.3f}) m   '
+                    f'实际 ({ax:+.3f}, {ay:+.3f}) m   '
+                    f'误差 {math.hypot(tx - ax, ty - ay) * 1000:.0f} mm   '
+                    f'窗口 {len(self.wave_pos) / 10:.0f}s')
+            else:
+                self.wave_info.set('XY 轨迹：等待 /cmd_pose 与 /odom…')
         else:
             axis = self.wave_axis.get()
             names = ('yaw', 'lift', 'extend')
@@ -1187,6 +1200,10 @@ class App:
         if w < 40 or h < 40:
             return
         mode = self.wave_mode.get()
+        if mode == 'xy':
+            self._draw_wave_xy(c, w, h)
+            self._update_wave_info()
+            return
         if mode == 'pos':
             panels = [
                 ('X 位置 (m)', self.wave_pos, 0, 2, '#1f6fd6'),
@@ -1201,6 +1218,89 @@ class App:
                        axis, 3 + axis, '#008c50')]
         self._draw_wave_panels(c, w, h, panels)
         self._update_wave_info()
+
+    def _draw_wave_xy(self, c, w, h):
+        """XY 轨迹视图：目标与实际在里程计平面上的轨迹（x/y 等比例，不拉伸）。
+
+        实线=实际轨迹，灰色虚线=目标轨迹（阶梯形状是目标逐步下发的自然结果），
+        黑十字=当前目标点，红圈=当前实际位置。
+        """
+        if not self.wave_pos:
+            c.create_text(w / 2, h / 2, text='等待数据…', fill='#aaa')
+            return
+        # 里程计系 → 场地朝向（只旋转：odom = R(-dq)·field，所以显示时用 R(+dq)
+        # 转回来；平移差无关紧要，视图自动取包围盒）。这样轨迹图和左边地图页
+        # 永远同向；当前校准 dq=180° 时就是整个图像旋转 180°。
+        dq = 0.0
+        if self.odom_start[2] is not None:
+            dq = math.radians(self.robot_start[2] - self.odom_start[2])
+        cd, sd = math.cos(dq), math.sin(dq)
+        pts = [(cd * p[0] - sd * p[1], sd * p[0] + cd * p[1],
+                cd * p[2] - sd * p[3], sd * p[2] + cd * p[3])
+               for p in self.wave_pos]
+        left, right, top, bottom = 54, 10, 16, 22
+        xs, ys = [], []
+        for t in pts:
+            xs.extend((t[0], t[2]))     # 目标x、实际x
+            ys.extend((t[1], t[3]))     # 目标y、实际y
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        if x1 - x0 < 0.2:
+            x0 -= 0.5
+            x1 += 0.5
+        if y1 - y0 < 0.2:
+            y0 -= 0.5
+            y1 += 0.5
+        x0 -= (x1 - x0) * 0.1
+        x1 += (x1 - x0) * 0.1
+        y0 -= (y1 - y0) * 0.1
+        y1 += (y1 - y0) * 0.1
+        # x/y 用同一个比例尺，弧线/直线才是真实形状（不等比例会掩盖跑偏）
+        scale = min((w - left - right) / (x1 - x0), (h - top - bottom) / (y1 - y0))
+        ox = left + (w - left - right - (x1 - x0) * scale) / 2.0
+        oy = top + (h - top - bottom - (y1 - y0) * scale) / 2.0
+
+        def px(x):
+            return ox + (x - x0) * scale
+
+        def py(y):
+            return oy + (y1 - y) * scale
+
+        c.create_rectangle(px(x0), py(y1), px(x1), py(y0), outline='#dcdcdc')
+        c.create_text(left + 4, top - 4, anchor='w', fill='#444',
+                      font=('', 9, 'bold'),
+                      text='XY 轨迹 (m，场地朝向)   实线=实际   虚线=目标')
+        for k in range(5):
+            gx = x0 + (x1 - x0) * k / 4.0
+            gy = y0 + (y1 - y0) * k / 4.0
+            c.create_line(px(gx), py(y0), px(gx), py(y1), fill='#f0f0f0')
+            c.create_line(px(x0), py(gy), px(x1), py(gy), fill='#f0f0f0')
+            c.create_text(px(gx), py(y0) + 12, fill='#999',
+                          font=('Consolas', 8), text=f'{gx:.2f}')
+            c.create_text(px(x0) - 5, py(gy), anchor='e', fill='#999',
+                          font=('Consolas', 8), text=f'{gy:.2f}')
+
+        tgt = [v for p in pts for v in (px(p[0]), py(p[1]))]
+        act = [v for p in pts for v in (px(p[2]), py(p[3]))]
+        if len(tgt) >= 4:
+            c.create_line(*tgt, fill='#999999', width=1, dash=(4, 3))
+        if len(act) >= 4:
+            c.create_line(*act, fill='#1f6fd6', width=2)
+
+        lx, ly = px(pts[-1][0]), py(pts[-1][1])
+        c.create_line(lx - 7, ly, lx + 7, ly, fill='#333333', width=2)
+        c.create_line(lx, ly - 7, lx, ly + 7, fill='#333333', width=2)
+        c.create_text(lx + 10, ly - 10, anchor='w', fill='#333', font=('', 8),
+                      text='目标')
+        ax_, ay_ = px(pts[-1][2]), py(pts[-1][3])
+        c.create_oval(ax_ - 4, ay_ - 4, ax_ + 4, ay_ + 4, outline='#d62728', width=2)
+        c.create_text(ax_ + 10, ay_ + 6, anchor='w', fill='#d62728', font=('', 8),
+                      text='实际')
+        # 0.5m 比例尺
+        bar = 0.5 * scale
+        bx, by = px(x1) - bar - 10, py(y0) - 10
+        c.create_line(bx, by, bx + bar, by, fill='#555555', width=2)
+        c.create_text(bx + bar / 2, by - 8, fill='#555', font=('', 8), text='0.5m')
 
     def _draw_wave_panels(self, c, w, h, panels):
         """每个 panel = (标题, 序列, 目标下标, 实际下标, 实际颜色)。"""
@@ -2218,52 +2318,13 @@ class App:
           先去第 1 点 → 第 1 点动作 → 第 1→2 段路径 → 第 2 点动作 → … → 第 9 点动作
         pick/place 的宏展开在 motion_planner 载入时做；vision_pick/align 在
         执行到那一条时启动视觉程序，并用程序输出的 JSON 改目标/插动作。
+        序列本身由 _build_mission_commands 组装，【预览完整序列】按钮也用它，
+        两种入口看到的内容完全一致。
         """
-        if not self.nodes:
-            messagebox.showwarning('没有节点', '【节点动作序列】页还没有任何节点')
+        cmds, err = self._build_mission_commands()
+        if cmds is None:
+            messagebox.showwarning('无法生成任务序列', err)
             return
-        routes = self._node_routes()
-        if len(routes) < 2:
-            messagebox.showwarning('节点太少', '至少需要 2 个节点才能组成路线')
-            return
-
-        self.plan_mission()
-        if not self.mission_legs:
-            return
-        bad = [i for i, leg in enumerate(self.mission_legs) if not leg['ok']]
-        if bad:
-            messagebox.showerror(
-                '有段不通',
-                f'第 {",".join(str(i + 1) for i in bad)} 段规划失败（共 '
-                f'{len(self.mission_legs)} 段）。\n先处理障碍，或在节点页改路线点。')
-            return
-
-        headings = self._mission_headings()
-        cmds = [{'cmd': 'comment',
-                 'text': f'九点任务：{len(self.nodes)} 个节点 / {len(self.mission_legs)} 段'}]
-        # 车不在第 1 点时，先规划一段过去，避免第一段从远处斜穿场地
-        first = self.mission_legs[0]['from_xy']
-        cur = self._robot_field()[:2]
-        if math.hypot(cur[0] - first[0], cur[1] - first[1]) > 150.0:
-            res = mapping.plan_path(
-                self.grid, self.mask, self.obstacles,
-                self.grid.w2c(*cur), self.grid.w2c(*first),
-                self.field.robot_radius, cell_block=self._cell_block(),
-                cost_fn=self._cost_fn())
-            if not res['path']:
-                messagebox.showerror('到不了起点',
-                                     f'从当前位置到第 1 个节点不通：{res["note"]}')
-                return
-            # 到第 1 个节点时，车头已经摆成第一段出发的朝向
-            cmds += self._path_commands(res['path_world'], '先去第 1 个节点',
-                                        fixed_yaw_deg=headings[0])
-        self._append_node_actions(cmds, 0)
-        for i, leg in enumerate(self.mission_legs):
-            cmds += self._path_commands(
-                leg['path'], f'{i + 1}. {leg["from_name"]} → {leg["to_name"]}',
-                start_yaw_deg=headings[i],
-                fixed_yaw_deg=leg.get('final_yaw'))
-            self._append_node_actions(cmds, i + 1)
 
         # ---- 没有里程计 / 起点没标定：只填序列，不下发 ----
         if self.node.odom is None or self.odom_start[2] is None:
@@ -2288,6 +2349,190 @@ class App:
         n_act = sum(1 for c in cmds if c['cmd'] not in ('goto', 'comment'))
         self._set_status(
             f'已下发九点任务：{n_goto} 个路点 + {n_act} 个节点动作，motion_planner 接管…')
+
+    def _build_mission_commands(self):
+        """把"九点任务"组装成 motion_planner 会收到的完整指令序列
+        （路点 goto + 每点动作），只组装、不发送。
+
+        返回 (cmds, None)；组装不了返回 (None, 原因)。
+        execute_mission 用它下发，【预览完整序列】用它填进动作序列页检查。
+        """
+        if not self.nodes:
+            return None, '【节点动作序列】页还没有任何节点'
+        routes = self._node_routes()
+        if len(routes) < 2:
+            return None, '至少需要 2 个节点才能组成路线'
+
+        self.plan_mission()
+        if not self.mission_legs:
+            return None, '全程规划失败（看下方提示）'
+        bad = [i for i, leg in enumerate(self.mission_legs) if not leg['ok']]
+        if bad:
+            return None, (f'第 {",".join(str(i + 1) for i in bad)} 段规划失败'
+                          f'（共 {len(self.mission_legs)} 段）。'
+                          f'先处理障碍，或在节点页改路线点')
+
+        headings = self._mission_headings()
+        cmds = [{'cmd': 'comment',
+                 'text': f'九点任务：{len(self.nodes)} 个节点 / {len(self.mission_legs)} 段'}]
+
+        # ---- 启停区发车/停车：横移+直行进出，不在角上转向 ----
+        # 启停区角上只有 300×300，原地转斜角车角（对角线半长 212mm）会出界；
+        # 所以小范围内不转向，把位移拆成"横移 + 直行"两条指令，转向一律放到
+        # 格子中心（E5/E1，开阔车道交汇口）再做。第一段/最后一段分别从格子
+        # 中心重新规划，不在角上绕外圈矩形车道。
+        start_pt = self.mission_legs[0]['from_xy']      # START = 启停区中心
+        gateway = self._start_gateway_cell(start_pt)
+        cur_f = self._robot_field()
+        cur = cur_f[:2]
+        car_at_start = (gateway is not None
+                        and math.hypot(cur[0] - start_pt[0],
+                                       cur[1] - start_pt[1]) <= 150.0)
+
+        self._append_node_actions(cmds, 0)
+        if car_at_start:
+            gname = self.field.cell_name(*gateway)
+            # 发车：横移+直行到格子中心（不转向）
+            cmds += self._strafe_move_pair(
+                gateway[0] - cur[0], gateway[1] - cur[1], cur_f[2],
+                f'发车：横移到 {gname} 中心')
+            # 第一段从格子中心重新规划（绕开外圈矩形线）
+            leg0 = self.mission_legs[0]
+            res = mapping.plan_path(
+                self.grid, self.mask, self.obstacles,
+                self.grid.w2c(*gateway), self.grid.w2c(*leg0['to_xy']),
+                self.field.robot_radius, cell_block=self._cell_block(),
+                cost_fn=self._cost_fn())
+            if res['path']:
+                cmds += self._path_commands(
+                    res['path_world'],
+                    f'1. {leg0["from_name"]} → {leg0["to_name"]}',
+                    start_yaw_deg=cur_f[2],
+                    fixed_yaw_deg=leg0.get('final_yaw'))
+            else:
+                cmds += self._path_commands(
+                    leg0['path'], f'1. {leg0["from_name"]} → {leg0["to_name"]}',
+                    start_yaw_deg=cur_f[2],
+                    fixed_yaw_deg=leg0.get('final_yaw'))
+            begin_i = 1
+        else:
+            # 车不在启停区：保持原逻辑（先规划到起点，再按原计划走）
+            if math.hypot(cur[0] - start_pt[0], cur[1] - start_pt[1]) > 150.0:
+                res = mapping.plan_path(
+                    self.grid, self.mask, self.obstacles,
+                    self.grid.w2c(*cur), self.grid.w2c(*start_pt),
+                    self.field.robot_radius, cell_block=self._cell_block(),
+                    cost_fn=self._cost_fn())
+                if not res['path']:
+                    return None, f'从当前位置到第 1 个节点不通：{res["note"]}'
+                # 到第 1 个节点时，车头已经摆成第一段出发的朝向
+                cmds += self._path_commands(res['path_world'], '先去第 1 个节点',
+                                            start_yaw_deg=headings[0])
+            begin_i = 0
+
+        last_i = len(self.mission_legs) - 1
+        for i in range(begin_i, len(self.mission_legs)):
+            leg = self.mission_legs[i]
+            title = f'{i + 1}. {leg["from_name"]} → {leg["to_name"]}'
+            if (i == last_i and last_i >= 1 and gateway is not None
+                    and math.hypot(leg['to_xy'][0] - start_pt[0],
+                                   leg['to_xy'][1] - start_pt[1]) < 1.0):
+                # 停车：最后一段只开到格子中心，到格子的同时把车头摆成停车
+                # 朝向（在开阔车道交汇口转，不进启停区小角再转）
+                park_yaw = leg.get('final_yaw')
+                res = mapping.plan_path(
+                    self.grid, self.mask, self.obstacles,
+                    self.grid.w2c(*leg['from_xy']), self.grid.w2c(*gateway),
+                    self.field.robot_radius, cell_block=self._cell_block(),
+                    cost_fn=self._cost_fn())
+                if res['path']:
+                    cmds += self._path_commands(
+                        res['path_world'], title,
+                        start_yaw_deg=headings[i],
+                        fixed_yaw_deg=park_yaw)
+                # 横移+直行进启停区（不转向）。分解用的朝向必须和车停在格子
+                # 中心时的实际朝向一致：final_yaw 对 START 是 None（_outward_yaw
+                # 只认 work_zones），此时 _path_commands 会保持最后的行驶朝向，
+                # 和 headings[i] 可能差 90° 以上——所以直接回读最后一条 goto
+                # 的 yaw_deg，别用假设值。
+                actual_yaw = None
+                for c in reversed(cmds):
+                    if c.get('cmd') == 'goto':
+                        actual_yaw = float(c['yaw_deg'])
+                        break
+                if actual_yaw is None:
+                    actual_yaw = headings[i]
+                # yaw_deg 是里程计系、位移是场地系，差一个 dq 旋转；分解必须
+                # 在同一坐标系里做，否则两个坐标系差 180° 时横移/直行全反。
+                actual_yaw = self._odom_to_field_yaw_deg(actual_yaw)
+                cmds += self._strafe_move_pair(
+                    leg['to_xy'][0] - gateway[0], leg['to_xy'][1] - gateway[1],
+                    actual_yaw, '停车：横移回启停区')
+            else:
+                cmds += self._path_commands(
+                    leg['path'], title,
+                    start_yaw_deg=headings[i],
+                    fixed_yaw_deg=leg.get('final_yaw'))
+            self._append_node_actions(cmds, i + 1)
+        return cmds, None
+
+    def _odom_to_field_yaw_deg(self, yaw_odom_deg):
+        """里程计系航向（度）→ 场地系航向。和 _field_to_odom 用同一个 dq，
+        保证跨坐标系换算时朝向差恰好抵消。"""
+        odeg0 = self.odom_start[2]
+        dq_deg = self.robot_start[2] - (odeg0 if odeg0 is not None else 0.0)
+        return wrap_deg(yaw_odom_deg + dq_deg)
+
+    def _strafe_move_pair(self, dx_mm, dy_mm, yaw_deg, label):
+        """把一段世界系位移拆成"横移 + 直行"两条指令（车体系，**不转向**）。
+
+        用于启停区小范围进出：角上只有 300×300，原地转斜角车角会出界；
+        横移+直行对任何目标位移都不用转角度。小于 3cm 的分量省略。
+        """
+        yaw = math.radians(yaw_deg)
+        fwd = dx_mm * math.cos(yaw) + dy_mm * math.sin(yaw)
+        lat = -dx_mm * math.sin(yaw) + dy_mm * math.cos(yaw)
+        out = []
+        if abs(lat) >= 30.0:
+            out.append({'cmd': 'strafe', 'dist_m': round(lat / 1000.0, 3)})
+        if abs(fwd) >= 30.0:
+            out.append({'cmd': 'move', 'dist_m': round(fwd / 1000.0, 3)})
+        if out:
+            out.insert(0, {'cmd': 'comment',
+                           'text': f'{label}（横移{lat:+.0f}mm 行走{fwd:+.0f}mm）'})
+        return out
+
+    def _start_gateway_cell(self, zone_xy):
+        """启停区发车/停车的斜线接入点：离启停区中心最近的 5×5 格中心。
+
+        启停区1（右上角）→ E5，启停区2（右下角）→ E1。格子中心在外圈车道里，
+        和启停区之间是一整片连通灰色车道，斜线不跨黄块。
+        """
+        best = None
+        for r in range(self.field.cell_rows):
+            for c in range(self.field.cell_cols):
+                p = self.field.cell_center(c, r)
+                d = math.hypot(p[0] - zone_xy[0], p[1] - zone_xy[1])
+                if best is None or d < best[0]:
+                    best = (d, p)
+        return best[1] if best else None
+
+    def _preview_mission_sequence(self):
+        """【预览完整序列】：把组装好的九点任务（路点 + 每点动作）完整填进
+        【动作序列】页，切过去显示，只预览、不发送。检查无误后点底部【▶ 执行】。
+        """
+        cmds, err = self._build_mission_commands()
+        if cmds is None:
+            messagebox.showwarning('无法生成任务序列', err)
+            return
+        self.commands = [dict(c) for c in cmds]
+        self._reload_listbox()
+        self.nb.select(0)   # 切到【动作序列】页
+        n_goto = sum(1 for c in cmds if c['cmd'] == 'goto')
+        n_act = sum(1 for c in cmds if c['cmd'] not in ('goto', 'comment'))
+        self._set_status(
+            f'完整任务序列已填入动作序列页：{n_goto} 个路点 + {n_act} 个动作 '
+            f'（只预览未下发；检查无误后点底部【▶ 执行】）')
 
     # ==================== 模拟执行（没有真车也能看车跑） ====================
 

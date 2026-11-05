@@ -293,6 +293,13 @@ static void Chassis_PoseControl(float targetX, float targetY)
     Chassis.Move.Vx =  vxWorld * cosY + vyWorld * sinY;
     Chassis.Move.Vy = -vxWorld * sinY + vyWorld * cosY;
 
+    /* 各向异性补偿：麦轮横移靠辊子摩擦，同样轮速下实际横移比前移慢，
+       斜向行驶时"执行的机体速度"会被拧偏出弧线。这里按标定值把指令
+       放大，让位置环看到的 plant 接近各向同性（手柄速度模式不受影响）。
+       标定方法见 RobotConfig.h 的 CHASSIS_AXIS_GAIN_X/Y 注释。 */
+    Chassis.Move.Vx /= CHASSIS_AXIS_GAIN_X;
+    Chassis.Move.Vy /= CHASSIS_AXIS_GAIN_Y;
+
     /* 位置环输出同样受"运动最大速度"限制：上位机把限幅调小后，
        不管是摇杆速度模式还是自动导航的位置模式，都超不过去。 */
     Chassis.Move.Vx = Chassis_Limit(Chassis.Move.Vx, PiTune.MaxSpeedX, CHASSIS_MAX_SPEED_X);

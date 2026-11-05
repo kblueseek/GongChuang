@@ -615,6 +615,11 @@
               <FilePath>..\ExHardware\JY901S.c</FilePath>
             </File>
             <File>
+              <FileName>MSPM0imu.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\ExHardware\MSPM0imu.c</FilePath>
+            </File>
+            <File>
               <FileName>PiComm.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\ExHardware\PiComm.c</FilePath>

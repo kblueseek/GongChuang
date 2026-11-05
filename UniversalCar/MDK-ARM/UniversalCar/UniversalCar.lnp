@@ -40,6 +40,7 @@
 "universalcar\port.o"
 "universalcar\blecontrol.o"
 "universalcar\jy901s.o"
+"universalcar\mspm0imu.o"
 "universalcar\picomm.o"
 "universalcar\servo.o"
 "universalcar\led.o"

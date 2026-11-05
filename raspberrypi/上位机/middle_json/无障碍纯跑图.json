@@ -1,0 +1,295 @@
+{
+  "commands": [
+    {
+      "cmd": "comment",
+      "text": "九点任务：9 个节点 / 8 段"
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 1：START（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "先去第 1 个节点"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.2,
+      "y_m": 0.15,
+      "yaw_deg": 0.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.15,
+      "y_m": 0.15,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.15,
+      "y_m": 0.04,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.04,
+      "y_m": 0.04,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "1. START → 扫码区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.04,
+      "y_m": 0.04,
+      "yaw_deg": 0.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.15,
+      "y_m": 0.04,
+      "yaw_deg": 90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.15,
+      "y_m": 1.05,
+      "yaw_deg": 89.5,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 2：扫码区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "2. 扫码区 → 原料区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.15,
+      "y_m": 1.05,
+      "yaw_deg": 0.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 1.05,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 0.15,
+      "yaw_deg": 0.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.2,
+      "y_m": 0.15,
+      "yaw_deg": 179.3,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 3：原料区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "3. 原料区 → 粗加工区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.2,
+      "y_m": 0.15,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 0.15,
+      "yaw_deg": 90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 1.95,
+      "yaw_deg": 0.5,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 4：粗加工区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "4. 粗加工区 → 暂存区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 1.95,
+      "yaw_deg": 0.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 1.95,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 1.05,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 5：暂存区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "5. 暂存区 → 原料区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 1.05,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 0.15,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.2,
+      "y_m": 0.15,
+      "yaw_deg": 179.3,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 6：原料区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "6. 原料区 → 粗加工区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.2,
+      "y_m": 0.15,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 0.15,
+      "yaw_deg": 90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 1.95,
+      "yaw_deg": 0.5,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 7：粗加工区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "7. 粗加工区 → 暂存区"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.05,
+      "y_m": 1.95,
+      "yaw_deg": 0.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 1.95,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 1.05,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 8：暂存区（无动作）"
+    },
+    {
+      "cmd": "comment",
+      "text": "8. 暂存区 → START"
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 1.05,
+      "yaw_deg": -90.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 1.95,
+      "y_m": 0.15,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "goto",
+      "x_m": 0.15,
+      "y_m": 0.15,
+      "yaw_deg": -180.0,
+      "arrive_yaw": true
+    },
+    {
+      "cmd": "comment",
+      "text": "停车：横移回启停区（横移-150mm 行走+150mm）"
+    },
+    {
+      "cmd": "strafe",
+      "dist_m": -0.15
+    },
+    {
+      "cmd": "move",
+      "dist_m": 0.15
+    },
+    {
+      "cmd": "comment",
+      "text": "节点 9：START（无动作）"
+    }
+  ]
+}

@@ -18,6 +18,11 @@
      先发 /set_odom 让 f407_bridge 把里程计偏移到该真实位姿（清除累计误差），
      再发 /ring_fix/result 通知 motion_planner 同步它的目标位姿。
 
+矫正全程在树莓派桌面弹出实时画面（ring_fix 窗口）：蓝十字 = 标定参考环心，
+绿/黄椭圆 = 当前识别到的圆环，顶部文字显示纠偏量和稳定帧——用来确认云台/
+相机是否摆到了参考姿态、画面里有没有看到三个环。SSH 无桌面环境下自动
+关闭预览，不影响矫正本身。参数 show_preview:=false 可禁用。
+
 坐标系注意：/set_odom 之后 ROS 侧所有位姿（/odom、/cmd_pose）都活在"修正后的
 里程计系"里——f407_bridge 会在 /odom 上报时加偏移、在 /cmd_pose 下发时减偏移，
 F407 内部始终用它自己的原始里程计系，两边自动换算。
@@ -90,6 +95,10 @@ class RingFixNode(Node):
         self.declare_parameter('converge_tol_yaw_deg', 1.5)  # 收敛判定：航向（度）
         self.declare_parameter('converge_hold_frames', 3)  # 连续多少帧满足才算对准
         self.declare_parameter('timeout_s', 45.0)          # 单次矫正总超时（秒）
+        # ---- 实时预览 ----
+        # true = 矫正时在树莓派桌面弹出识别画面（窗口名 ring_fix）；
+        # 无桌面环境（纯 SSH）首次显示失败会自动关掉预览，不影响矫正。
+        self.declare_parameter('show_preview', True)
 
         self._device = str(self.get_parameter('camera_device').value)
         self._width = int(self.get_parameter('camera_width').value)
@@ -107,6 +116,8 @@ class RingFixNode(Node):
         self._tol_yaw = abs(float(self.get_parameter('converge_tol_yaw_deg').value))
         self._hold_need = max(1, int(self.get_parameter('converge_hold_frames').value))
         self._timeout = float(self.get_parameter('timeout_s').value)
+        self._show_preview = bool(self.get_parameter('show_preview').value)
+        self._preview_active = False   # 预览窗口当前是否开着（含重试降级）
 
         # ---- 加载视觉配置（import vision 的检测器） ----
         vision_dir = str(self.get_parameter('vision_dir').value).strip()
@@ -217,6 +228,7 @@ class RingFixNode(Node):
         except self._RingStationDetectionError as error:
             self._fail(f'圆环检测异常：{error}')
             return
+        self._draw_preview(frame, result)
 
         usable = (result.detected and result.stable
                   and len(result.centers_px) == 3
@@ -318,6 +330,7 @@ class RingFixNode(Node):
         self._pub_result.publish(msg)
         self._phase = 'idle'
         self._hold_pose = None
+        self._close_preview()
         self._release_camera()
 
     # ---------------- 摄像头 ----------------
@@ -359,6 +372,72 @@ class RingFixNode(Node):
             self._cam_retry_t = time.monotonic() + 1.0
             return None
         return frame
+
+    # ---------------- 实时预览 ----------------
+
+    def _draw_preview(self, frame, result):
+        """把识别结果叠加到画面上，在树莓派桌面实时显示（窗口名 ring_fix）。
+
+        蓝十字 = 标定参考环心（correction_calibration 的参考图像位置），
+        绿/黄椭圆 = 当前帧识别到的圆环（绿 = 稳定观测），让人直接看出云台/
+        相机有没有摆到参考姿态、画面里有没有看到三个环。
+        """
+        if not self._show_preview:
+            return
+        cv2 = self._cv2
+        vis = frame.copy()
+        # 标定基准：三个参考环心画蓝色十字 + 圆圈
+        for rx, ry in self._ring_config.reference_centers_px:
+            pt = (int(round(rx)), int(round(ry)))
+            cv2.drawMarker(vis, pt, (255, 160, 0), cv2.MARKER_CROSS, 30, 2)
+            cv2.circle(vis, pt, 24, (255, 160, 0), 1)
+        # 当前识别：稳定 = 绿，识别到但不稳定 = 黄
+        if result.detected:
+            color = (0, 255, 0) if result.stable else (0, 220, 255)
+            for ellipse in result.ellipses:
+                cv2.ellipse(vis, ellipse, color, 2)
+            for cx, cy in result.centers_px:
+                cv2.circle(vis, (int(round(cx)), int(round(cy))), 5, color, -1)
+        # 顶部状态条（cv2.putText 不支持中文，这里只用 ASCII）
+        remain = max(0.0, self._timeout - (time.monotonic() - self._start_t))
+        line1 = (f'RING FIX  detected:{"Y" if result.detected else "N"}'
+                 f'  stable:{"Y" if result.stable else "N"}'
+                 f'  conf:{result.confidence:.2f}')
+        if (result.correction_body_x_mm is not None
+                and result.correction_body_y_mm is not None
+                and result.correction_yaw_deg is not None):
+            line2 = (f'corr: x={result.correction_body_x_mm:+.1f}mm'
+                     f' y={result.correction_body_y_mm:+.1f}mm'
+                     f' yaw={result.correction_yaw_deg:+.2f}deg')
+        else:
+            line2 = 'corr: -- (waiting for stable observation)'
+        line3 = f'hold: {self._hold_frames}/{self._hold_need}  left: {remain:.0f}s'
+        for i, text in enumerate((line1, line2, line3)):
+            y = 30 + i * 26
+            cv2.rectangle(vis, (4, y - 20), (640, y + 6), (0, 0, 0), -1)
+            cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 255), 1, cv2.LINE_AA)
+        try:
+            if not self._preview_active:
+                cv2.namedWindow('ring_fix', cv2.WINDOW_NORMAL)
+                self._preview_active = True
+            cv2.imshow('ring_fix', vis)
+            cv2.waitKey(1)   # 刷新窗口事件，必填
+        except Exception as error:  # noqa: BLE001 - 纯 SSH 无桌面时降级关闭
+            self._show_preview = False
+            self._close_preview()
+            self.get_logger().warning(
+                f'无法弹出实时画面（无桌面环境？）：{error}；'
+                f'预览已关闭，矫正照常进行')
+
+    def _close_preview(self):
+        if not self._preview_active:
+            return
+        try:
+            self._cv2.destroyWindow('ring_fix')
+        except Exception:  # noqa: BLE001
+            pass
+        self._preview_active = False
 
     def _release_camera(self):
         if self._camera is not None:
@@ -435,6 +514,7 @@ class RingFixNode(Node):
             return None, None
 
     def destroy_node(self):
+        self._close_preview()
         self._release_camera()
         return super().destroy_node()
 
