@@ -135,8 +135,8 @@ class JoyControlNode(Node):
         self.declare_parameter('gimbal_extend_speed', 300.0)  # extend（X 伸缩，Y/A 按键）
         self.declare_parameter('servo_step_deg', 5.0)     # 载物盘每 tick 步进 °
         self.declare_parameter('cam_step_deg', 5.0)       # 摄像头每按一下步进 °
-        self.declare_parameter('gripper_close_deg', 40.0)  # 夹爪"夹紧"角度
-        self.declare_parameter('gripper_open_deg', 90.0)   # 夹爪"松开"角度
+        self.declare_parameter('gripper_close_deg', 1.0)  # 夹爪"夹紧"角度
+        self.declare_parameter('gripper_open_deg', 80.0)   # 夹爪"松开"角度
 
         # 读出参数
         self.axis_linear = self.get_parameter('axis_linear').value

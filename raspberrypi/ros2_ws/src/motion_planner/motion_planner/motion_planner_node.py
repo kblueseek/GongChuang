@@ -541,7 +541,7 @@ class MotionPlannerNode(Node):
         lift = float(cmd.get('lift_deg', 0.0))
         safe = float(cmd.get('safe_lift_deg', 0.0))
         ext = float(cmd.get('extend_deg', 0.0))
-        g_open = float(cmd.get('gripper_open', 120.0))
+        g_open = float(cmd.get('gripper_open', 140.0))
         g_close = float(cmd.get('gripper_close', 35.0))
         settle = int(cmd.get('settle_ms', 800))
 
