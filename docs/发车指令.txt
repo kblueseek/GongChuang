@@ -1,0 +1,2 @@
+cd ~/GongChuang/raspberrypi/ros2_ws
+colcon build --symlink-install

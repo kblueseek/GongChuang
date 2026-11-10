@@ -234,6 +234,18 @@ class PreviewSim:
             self.i += 1
             return
 
+        if name in ('gimbal_yaw', 'gimbal_lift', 'gimbal_ext'):
+            # 相对微调：加在"当前命令目标"上，和 motion_planner 的合并语义一致。
+            # 真机是阻塞到位的，这里按 GIMBAL_RATE 匀速走估算等多久，让预览的
+            # 节奏和实车一致（不套 DELAY_SCALE —— 这是物理时间，不是演示等待）。
+            axis = {'gimbal_yaw': 0, 'gimbal_lift': 1, 'gimbal_ext': 2}[name]
+            delta = float(cmd.get('delta_deg', 0) or 0)
+            self.gimbal_tgt[axis] += delta
+            self.node._cb_gimbal_target(Float32MultiArray(list(self.gimbal_tgt)))
+            self.wait_until = now + abs(delta) / GIMBAL_RATE + 0.05
+            self.i += 1
+            return
+
         if name == 'gripper':
             self.gripper = float(cmd.get('deg', 0) or 0)
             self.i += 1

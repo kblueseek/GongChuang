@@ -657,12 +657,26 @@ def split_backbone(path, field, tol=None):
 # ==================== 4. A* 路径规划 ====================
 
 
-def astar(mask, blocked, start, goal, allow_diag=True, cost_fn=None):
+# 默认转向惩罚（毫米/次）：一次"停稳+原地转+再停稳" ≈ 1~2s，按任务均速
+# 250mm/s 折算 ≈ 400mm 等效距离。代价函数 = 距离 + 惩罚×转向次数，
+# 等距路线自动选转向少的；想退回纯最短距离把它设为 0 即可。
+DEFAULT_TURN_PENALTY_MM = 400.0
+
+
+def astar(mask, blocked, start, goal, allow_diag=True, cost_fn=None,
+          turn_penalty=0.0, start_dir=None):
     """在栅格上找路。
 
     mask   : 可通行掩码（车道）
     blocked: 障碍掩码（圆柱 + 膨胀）
     start/goal: (ix, iy)
+    turn_penalty: 每次换方向的额外代价（栅格单位）。>0 时搜索状态带"来向"，
+        状态数 ×4/×8（栅格小，开销可忽略）。启发函数保持纯距离、仍满足
+        一致性（转向只加不减），所以第一个弹出的终点状态就是最优。
+        0 = 纯最短距离（旧行为）。
+    start_dir: 入场方向在 nb 里的下标（首次移动换方向也计惩罚）。
+        用于把"车开到段起点的朝向"算进转向数——同一条路，顺向进场 0 罚，
+        横向进场一次 90° 罚。None = 不约束首步方向。
     返回 (path, cost)  path 是 [(ix,iy), ...]；找不到返回 ([], inf)
     """
     import heapq
@@ -695,6 +709,8 @@ def astar(mask, blocked, start, goal, allow_diag=True, cost_fn=None):
                     d = (ix - goal[0]) ** 2 + (iy - goal[1]) ** 2
                     if d < bd:
                         bd, best = d, (ix, iy)
+                        if d == 0:
+                            break
         if best is None:
             return [], float("inf")
         goal = best
@@ -712,35 +728,78 @@ def astar(mask, blocked, start, goal, allow_diag=True, cost_fn=None):
             return (dx + dy) + (math.sqrt(2) - 2) * min(dx, dy)
         return dx + dy
 
-    openq = [(h(start, goal), 0.0, start)]
-    g = {start: 0.0}
-    parent = {}
+    def relax(nxt, ng, cur, push):
+        if ng < g.get(nxt, 1e18):
+            g[nxt] = ng
+            parent[nxt] = cur
+            push(nxt, ng)
+
+    if turn_penalty <= 0.0:
+        # —— 纯距离模式：状态 = 格子（原逻辑）——
+        openq = [(h(start, goal), 0.0, start)]
+        g = {start: 0.0}
+        parent = {}
+        closed = set()
+        while openq:
+            _, gc, cur = heapq.heappop(openq)
+            if cur in closed:
+                continue
+            closed.add(cur)
+            if cur == goal:
+                path = [cur]
+                while cur in parent:
+                    cur = parent[cur]
+                    path.append(cur)
+                path.reverse()
+                return path, gc
+            cx, cy = cur
+            for dx, dy, w in nb:
+                nxt = (cx + dx, cy + dy)
+                if not free(*nxt):
+                    continue
+                # 斜着走要求两个正交邻居都通，避免切角穿墙
+                if dx and dy and not (free(cx + dx, cy) and free(cx, cy + dy)):
+                    continue
+                ng = gc + w + (cost_fn(nxt[0], nxt[1]) if cost_fn else 0.0)
+                relax(nxt, ng, cur,
+                      lambda n, v: heapq.heappush(openq, (v + h(n, goal), v, n)))
+        return [], float("inf")
+
+    # —— 距离 + 转向模式：状态 = (格子, 来向序号)，换方向加 turn_penalty ——
+    # start_dir 给定则首步按它计转向（入场朝向）；否则 -1 = 无来向（首步不罚）
+    start_state = (start, start_dir if start_dir is not None else -1)
+    openq = [(h(start, goal), 0.0, start_state)]
+    g = {start_state: 0.0}
+    parent = {start_state: None}
     closed = set()
     while openq:
-        _, gc, cur = heapq.heappop(openq)
-        if cur in closed:
+        _, gc, cur_state = heapq.heappop(openq)
+        if cur_state in closed:
             continue
-        closed.add(cur)
+        closed.add(cur_state)
+        cur, cur_dir = cur_state
         if cur == goal:
             path = [cur]
-            while cur in parent:
-                cur = parent[cur]
-                path.append(cur)
+            s = cur_state
+            while parent[s] is not None:
+                s = parent[s]
+                path.append(s[0])
             path.reverse()
             return path, gc
         cx, cy = cur
-        for dx, dy, w in nb:
+        for i, (dx, dy, w) in enumerate(nb):
             nxt = (cx + dx, cy + dy)
             if not free(*nxt):
                 continue
-            # 斜着走要求两个正交邻居都通，避免切角穿墙
             if dx and dy and not (free(cx + dx, cy) and free(cx, cy + dy)):
                 continue
-            ng = gc + w + (cost_fn(nxt[0], nxt[1]) if cost_fn else 0.0)
-            if ng < g.get(nxt, 1e18):
-                g[nxt] = ng
-                parent[nxt] = cur
-                heapq.heappush(openq, (ng + h(nxt, goal), ng, nxt))
+            turn = turn_penalty if (cur_dir >= 0 and cur_dir != i) else 0.0
+            ng = gc + w + turn + (cost_fn(nxt[0], nxt[1]) if cost_fn else 0.0)
+            nstate = (nxt, i)
+            if ng < g.get(nstate, 1e18):
+                g[nstate] = ng
+                parent[nstate] = cur_state
+                heapq.heappush(openq, (ng + h(nxt, goal), ng, nstate))
     return [], float("inf")
 
 
@@ -850,8 +909,15 @@ def erode_mask(mask, cell_mm, pad_mm):
 
 
 def plan_path(grid, mask, cylinders, start, goal, robot_radius,
-              min_clear_mm=20.0, cell_block=None, cost_fn=None):
+              min_clear_mm=20.0, cell_block=None, cost_fn=None,
+              turn_penalty_mm=None, entry_heading_deg=None):
     """带退让的规划：先按理想车半径规划，走不通就逐步缩小膨胀半径重试。
+
+    turn_penalty_mm: 每次转向的等效惩罚距离（默认 DEFAULT_TURN_PENALTY_MM）。
+        0 = 纯最短距离。等距路线会自动选转向次数少的那条。
+    entry_heading_deg: 到达起点时的车头朝向（度，世界系）。给了它，"首段
+        行驶方向 vs 入场朝向"的夹角也按转向计罚——否则十字/外圈等距 tie 时
+        选不出"顺向进场"的那条。None = 不约束首步。
 
     为什么要退让：车道只有 400 宽，放一个 φ50 圆柱后只剩 350 的缝，
     车 300 宽——理论上过得去，但按"车半径 170 + 余量"去膨胀就没有解了。
@@ -862,6 +928,10 @@ def plan_path(grid, mask, cylinders, start, goal, robot_radius,
 
     返回 dict: path / cost / pad / scale / min_clear / note / goal_blocked / start_blocked
     """
+    # 转向惩罚：None = 用模块默认值；显式 0 = 关闭（纯最短距离）
+    if turn_penalty_mm is None:
+        turn_penalty_mm = DEFAULT_TURN_PENALTY_MM
+
     # 车不是质点：先把可走区域按车半径腐蚀，否则会从墙缝里钻过去
     mask = erode_mask(mask, grid.cell, robot_radius)
 
@@ -902,8 +972,24 @@ def plan_path(grid, mask, cylinders, start, goal, robot_radius,
                         row[ix] = True
         # 沿中线的模式用 4 连通：路径严格正交（只有直行和原地转），
         # 正好对上 motion_planner 的 move/turn 指令集。
+        # 入场朝向 → 最接近的邻居方向下标（4/8 连通通用）
+        start_dir = None
+        if entry_heading_deg is not None:
+            best_d, best_dd = None, 1e18
+            for i, (dx, dy, _w) in enumerate(
+                    [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0)]
+                    + ([(1, 1, 1.0), (1, -1, 1.0), (-1, 1, 1.0), (-1, -1, 1.0)]
+                       if cost_fn is None else [])):
+                da = abs((math.degrees(math.atan2(dy, dx))
+                          - entry_heading_deg + 180.0) % 360.0 - 180.0)
+                if da < best_dd:
+                    best_d, best_dd = i, da
+            start_dir = best_d
         path, cost = astar(mask, blocked, start, goal,
-                           allow_diag=(cost_fn is None), cost_fn=cost_fn)
+                           allow_diag=(cost_fn is None), cost_fn=cost_fn,
+                           turn_penalty=max(0.0, float(turn_penalty_mm))
+                                         / grid.cell,
+                           start_dir=start_dir)
         if not path:
             continue
         # 沿中线的模式不能拉直：拉直会连线切角，把"走中线"全毁了。
@@ -938,12 +1024,18 @@ def plan_path(grid, mask, cylinders, start, goal, robot_radius,
 
 
 def plan_mission(field, grid, mask, cylinders, route_names=None,
-                 robot_radius=170.0, cell_block=None, cost_fn=None):
+                 robot_radius=170.0, cell_block=None, cost_fn=None,
+                 turn_entry_fn=None, entry_first_deg=None):
     """整条任务路线：逐段 A* + 汇总。
 
     route_names 默认取 field.mission_route（START → 扫码 → 原料 → 粗加工 → 暂存 → … → START）。
     返回 (legs, total_mm)：
         legs[i] = {from_name, to_name, from_xy, to_xy, path(世界坐标), mm, ok, note, min_clear}
+
+    turn_entry_fn: 给定段起点世界坐标 → 到达该点时的车头朝向（度）。
+        每段 A* 把"首段方向 vs 该朝向"计为一次转向，让规划在全图层面
+        就选顺向进场的路线（而不是段内最优、段首硬拧 90°）。
+        entry_first_deg: 第 1 段的入场朝向（None = 首步不约束）。
     """
     names = list(route_names or field.mission_route)
     pts = [field.resolve_waypoint(n) for n in names]
@@ -958,8 +1050,11 @@ def plan_mission(field, grid, mask, cylinders, route_names=None,
             leg["note"] = "名字解析不到坐标"
             legs.append(leg)
             continue
+        entry = entry_first_deg if i == 0 else (
+            turn_entry_fn(a) if turn_entry_fn else None)
         res = plan_path(grid, mask, cylinders, grid.w2c(*a), grid.w2c(*b),
-                        robot_radius, cell_block=cell_block, cost_fn=cost_fn)
+                        robot_radius, cell_block=cell_block, cost_fn=cost_fn,
+                        entry_heading_deg=entry)
         wp = res.get("path_world") or [grid.c2w(ix, iy) for ix, iy in res["path"]]
         leg["path"] = wp
         leg["backbone"], leg["spur"], leg["spur_mm"] = split_backbone(wp, field)

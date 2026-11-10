@@ -1,5 +1,5 @@
 # setup.py：告诉 colcon 怎么安装 obstacle_detect 包。
-# 和 lidar_bringup 的区别：这个包里有真正的 Python 代码（节点），所以有 packages 和 entry_points。
+# 和 car_bringup 的区别：这个包里有真正的 Python 代码（节点），所以有 packages 和 entry_points。
 
 from setuptools import find_packages, setup   # find_packages：自动找到所有 Python 包（带 __init__.py 的目录）
 
@@ -10,7 +10,7 @@ setup(
     version='0.1.0',
     packages=find_packages(exclude=['test']),   # 自动把 obstacle_detect/ 这个包打进去
     data_files=[
-        # 包标记 + package.xml，和 lidar_bringup 一样
+        # 包标记 + package.xml，和 car_bringup 一样
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],

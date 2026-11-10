@@ -29,6 +29,15 @@ void PiComm_TuneReset(void)
     PiTune.GimbalKp = 20.0f;
     PiTune.GimbalKi = 0.0f;
     PiTune.GimbalKd = 0.0f;
+    PiTune.GimbalLiftKp = 20.0f;
+    PiTune.GimbalLiftKi = 0.0f;
+    PiTune.GimbalLiftKd = 0.0f;
+    PiTune.GimbalExtKp  = 20.0f;
+    PiTune.GimbalExtKi  = 0.0f;
+    PiTune.GimbalExtKd  = 0.0f;
+    PiTune.GimbalYawSpeed  = 120.0f;   /* 与 RobotConfig.h 的 GIMBAL_*_SPEED_MAX 一致 */
+    PiTune.GimbalLiftSpeed = 400.0f;
+    PiTune.GimbalExtSpeed  = 300.0f;
 
     PiTune.Version = 0;
 }
@@ -298,6 +307,15 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
             case PI_TUNE_GIMBAL_KP:
             case PI_TUNE_GIMBAL_KI:
             case PI_TUNE_GIMBAL_KD:
+            case PI_TUNE_GIMBAL_LIFT_KP:
+            case PI_TUNE_GIMBAL_LIFT_KI:
+            case PI_TUNE_GIMBAL_LIFT_KD:
+            case PI_TUNE_GIMBAL_EXT_KP:
+            case PI_TUNE_GIMBAL_EXT_KI:
+            case PI_TUNE_GIMBAL_EXT_KD:
+            case PI_TUNE_GIMBAL_YAW_SPEED:
+            case PI_TUNE_GIMBAL_LIFT_SPEED:
+            case PI_TUNE_GIMBAL_EXT_SPEED:
                 if (v >= 0.0f && v <= 100.0f) {
                     if      (id == PI_TUNE_POS_KP)    PiTune.PosKp = v;
                     else if (id == PI_TUNE_POS_KI)    PiTune.PosKi = v;
@@ -305,9 +323,18 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
                     else if (id == PI_TUNE_HEAD_KP)   PiTune.HeadingKp = v;
                     else if (id == PI_TUNE_HEAD_KI)   PiTune.HeadingKi = v;
                     else if (id == PI_TUNE_HEAD_KD)   PiTune.HeadingKd = v;
-                    else if (id == PI_TUNE_GIMBAL_KP) PiTune.GimbalKp = v;
-                    else if (id == PI_TUNE_GIMBAL_KI) PiTune.GimbalKi = v;
-                    else                              PiTune.GimbalKd = v;
+                    else if (id == PI_TUNE_GIMBAL_KP)      PiTune.GimbalKp = v;
+                    else if (id == PI_TUNE_GIMBAL_KI)      PiTune.GimbalKi = v;
+                    else if (id == PI_TUNE_GIMBAL_KD)      PiTune.GimbalKd = v;
+                    else if (id == PI_TUNE_GIMBAL_LIFT_KP) PiTune.GimbalLiftKp = v;
+                    else if (id == PI_TUNE_GIMBAL_LIFT_KI) PiTune.GimbalLiftKi = v;
+                    else if (id == PI_TUNE_GIMBAL_LIFT_KD) PiTune.GimbalLiftKd = v;
+                    else if (id == PI_TUNE_GIMBAL_EXT_KP)  PiTune.GimbalExtKp = v;
+                    else if (id == PI_TUNE_GIMBAL_EXT_KI)  PiTune.GimbalExtKi = v;
+                    else if (id == PI_TUNE_GIMBAL_EXT_KD)  PiTune.GimbalExtKd = v;
+                    else if (id == PI_TUNE_GIMBAL_YAW_SPEED)  PiTune.GimbalYawSpeed = v;
+                    else if (id == PI_TUNE_GIMBAL_LIFT_SPEED) PiTune.GimbalLiftSpeed = v;
+                    else                                      PiTune.GimbalExtSpeed = v;
                     applied = 1;
                 }
                 break;

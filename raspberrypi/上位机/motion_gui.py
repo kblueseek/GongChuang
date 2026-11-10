@@ -89,6 +89,7 @@ field.json 和"车起点 / 雷达安装位姿"这类安装参数里。屏幕上�
 
 import json
 import math
+import re
 import os
 import queue
 from collections import deque
@@ -108,6 +109,9 @@ import mapping
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "field.json")
 NODES_PATH = os.path.join(HERE, "nodes.json")
+# PID 调参页的配置文件：滑杆改动自动保存到这里，下次开 GUI 自动恢复。
+# 想还原固件默认，PID 页点【恢复默认】即可（会把默认值写回此文件）。
+TUNE_PROFILE_PATH = os.path.join(HERE, "tune_profile.json")
 
 # ---------------- 配色（和 map_app 一致） ----------------
 C_BG      = "#ffffff"
@@ -129,7 +133,18 @@ COMMAND_TYPES = {
     'strafe':    {'params': 'dist_m', 'hint': '横向平移(米)，正=左'},
     'turn':      {'params': 'deg', 'hint': '转向角(度)，正=左转(逆时针)，负=右转'},
     'goto':      {'params': 'x_m,y_m,yaw_deg', 'hint': '绝对位姿(里程计系)：x(米), y(米), 朝向(度)'},
-    'gimbal':    {'params': 'yaw_deg,lift_deg,extend_deg', 'hint': '云台三轴(度)，逗号分隔'},
+    'gimbal':    {'params': 'yaw_deg,lift_deg,extend_deg', 'hint': '云台三轴绝对角(度)，逗号分隔'},
+    'gimbal_yaw':  {'params': 'delta_deg[,tol_deg[,timeout_ms]]',
+                    'hint': '云台 yaw 相对微调(度)：在当前角度上加减，只动 yaw 轴。'
+                            '会自动等到位再走下一条，后面不用加 delay。'
+                            '可省略后两个参数（默认容差 2°、超时 2500ms）'},
+    'gimbal_lift': {'params': 'delta_deg[,tol_deg[,timeout_ms]]',
+                    'hint': '云台 lift 相对微调(度)：在当前角度上加减，只动 lift 轴。'
+                            '例：-20 = 再降 20°，用来从"物料居中"降到"抓取高度"。'
+                            '自动等到位再走下一条'},
+    'gimbal_ext':  {'params': 'delta_deg[,tol_deg[,timeout_ms]]',
+                    'hint': '云台 extend 相对微调(度)：在当前角度上加减，只动 extend 轴。'
+                            '自动等到位再走下一条'},
     'gripper':   {'params': 'deg', 'hint': '夹爪角度(0~180)'},
     'plate':     {'params': 'deg', 'hint': '载物盘角度(0~180)'},
     'cam':       {'params': 'deg', 'hint': '相机角度(0~180)'},
@@ -167,6 +182,26 @@ COMMAND_TYPES = {
         'hint': '放置宏：到安全位→下降到放置位→张爪→抬起。'
                 '例：0,-40,0,150,120,35,800'
     },
+    # ---- 任务码驱动动作（参数可写任务码占位符 $b1c1$/$b1p1$/$b2c1$/$b2p1$…）----
+    'color_pick': {
+        'params': 'color',
+        'hint': '云台跟随到指定颜色物料上方：自动开摄像头+实时预览，只跟随不抓取。'
+                '后续抓取/放置用你自己写死的 gimbal/gripper/plate 指令。'
+                'color=1~6 或占位符，例：$b1c1$'
+    },
+    'number_put': {
+        'params': 'number',
+        'hint': '放到指定编号圆环（1/2/3 从左到右，不识别、按几何解算）。'
+                '前面必须先有 calibrate 对位。可写占位符 $b1p1$'
+    },
+    'double_put': {
+        'params': 'number',
+        'hint': '叠放到第一批上方（环上已有物料，层+1）。同 number_put，例：$b2p1$'
+    },
+    'tray_slot': {
+        'params': 'number',
+        'hint': '载物盘转到第 N 个料位（1~3）。角度在 vehicle.yaml 的 tray_slotN_deg 实测填写'
+    },
 }
 
 
@@ -184,6 +219,13 @@ def cmd_to_text(cmd: dict) -> str:
                 f"朝向 {cmd.get('yaw_deg', 0):+.1f}°")
     if name == 'gimbal':
         return f"云台 yaw={cmd.get('yaw_deg', 0)}° lift={cmd.get('lift_deg', 0)}° ext={cmd.get('extend_deg', 0)}°"
+    if name in ('gimbal_yaw', 'gimbal_lift', 'gimbal_ext'):
+        axis = {'gimbal_yaw': 'yaw', 'gimbal_lift': 'lift',
+                'gimbal_ext': 'ext'}[name]
+        text = f"云台 {axis} {float(cmd.get('delta_deg', 0) or 0):+.1f}°（相对，等到位）"
+        if 'tol_deg' in cmd:
+            text += f" ±{cmd['tol_deg']}°"
+        return text
     if name == 'gripper':
         return f"夹爪 {cmd.get('deg', 0)}°"
     if name == 'plate':
@@ -214,6 +256,14 @@ def cmd_to_text(cmd: dict) -> str:
         verb = '抓取' if name == 'pick' else '放置'
         return (f"{verb} yaw={cmd.get('yaw_deg', 0)}° lift={cmd.get('lift_deg', 0)}° "
                 f"ext={cmd.get('extend_deg', 0)}° 夹爪{cmd.get('gripper_close', 35)}°")
+    if name == 'color_pick':
+        return f"按颜色抓取 颜色={cmd.get('color', '?')}"
+    if name == 'number_put':
+        return f"放到圆环 {cmd.get('number', '?')}"
+    if name == 'double_put':
+        return f"叠放到圆环 {cmd.get('number', '?')}"
+    if name == 'tray_slot':
+        return f"载物盘转到料位 {cmd.get('number', '?')}"
     return str(cmd)
 
 
@@ -233,6 +283,16 @@ def build_cmd(name: str, params_str: str) -> dict:
     if name == 'gimbal':
         vals = [float(p) for p in parts] + [0.0, 0.0, 0.0]
         return {'cmd': name, 'yaw_deg': vals[0], 'lift_deg': vals[1], 'extend_deg': vals[2]}
+    if name in ('gimbal_yaw', 'gimbal_lift', 'gimbal_ext'):
+        # 相对量：只存一个增量，执行时加到云台当前角度上。
+        # 可选第 2/3 个参数覆盖"到位"容差和超时；不填就交给 motion_planner
+        # 的 gimbal_arrive_tol_deg / gimbal_arrive_timeout_s。
+        cmd = {'cmd': name, 'delta_deg': float(parts[0]) if parts else 0.0}
+        if len(parts) > 1:
+            cmd['tol_deg'] = float(parts[1])
+        if len(parts) > 2:
+            cmd['timeout_ms'] = int(float(parts[2]))
+        return cmd
     if name in ('gripper', 'plate', 'cam'):
         return {'cmd': name, 'deg': float(parts[0]) if parts else 0.0}
     if name == 'enable':
@@ -268,6 +328,14 @@ def build_cmd(name: str, params_str: str) -> dict:
                 cmd['timeout_s'] = 60.0
         return cmd
 
+    if name in ('color_pick', 'number_put', 'double_put'):
+        # 参数可以是数字，也可以是 $b1c1$ 这类占位符（原样存，不动 motion_planner 执行时替换）
+        key = 'color' if name == 'color_pick' else 'number'
+        return {'cmd': name, key: parts[0] if parts else ''}
+
+    if name == 'tray_slot':
+        return {'cmd': name, 'number': parts[0] if parts else ''}
+
     if name in ('pick', 'place'):
         vals = [float(p) for p in parts] + [0.0] * 7
         return {'cmd': name,
@@ -301,16 +369,28 @@ TUNE_PARAMS = [
     (0x08, 'head_kp',   '转向环 Kp',             0.0, 20.0, 0.05, 4.0, False),
     (0x09, 'head_ki',   '转向环 Ki',             0.0, 10.0, 0.01, 0.0, False),
     (0x0A, 'head_kd',   '转向环 Kd',             0.0, 10.0, 0.01, 0.0, False),
-    (0x0B, 'gim_kp',    '云台位置环 Kp',         0.0, 100.0, 0.5, 20.0, False),
-    (0x0C, 'gim_ki',    '云台位置环 Ki',         0.0, 20.0, 0.05, 0.0, False),
-    (0x0D, 'gim_kd',    '云台位置环 Kd',         0.0, 10.0, 0.05, 0.0, False),
+    (0x0B, 'gim_yaw_kp',  '云台yaw环 Kp',         0.0, 100.0, 0.5, 20.0, False),
+    (0x0C, 'gim_yaw_ki',  '云台yaw环 Ki',         0.0, 20.0, 0.05, 0.0, False),
+    (0x0D, 'gim_yaw_kd',  '云台yaw环 Kd',         0.0, 10.0, 0.05, 0.0, False),
+    (0x0E, 'gim_lift_kp', '云台lift环 Kp',        0.0, 100.0, 0.5, 20.0, False),
+    (0x0F, 'gim_lift_ki', '云台lift环 Ki',        0.0, 20.0, 0.05, 0.0, False),
+    (0x10, 'gim_lift_kd', '云台lift环 Kd',        0.0, 10.0, 0.05, 0.0, False),
+    (0x11, 'gim_ext_kp',  '云台extend环 Kp',      0.0, 100.0, 0.5, 20.0, False),
+    (0x12, 'gim_ext_ki',  '云台extend环 Ki',      0.0, 20.0, 0.05, 0.0, False),
+    (0x13, 'gim_ext_kd',  '云台extend环 Kd',      0.0, 10.0, 0.05, 0.0, False),
+    (0x14, 'gim_yaw_speed',  '云台yaw最大速度 °/s',   0.0, 2000.0, 5.0, 120.0, False),
+    (0x15, 'gim_lift_speed', '云台lift最大速度 °/s',  0.0, 2000.0, 5.0, 400.0, False),
+    (0x16, 'gim_ext_speed',  '云台extend最大速度 °/s', 0.0, 2000.0, 5.0, 300.0, False),
 ]
 
 TUNE_GROUPS = [
     ('车速 / 限幅', ('max_vx', 'max_vy', 'max_wz', 'max_rpm')),
     ('位置环 PID', ('pos_kp', 'pos_ki', 'pos_kd')),
     ('转向环 PID', ('head_kp', 'head_ki', 'head_kd')),
-    ('云台位置环 PID', ('gim_kp', 'gim_ki', 'gim_kd')),
+    ('云台yaw环 PID', ('gim_yaw_kp', 'gim_yaw_ki', 'gim_yaw_kd')),
+    ('云台lift环 PID', ('gim_lift_kp', 'gim_lift_ki', 'gim_lift_kd')),
+    ('云台extend环 PID', ('gim_ext_kp', 'gim_ext_ki', 'gim_ext_kd')),
+    ('云台最大速度 °/s', ('gim_yaw_speed', 'gim_lift_speed', 'gim_ext_speed')),
 ]
 
 # 云台标定：轴名、位置显示键
@@ -348,6 +428,9 @@ class GuiRosNode(Node):
         # 里程计被视觉矫正重置（/set_odom 生效）时，f407_bridge 发来的坐标系平移量；
         # App 用它同步"车起点"锚点，保证场地↔里程计换算不变
         self.create_subscription(Pose2D, '/odom_shift', self._cb_odom_shift, 10)
+        # 任务码（qr_scanner）：界面显示 + 预览占位符替换用
+        self.create_subscription(String, '/task_code', self._cb_task_code, 10)
+        self.create_subscription(String, '/task_code_decoded', self._cb_task_code_decoded, 10)
 
         self.odom = None            # (x, y, theta) 米/米/弧度
         self.traj = []              # 历史轨迹 [(x,y), ...]（里程计系）
@@ -361,6 +444,8 @@ class GuiRosNode(Node):
         self.online = False
         self.tune_ack = {}          # 参数编号 -> 407 回显的生效值
         self.odom_shift = None      # 待处理的里程计坐标系平移 (t_x, t_y, t_yaw)
+        self.task_raw = ''          # 当前任务码（未扫到为空串）
+        self.task_code = None       # 解析结果 dict（batch1_colors 等）
 
     def _cb_odom(self, msg: Odometry):
         q = msg.pose.pose.orientation
@@ -407,6 +492,16 @@ class GuiRosNode(Node):
         """里程计被视觉矫正重置（calibrate 指令生效）：记下坐标系平移量，由
         App 在刷新循环里同步"车起点"锚点。可能连续来多次，只保留最新一次。"""
         self.odom_shift = (float(msg.x), float(msg.y), float(msg.theta))
+
+    def _cb_task_code(self, msg: String):
+        self.task_raw = str(msg.data)
+
+    def _cb_task_code_decoded(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except Exception:  # noqa: BLE001
+            return
+        self.task_code = data if isinstance(data, dict) else None
 
     def send_sequence(self, commands: list) -> bool:
         """下发一段指令序列。返回 False = 没有节点在听 /motion_load（motion_planner 没起来）。"""
@@ -520,6 +615,7 @@ class App:
         # 收到 /f407_online 由 False→True 时自动把全部值重发一遍，
         # 防止 407 重启后参数悄悄回到默认。
         self.tune = {key: float(default) for (_, key, _, _, _, _, default, _) in TUNE_PARAMS}
+        self._load_tune_profile()   # 有上次保存的调参就覆盖默认值
         self._tune_ids = {key: pid for (pid, key, *_rest) in TUNE_PARAMS}
         self._tune_scales = {}
         self._tune_pending = {}
@@ -694,11 +790,10 @@ class App:
         ttk.Button(editrow, text='清空', command=clear).pack(side=tk.LEFT, padx=2)
         return {'type': cmd_type, 'entry': entry, 'hint': hint}
 
-    @staticmethod
-    def _reload_actions(listbox, cmds):
+    def _reload_actions(self, listbox, cmds):
         listbox.delete(0, tk.END)
         for c in cmds:
-            listbox.insert(tk.END, cmd_to_text(c))
+            listbox.insert(tk.END, self._cmd_text(c))
 
     # ---------- 页签 3：九节点动作序列 ----------
 
@@ -886,15 +981,16 @@ class App:
             for key in keys:
                 spec = next(s for s in TUNE_PARAMS if s[1] == key)
                 pid, _k, label, vmin, vmax, step, default, is_int = spec
+                val = self.tune.get(key, float(default))
                 row = ttk.Frame(box)
                 row.pack(fill=tk.X)
-                var = tk.StringVar(value=f'{default:g}')
+                var = tk.StringVar(value=f'{val:g}')
                 scale = tk.Scale(
                     row, from_=vmin, to=vmax, resolution=step, orient=tk.HORIZONTAL,
                     length=240, showvalue=False, label=label, bd=0,
                     highlightthickness=0,
                     command=lambda v, k=key: self._on_tune_slide(k, v))
-                scale.set(default)
+                scale.set(val)
                 scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 ttk.Label(row, textvariable=var, width=7, anchor='e').pack(
                     side=tk.LEFT, padx=(2, 0))
@@ -1081,6 +1177,25 @@ class App:
         if self._tune_after is None:
             self._tune_after = self.root.after(60, self._flush_tune)
 
+    def _load_tune_profile(self):
+        """从上位机目录的 tune_profile.json 恢复上次调参（没有/坏了就用固件默认）。"""
+        try:
+            with open(TUNE_PROFILE_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for key in self.tune:
+                if key in data:
+                    self.tune[key] = float(data[key])
+        except Exception:  # noqa: BLE001 - 文件不存在是正常情况
+            pass
+
+    def _save_tune_profile(self):
+        """把当前滑杆值落盘（debounce 后调用，写文件很便宜）。"""
+        try:
+            with open(TUNE_PROFILE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self.tune, f, ensure_ascii=False, indent=1)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _flush_tune(self):
         self._tune_after = None
         pending, self._tune_pending = self._tune_pending, {}
@@ -1088,11 +1203,13 @@ class App:
             self.node.send_tune(self._tune_ids[key], value)
         if pending:
             self.tune_status.set(f'已下发 {len(pending)} 项参数，等待 407 回显…')
+            self._save_tune_profile()
 
     def _send_all_tune(self):
         for key, value in self.tune.items():
             self.node.send_tune(self._tune_ids[key], value)
         self.tune_status.set('已下发全部参数，等待 407 回显…')
+        self._save_tune_profile()
 
     def _restore_tune_defaults(self):
         self._tune_applying = True
@@ -2062,7 +2179,8 @@ class App:
         self.plan = mapping.plan_path(
             self.grid, self.mask, self.obstacles, start, goal,
             self.field.robot_radius, cell_block=self._cell_block(),
-            cost_fn=self._cost_fn())
+            cost_fn=self._cost_fn(),
+            entry_heading_deg=self._robot_field()[2])
         self._last_plan_kind = 'single'
         self._report_plan(self.plan)
         self._redraw()
@@ -2157,15 +2275,63 @@ class App:
         out.append(ded[-1])
         return out
 
-    def _seg_heading(self, seg, prev):
-        """段行驶方向 seg（度）→ 车头朝向：seg 或 seg+180 里选离 prev 更近的。
+    def _leg_headings(self, wps, start_deg, fixed_deg):
+        """整段路一起定每个航点的车头朝向（不再逐点贪心）。
 
-        麦轮正着走/倒着走都比横着走直，所以让车头或车尾对着行驶方向，
-        并且选转弯更小的那一头（少打方向、少磨轮子）。
+        约束：航点 i 的车头只能取"i→i+1 这段的行驶方向"或"它 +180°"。
+        麦轮正着开、倒着开都比横着开直，但横着开不行，所以只有这两种。
+        目标：让 [进场转角 + 各拐点转角 + 到站转成作业朝向] 总和最小。
+
+        为什么不能逐点贪心：每个航点单独挑"离上一段最近"的那一头只是局部最优。
+        例：这段路往北，到站要求车头朝北 —— 贪心在起点可能选了"车头朝南
+        倒着开"，到站后必须原地掉头 180°；整段一起算就知道该从起点就抬头
+        朝北，到站几乎不用转。九点任务实测总转角 1349° → 993°。
+
+        wps: 世界坐标折线；start_deg: 出发时的车头朝向（度）；
+        fixed_deg: 到站要摆成的作业朝向（None = 保持最后一段的行驶朝向）。
+        返回和 wps 等长的朝向列表（度）。
         """
-        d_fwd = wrap_deg(seg - prev)
-        d_bwd = wrap_deg(seg + 180.0 - prev)
-        return wrap_deg(seg + 180.0) if abs(d_bwd) < abs(d_fwd) else wrap_deg(seg)
+        n = len(wps)
+        start = wrap_deg(start_deg)
+        if n == 1:
+            return [wrap_deg(fixed_deg) if fixed_deg is not None else start]
+
+        segs = [math.degrees(math.atan2(wps[i + 1][1] - wps[i][1],
+                                        wps[i + 1][0] - wps[i][0]))
+                for i in range(n - 1)]
+        # 每段只有两个候选车头；2 状态 DP 就够了，不用背包/遗传那些
+        cand = [[wrap_deg(s), wrap_deg(s + 180.0)] for s in segs]
+
+        # cost[k]：处理到第 i 段、车头取 cand[i][k] 时的最小累计转角
+        cost = [abs(wrap_deg(cand[0][0] - start)),
+                abs(wrap_deg(cand[0][1] - start))]
+        back = []          # back[i][k] = 第 i 段取 k 时，第 i-1 段取的是哪一个
+        for i in range(1, n - 1):
+            nc, nb = [float('inf'), float('inf')], [0, 0]
+            for k in (0, 1):
+                for j in (0, 1):
+                    c = cost[j] + abs(wrap_deg(cand[i][k] - cand[i - 1][j]))
+                    if c < nc[k]:
+                        nc[k], nb[k] = c, j
+            cost = nc
+            back.append(nb)
+
+        if fixed_deg is not None:
+            tail = [cost[k] + abs(wrap_deg(fixed_deg - cand[n - 2][k]))
+                    for k in (0, 1)]
+        else:
+            tail = list(cost)      # 没有作业朝向：到站就直接停，不计末段转角
+        k = 0 if tail[0] <= tail[1] else 1
+
+        idx = [k]                  # 回溯
+        for nb in reversed(back):
+            k = nb[k]
+            idx.append(k)
+        idx.reverse()
+
+        hdgs = [cand[i][idx[i]] for i in range(n - 1)]
+        hdgs.append(wrap_deg(fixed_deg) if fixed_deg is not None else hdgs[-1])
+        return hdgs
 
     def _path_commands(self, path_mm, title=None, fixed_yaw_deg=None,
                        start_yaw_deg=None):
@@ -2175,9 +2341,13 @@ class App:
         fixed_yaw_deg: 终点作业朝向（度）。None = 到站后保持最后一段的行驶朝向。
 
         麦轮能横移，但横着走没有正着走直、更容易打滑。所以改成**不横移**：
-        每个拐点先原地把车头（或车尾，选转弯更小的一头）摆到下一段的行驶
-        方向，再沿这段只前/后直行；走到最后一个航点站定后，才原地转到
-        fixed_yaw_deg（作业朝向）。所有转体都是原地完成，不边走边转。
+        每个拐点先原地把车头（或车尾）摆到下一段的行驶方向，再沿这段只
+        前/后直行；走到最后一个航点站定后，才原地转到 fixed_yaw_deg（作业
+        朝向）。所有转体都是原地完成，不边走边转。
+
+        每个航点摆车头朝哪一头（正着开 / 倒着开）由 _leg_headings 整段
+        DP 决定，不是逐点贪心——逐点贪心会把"进场 90° + 到站掉头 180°"
+        这种明显多余的动作留下来。
         """
         wps = self._waypoints(path_mm)
         cmds = []
@@ -2188,22 +2358,13 @@ class App:
         if start_yaw_deg is None:
             start_yaw_deg = self._robot_field()[2]
         prev = wrap_deg(start_yaw_deg)
-        n = len(wps)
-        hdgs = []
-        for i, (x, y) in enumerate(wps):
-            if i < n - 1:
-                seg = math.degrees(math.atan2(wps[i + 1][1] - y,
-                                              wps[i + 1][0] - x))
-                hdg = self._seg_heading(seg, prev)
-            elif fixed_yaw_deg is not None:
-                hdg = wrap_deg(fixed_yaw_deg)
-            elif hdgs:
-                hdg = hdgs[-1]      # 没有作业朝向：到站就停，别再多转一下
-            else:
-                hdg = prev
-            hdgs.append(hdg)
-            prev = hdg
-        for (x, y), hdg in zip(wps, hdgs):
+        hdgs = self._leg_headings(wps, prev, fixed_yaw_deg)
+
+        for i, ((x, y), hdg) in enumerate(zip(wps, hdgs)):
+            # 第一个航点就是车现在站的位置、朝向也没变：别再多发一条原地转
+            # （段与段的衔接点会重复出现，不跳过的话每段开头都白停一下）
+            if i == 0 and len(wps) > 1 and abs(wrap_deg(hdg - prev)) < 2.0:
+                continue
             ox, oy, oth = self._field_to_odom(x, y, hdg)
             cmds.append({'cmd': 'goto',
                          'x_m': round(ox, 3),
@@ -2274,11 +2435,15 @@ class App:
         if not routes and not self.field.mission_route:
             self._set_status('没有任务路线：在【节点动作序列】页填每点对应的路线名')
             return
+        # turn_entry_fn：每段起点 = 上一段的作业朝向（车头顺向进场少走一次原地转）；
+        # 第 1 段用当前车头朝向
         legs, total = mapping.plan_mission(
             self.field, self.grid, self.mask, self.obstacles,
             routes or self.field.mission_route,
             self.field.robot_radius, cell_block=self._cell_block(),
-            cost_fn=self._cost_fn())
+            cost_fn=self._cost_fn(),
+            turn_entry_fn=self._outward_yaw,
+            entry_first_deg=self._robot_field()[2])
         self.mission_legs = legs
         self.mission_total = total
         self.plan = None
@@ -2402,7 +2567,7 @@ class App:
                 self.grid, self.mask, self.obstacles,
                 self.grid.w2c(*gateway), self.grid.w2c(*leg0['to_xy']),
                 self.field.robot_radius, cell_block=self._cell_block(),
-                cost_fn=self._cost_fn())
+                cost_fn=self._cost_fn(), entry_heading_deg=cur_f[2])
             if res['path']:
                 cmds += self._path_commands(
                     res['path_world'],
@@ -2422,7 +2587,7 @@ class App:
                     self.grid, self.mask, self.obstacles,
                     self.grid.w2c(*cur), self.grid.w2c(*start_pt),
                     self.field.robot_radius, cell_block=self._cell_block(),
-                    cost_fn=self._cost_fn())
+                    cost_fn=self._cost_fn(), entry_heading_deg=cur_f[2])
                 if not res['path']:
                     return None, f'从当前位置到第 1 个节点不通：{res["note"]}'
                 # 到第 1 个节点时，车头已经摆成第一段出发的朝向
@@ -2444,7 +2609,7 @@ class App:
                     self.grid, self.mask, self.obstacles,
                     self.grid.w2c(*leg['from_xy']), self.grid.w2c(*gateway),
                     self.field.robot_radius, cell_block=self._cell_block(),
-                    cost_fn=self._cost_fn())
+                    cost_fn=self._cost_fn(), entry_heading_deg=headings[i])
                 if res['path']:
                     cmds += self._path_commands(
                         res['path_world'], title,
@@ -2539,9 +2704,9 @@ class App:
     def _play_mission(self):
         """把整条任务路线按固定步长采样成位姿序列，用 tk.after 一步步播放。
 
-        **朝向**：和真车指令一致——每到拐点先**原地**把车头（或车尾，选
-        转弯小的一头）摆到下一段行驶方向，再沿这段直着开过去；到作业点
-        再原地转成作业朝向（final_yaw）。所以动画里不会出现横移。
+        **朝向**：和真车指令一致——用 _leg_headings 整段算出的朝向，每到
+        拐点先**原地**把车头（或车尾）摆到下一段行驶方向，再沿这段直着
+        开过去；到作业点再原地转成作业朝向（final_yaw）。不会出现横移。
 
         采样按 60mm 定长沿折线插值：路径大多是一大段直线，共线点被压掉后
         两个航点能隔 500mm 以上，按航点播就是"一步跳半米"。
@@ -2577,15 +2742,15 @@ class App:
             if not pos:
                 pos.append((float(wps[0][0]), float(wps[0][1])))
                 tgt.append(yaw)
+            fy = leg.get('final_yaw')
+            hdgs = self._leg_headings(wps, yaw, fy)   # 和下发指令同一套朝向
             for k in range(len(wps) - 1):
                 x0, y0 = wps[k]
                 x1, y1 = wps[k + 1]
                 d = math.hypot(x1 - x0, y1 - y0)
                 if d <= 1e-6:
                     continue
-                hd = self._seg_heading(
-                    math.degrees(math.atan2(y1 - y0, x1 - x0)), yaw)
-                spin_to(hd)                       # 先原地摆正车头/车尾
+                spin_to(hdgs[k])                  # 先原地摆正车头/车尾
                 t = step_mm
                 while t < d:
                     r = t / d
@@ -2594,7 +2759,6 @@ class App:
                     t += step_mm
                 pos.append((float(x1), float(y1)))
                 tgt.append(yaw)
-            fy = leg.get('final_yaw')
             if fy is not None:
                 spin_to(float(fy))                # 到作业点再原地转成作业朝向
 
@@ -2818,14 +2982,13 @@ class App:
     # ---------- 作业点到达朝向 ----------
 
     def _outward_yaw(self, xy):
-        """作业点上要求车摆到的场地朝向：**机械臂侧朝场地外侧**。
+        """作业点上要求车摆到的场地朝向。
 
-        机械臂 + 扫码相机在车头**逆时针 90°**（车体 +y，车左）。
-        要让车左指向"从场心指向该作业点"的外法线，车头就要比外法线少 90°：
+        默认（face 不写）：机械臂侧朝工位外法线 —— 机械臂在车头逆时针 90°
+        （车体 +y，车左），所以车头 = 外法线 − 90°：
             外法线   0°(东) → 车头 270°(南) → 车左朝东 ✓
-            外法线  90°(北) → 车头   0°(东) → 车左朝北 ✓
-            外法线 180°(西) → 车头  90°(北) → 车左朝西 ✓
-            外法线 270°(南) → 车头 180°(西) → 车左朝南 ✓
+        例外：face="scan"（扫码区）—— 扫码模块在机械臂对侧（车右），要让车右
+        朝工位，车头 = 外法线 + 90°，正好和默认差 180°。
 
         xy 不是 work_zones 的 approach 点（或就在场心）就返回 None，不加朝向约束。
         """
@@ -2846,7 +3009,9 @@ class App:
         if math.hypot(dx, dy) < 1.0:
             return None
         arm_dir = math.degrees(math.atan2(dy, dx))
-        return wrap_deg(arm_dir - 90.0)
+        if str(zone.get("face", "arm")) == "scan":
+            return wrap_deg(arm_dir + 90.0)   # 扫码模块侧朝工位（车右）
+        return wrap_deg(arm_dir - 90.0)       # 机械臂侧朝工位（车左）
 
     def on_click(self, ev):
         w = self._px_to_world(ev.x, ev.y)
@@ -3123,6 +3288,8 @@ class App:
             self.pose_var.set('当前位姿: 未收到 /odom（检查 run_car.sh / 串口）')
 
         st = f'状态机: {self.node.motion_state or "—"}'
+        if getattr(self.node, 'task_raw', ''):
+            st += f'    任务码: {self.node.task_raw}'
         if self.node.robot_status:
             state, err, mask = self.node.robot_status
             state_name = {0: '未使能', 1: '就绪', 2: '故障'}.get(state, state)
@@ -3181,10 +3348,39 @@ class App:
 
     # ==================== 动作序列编辑 ====================
 
+    def _task_flat(self):
+        '''任务码平铺表：{'b1c1': 4, ...}；没扫到返回 None。'''
+        tc = getattr(self.node, 'task_code', None)
+        if not tc:
+            return None
+        flat = {}
+        for i, v in enumerate(tc.get('batch1_colors') or []):
+            flat[f'b1c{i + 1}'] = v
+        for i, v in enumerate(tc.get('batch1_places') or []):
+            flat[f'b1p{i + 1}'] = v
+        for i, v in enumerate(tc.get('batch2_colors') or []):
+            flat[f'b2c{i + 1}'] = v
+        for i, v in enumerate(tc.get('batch2_places') or []):
+            flat[f'b2p{i + 1}'] = v
+        return flat
+
+    def _cmd_text(self, cmd):
+        '''显示用：任务码已扫到时把 $b1c1$ 占位符替换成真实值再渲染。'''
+        flat = self._task_flat()
+        if not flat:
+            return cmd_to_text(cmd)
+        def res(v):
+            if isinstance(v, str):
+                m = re.fullmatch(r'\s*\$\s*(\w+)\s*\$\s*', v)
+                if m and m.group(1) in flat:
+                    return flat[m.group(1)]
+            return v
+        return cmd_to_text({k: res(v) for k, v in cmd.items()})
+
     def _reload_listbox(self):
         self.listbox.delete(0, tk.END)
         for c in self.commands:
-            self.listbox.insert(tk.END, cmd_to_text(c))
+            self.listbox.insert(tk.END, self._cmd_text(c))
 
     def import_json(self):
         path = filedialog.askopenfilename(filetypes=[('JSON 文件', '*.json')])

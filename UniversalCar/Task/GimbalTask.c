@@ -79,17 +79,49 @@ static float   s_Offset[3]      = { 0.0f, 0.0f, 0.0f };
 static uint8_t s_OffsetValid[3] = { 0, 0, 0 };
 
 /* ---- 位置环状态（角度目标 → 速度） ---- */
-static const float s_MaxSpeedDegPerSec[3] = {
+/* 三轴位置环输出限幅（°/s）。初值取固件默认，上位机 0x14~0x16 可随时改，
+   0/负值 = 回退固件宏。运行中改动由 Gimbal_SyncSpeedLimit 热更新（含 PID 限幅）。 */
+static float s_MaxSpeedDegPerSec[3] = {
     GIMBAL_YAW_SPEED_MAX, GIMBAL_LIFT_SPEED_MAX, GIMBAL_EXTEND_SPEED_MAX
 };
+
+/* 位置环状态要在 Gimbal_SyncSpeedLimit 之前声明：那个函数里会直接改 PID 限幅。 */
 static float    s_TargetDeg[3]   = { 0.0f, 0.0f, 0.0f };
 static uint8_t  s_TargetValid[3] = { 0, 0, 0 };
 static uint32_t s_TargetTick[3]  = { 0, 0, 0 };
 static PID_t    s_PosPid[3];
 static uint8_t  s_PosPidReady     = 0;
-static float    s_LastGimbalKp    = -1.0f;
-static float    s_LastGimbalKi    = -1.0f;
-static float    s_LastGimbalKd    = -1.0f;
+
+static void Gimbal_SyncSpeedLimit(void)
+{
+    const float tune[3] = { PiTune.GimbalYawSpeed, PiTune.GimbalLiftSpeed,
+                            PiTune.GimbalExtSpeed };
+    const float dft[3]  = { GIMBAL_YAW_SPEED_MAX, GIMBAL_LIFT_SPEED_MAX,
+                            GIMBAL_EXTEND_SPEED_MAX };
+    for (uint8_t i = 0; i < 3; i++) {
+        float spd = (tune[i] > 0.0f) ? tune[i] : dft[i];
+        if (spd == s_MaxSpeedDegPerSec[i])
+            continue;
+        s_MaxSpeedDegPerSec[i] = spd;
+        if (s_PosPidReady) {                 /* PID 限幅跟着改，立即生效 */
+            s_PosPid[i].MaxOut = spd;
+            s_PosPid[i].I_Max  = spd;
+        }
+    }
+}
+
+/* yaw/lift/extend 三轴各自记忆最后生效的增益（-1 = 尚未初始化） */
+static float    s_LastGimbalKp[3] = { -1.0f, -1.0f, -1.0f };
+static float    s_LastGimbalKi[3] = { -1.0f, -1.0f, -1.0f };
+static float    s_LastGimbalKd[3] = { -1.0f, -1.0f, -1.0f };
+
+/* 三轴增益表：PiTune 里 yaw/lift/extend 各自独立 */
+static void Gimbal_TuneGains(float kp[3], float ki[3], float kd[3])
+{
+    kp[0] = PiTune.GimbalKp;     ki[0] = PiTune.GimbalKi;     kd[0] = PiTune.GimbalKd;
+    kp[1] = PiTune.GimbalLiftKp; ki[1] = PiTune.GimbalLiftKi; kd[1] = PiTune.GimbalLiftKd;
+    kp[2] = PiTune.GimbalExtKp;  ki[2] = PiTune.GimbalExtKi;  kd[2] = PiTune.GimbalExtKd;
+}
 
 /* 把树莓派示教出来的限位同步进来（每拍调用，代价只有 3 次判断）。
    树莓派没下发过的轴保持 RobotConfig.h 的默认值。 */
@@ -146,11 +178,15 @@ void Gimbal_GetLimits(float minDeg[3], float maxDeg[3])
    增益初值取 PiTune，之后每拍检查一次，上位机改了就用 PID_SetGains 热更新。 */
 static void Gimbal_InitPosPid(void)
 {
+    float kp[3], ki[3], kd[3];
+    Gimbal_TuneGains(kp, ki, kd);
+    Gimbal_SyncSpeedLimit();               /* 先同步速度限幅，PID_Init 用它做 MaxOut */
+
     for (uint8_t i = 0; i < 3; i++) {
         PID_InitStruct_t p;
-        p.kP = PiTune.GimbalKp;
-        p.kI = PiTune.GimbalKi;
-        p.kD = PiTune.GimbalKd;
+        p.kP = kp[i];
+        p.kI = ki[i];
+        p.kD = kd[i];
         p.DeltaTime = GIMBAL_TASK_UPDATE_TICK / 1000.0f;
         p.DifferentialFreqDiv = 1;
         p.CircleResolution = 0.0f;
@@ -160,28 +196,31 @@ static void Gimbal_InitPosPid(void)
         p.DeadBand = GIMBAL_POS_DEADBAND_DEG;
         p.IntegralBand = GIMBAL_POS_INTEGRAL_BAND;
         PID_Init(&s_PosPid[i], &p);
+        s_LastGimbalKp[i] = kp[i];
+        s_LastGimbalKi[i] = ki[i];
+        s_LastGimbalKd[i] = kd[i];
     }
-    s_LastGimbalKp = PiTune.GimbalKp;
-    s_LastGimbalKi = PiTune.GimbalKi;
-    s_LastGimbalKd = PiTune.GimbalKd;
     s_PosPidReady  = 1;
 }
 
-/* 上位机调参：只在三项增益真的变了才重装（PID_SetGains 会清积分）。 */
+/* 上位机调参：每轴独立比对，只有该轴增益真的变了才重装（PID_SetGains 会清积分）。 */
 static void Gimbal_ApplyTune(void)
 {
     if (!s_PosPidReady)
         return;
-    if (PiTune.GimbalKp == s_LastGimbalKp &&
-        PiTune.GimbalKi == s_LastGimbalKi &&
-        PiTune.GimbalKd == s_LastGimbalKd)
-        return;
-
-    s_LastGimbalKp = PiTune.GimbalKp;
-    s_LastGimbalKi = PiTune.GimbalKi;
-    s_LastGimbalKd = PiTune.GimbalKd;
-    for (uint8_t i = 0; i < 3; i++)
-        PID_SetGains(&s_PosPid[i], PiTune.GimbalKp, PiTune.GimbalKi, PiTune.GimbalKd);
+    float kp[3], ki[3], kd[3];
+    Gimbal_TuneGains(kp, ki, kd);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (kp[i] == s_LastGimbalKp[i] &&
+            ki[i] == s_LastGimbalKi[i] &&
+            kd[i] == s_LastGimbalKd[i])
+            continue;
+        s_LastGimbalKp[i] = kp[i];
+        s_LastGimbalKi[i] = ki[i];
+        s_LastGimbalKd[i] = kd[i];
+        PID_SetGains(&s_PosPid[i], kp[i], ki[i], kd[i]);
+    }
+    Gimbal_SyncSpeedLimit();               /* 0x14~0x16 改了速度限幅也随版本号热更新 */
 }
 
 /* 置零：把三个轴此刻的编码器值定义成 0 点。

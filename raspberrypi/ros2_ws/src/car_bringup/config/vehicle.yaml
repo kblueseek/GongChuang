@@ -1,0 +1,99 @@
+# 整车集中配置（对标 F407 的 RobotConfig.h）
+#
+# 树莓派侧所有"装一次车 / 换一次场地 / 换设备"要调的参数全部集中在这一个文件，
+# launch 只负责拉节点、把本文件传下去——ROS 只会应用与节点名匹配的那一节。
+#
+# ⚠ 改完重启 run_car.sh 生效。vision_args 里的仓库路径要改成树莓派上的实际路径。
+
+motion_planner:
+  ros__parameters:
+    # ---- gimbal_yaw / gimbal_lift / gimbal_ext 单轴相对微调的"到位"判据 ----
+    # 指令发出去后阻塞等 /gimbal_state 的实测角进 ±tol 才走下一句，所以序列里
+    # 后面不用再写 delay。给小了会"没到位就继续"，给大了只是慢一点。
+    # 超时（秒）到了只报警、继续执行，不会卡死任务。
+    gimbal_arrive_tol_deg: 2.0
+    gimbal_arrive_timeout_s: 2.5
+    # 状态机推进频率。10Hz 时"到位后最多多等 100ms"，20Hz → 50ms。
+    # 云台位置回传是 20Hz，再往上吃不到新数据，只多占上行位姿帧。
+    tick_hz: 20.0
+    # ---- color_pick 的视觉端（云台跟随抓取跟踪器）----
+    vision_program: 'python3'
+    vision_args: '/home/pi/GongChuang/raspberrypi/vision/gimbal_track_pick.py'
+    # ---- number_put / double_put 放置位姿（三环独立查表）----
+    # 标定方法：车开到位 → calibrate 对位 → 用"夹爪微动+暂停"逐环试放：
+    #   每次放到环 N 成功时，读 /gimbal_state（或 PID 页"当前"）的 yaw/lift/extend
+    #   填入 place_ringN_*。量三个填三个，不做线性假设。
+    # double_put = 同环角度 + lift 再抬高 stack_lift_deg（叠在第一批上方）。
+    place_ring1_yaw_deg: 0.0
+    place_ring1_extend_deg: 0.0
+    place_ring1_lift_deg: 0.0
+    place_ring2_yaw_deg: 0.0
+    place_ring2_extend_deg: 150.0
+    place_ring2_lift_deg: 0.0
+    place_ring3_yaw_deg: 0.0
+    place_ring3_extend_deg: 0.0
+    place_ring3_lift_deg: 0.0
+    place_safe_lift_deg: 0.0
+    stack_lift_deg: 0.0
+    # ---- 载物盘三个料位角度（tray_slot 指令用）。实测法：手柄按住 L1 步进转盘到
+    #      "能接住物料"的位置，ros2 topic echo /cmd_servo --once 读目标角填入。
+    #      0/60/120 是示例分布，必须按你的机构实测 ----
+    tray_slot1_deg: 0.0
+    tray_slot2_deg: 60.0
+    tray_slot3_deg: 120.0
+    # ---- vision_pick/color_pick 抓取位姿兜底与整体偏移（视觉 JSON 缺字段时用；
+    #      offset 加在视觉输出上，机械标定修正不用改视觉程序）----
+    pick_default_yaw_deg: 0.0
+    pick_default_lift_deg: 0.0
+    pick_default_extend_deg: 0.0
+    pick_safe_lift_deg: 0.0
+    pick_gripper_open_deg: 120.0
+    pick_gripper_close_deg: 35.0
+    pick_settle_ms: 800
+    pick_yaw_offset_deg: 0.0
+    pick_lift_offset_deg: 0.0
+    pick_extend_offset_deg: 0.0
+    # ---- calibrate（圆环视觉矫正）等待上限 ----
+    calibrate_timeout_s: 60.0
+
+ring_fix:
+  ros__parameters:
+    # 圆环工位视觉矫正：触发时才开摄像头
+    camera_device: '/dev/video0'
+    # 对准后车体相对中间环的偏移（odom 系，米）：默认 0 = 对准位置即输入坐标。
+    # 标定：手动对准后读 odom 减去圆环坐标填入；align_yaw_deg 留空 = 只修位置不修航向
+    align_offset_x_m: 0.0
+    align_offset_y_m: 0.0
+    align_yaw_deg: ''
+    timeout_s: 45.0
+
+qr_scanner:
+  ros__parameters:
+    # 扫码模块：树莓派 UART3（TX=GPIO4 / RX=GPIO5）。
+    # Pi5 需 /boot/firmware/config.txt 加 dtoverlay=uart3-pi5 重启；
+    # USB 转接模块把 device 改成 /dev/ttyUSB0
+    device: '/dev/ttyAMA3'
+    baudrate: 115200
+
+f407_bridge:
+  ros__parameters:
+    # F407 链路：有线 / BLE 上行 + LoRa 下行（见 docs/无线链路搭建.md）
+    uplink: 'wire'
+    wire_device: '/dev/ttyAMA0'
+    wire_baudrate: 115200
+    downlink: 'wire'
+
+joy_control:
+  ros__parameters:
+    # 手柄按键控制夹爪的开/合角度
+    gripper_open_deg: 90.0
+    gripper_close_deg: 40.0
+    # 载物盘（L1 按住步进）：每 tick 步进角度 / 方向（顺反了改 -1.0）
+    servo_step_deg: 5.0
+    plate_dir: 1.0
+
+status_display:
+  ros__parameters:
+    # OLED 状态屏分辨率（160x80 的屏改成 160 / 80）
+    width: 128
+    height: 64

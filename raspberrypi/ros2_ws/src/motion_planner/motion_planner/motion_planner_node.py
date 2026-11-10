@@ -23,7 +23,16 @@
                                                绝对位姿(里程计世界系，米/度)。
                                                雷达地图导航就用它：上位机把规划出的
                                                场地路点换算成里程计坐标后下发
-  gimbal   {"cmd":"gimbal", "yaw_deg":-30, "lift_deg":50}  云台轴角度(可缺省)
+  gimbal   {"cmd":"gimbal", "yaw_deg":-30, "lift_deg":50}  云台三轴绝对角(可缺省)
+  gimbal_yaw  {"cmd":"gimbal_yaw",  "delta_deg":5}   单轴相对微调：在当前角度上加减，
+  gimbal_lift {"cmd":"gimbal_lift", "delta_deg":-20} 只动一个轴。起算点是 /gimbal_state
+  gimbal_ext  {"cmd":"gimbal_ext",  "delta_deg":30}  的实测角——所以 color_pick 刚把
+                                                     云台跟到物料上方、不知道 yaw 具体
+                                                     多少时，直接写 "再降 20°" 就行。
+           阻塞到该轴实测角进入 ±tol_deg（默认 2°）才执行下一条，所以后面
+           不用再加 delay。可选字段 tol_deg / timeout_ms 覆盖默认值；
+           超时只报警不中断整个序列。参数见 gimbal_arrive_tol_deg /
+           gimbal_arrive_timeout_s。
   gripper  {"cmd":"gripper","deg":45}          夹爪舵机
   plate    {"cmd":"plate",  "deg":90}          载物盘舵机
   cam      {"cmd":"cam",    "deg":0}           相机舵机
@@ -74,6 +83,7 @@ F407 的位置环和航向环是同时收敛的：一个 POSE 帧里同时给 (x
 
 import json        # 解析/生成 JSON（指令序列就是 JSON）
 import math        # 三角函数、弧度换算
+import re          # 任务码占位符 $b1c1$ 解析
 import os          # 展开路径里的 ~ 和环境变量
 import queue       # 子程序输出用后台线程读，避免阻塞状态机
 import shlex       # 把 "程序 参数" 拆成 argv
@@ -105,6 +115,14 @@ class MotionPlannerNode(Node):
         # 转向到位后的确认时间：必须连续这么久都在容差内，才允许开始下一条
         # （否则车还有角速度、或 odom 噪声恰好扫过容差，就会"没转到位就开走"）。
         self.declare_parameter('turn_hold_s', 0.3)        # 秒
+        # gimbal_yaw/lift/ext 单轴相对微调的"到位"判据：/gimbal_state 的实测角
+        # 与目标的偏差落进 ±tol 就放行下一条；最多等 timeout 秒，超时只报警
+        # 不中断（和 calibrate 一样，单条失败不毁整个任务）。
+        self.declare_parameter('gimbal_arrive_tol_deg', 2.0)
+        self.declare_parameter('gimbal_arrive_timeout_s', 2.5)
+        # 状态机推进频率（Hz）。位姿重发、到位判断、指令切换都在这个节拍上。
+        # /gimbal_state 是 20Hz，所以 20 已经吃满；再高只会多占上行（位姿帧）。
+        self.declare_parameter('tick_hz', 10.0)
         # 启动时自动加载的序列文件路径（空 = 不加载，等上位机下发）
         self.declare_parameter('sequence_file', '')
         # 视觉程序的默认位置：动作序列里的 script / align / vision_pick 没写
@@ -116,12 +134,50 @@ class MotionPlannerNode(Node):
         # 圆环视觉矫正（calibrate 指令）最多等多久：要覆盖摄像头打开、识别
         # 稳定、小步对位的全部时间，给足余量。
         self.declare_parameter('calibrate_timeout_s', 60.0)
+        # ---- 任务码动作原语的放置位姿（number_put/double_put）----
+        # 三环独立查表：calibrate 对位后（车不动），分别实测"放环 1/2/3 成功"时的
+        # 云台三轴角度填入 place_ringN_*。不做"基准+步进"的线性假设——旋转云台
+        # 跨环的映射本身非线性，量三个填三个最准。double_put = 同环角度 + lift 抬高
+        # stack_lift_deg（叠在第一批物料上方）。
+        for _ring in (1, 2, 3):
+            self.declare_parameter(f'place_ring{_ring}_yaw_deg', 0.0)
+            self.declare_parameter(f'place_ring{_ring}_extend_deg',
+                                   150.0 if _ring == 2 else 0.0)
+            self.declare_parameter(f'place_ring{_ring}_lift_deg', 0.0)
+        self.declare_parameter('place_safe_lift_deg', 0.0)
+        self.declare_parameter('stack_lift_deg', 0.0)         # 待标定：叠一层 lift 增量°
+        self.declare_parameter('place_gripper_open_deg', 120.0)
+        self.declare_parameter('place_settle_ms', 800)
+        # ---- 载物盘三个料位角度（tray_slot 指令查表；实测填入 vehicle.yaml）----
+        self.declare_parameter('tray_slot1_deg', 0.0)
+        self.declare_parameter('tray_slot2_deg', 60.0)
+        self.declare_parameter('tray_slot3_deg', 120.0)
+        # ---- color_pick / vision_pick 的抓取位姿 ----
+        # 真值来自视觉程序 JSON（每个物料动态不同）；下面两组参数是"不动视觉
+        # 程序"的调节手段：
+        #   pick_default_* ：视觉 JSON 缺字段时的兜底值（默认全 0）；
+        #   pick_*_offset  ：加在视觉输出上的整体修正（机械标定/系统偏差用，
+        #                    比如实际总偏低 5° 就设 pick_lift_offset_deg=5）。
+        self.declare_parameter('pick_default_yaw_deg', 0.0)
+        self.declare_parameter('pick_default_lift_deg', 0.0)
+        self.declare_parameter('pick_default_extend_deg', 0.0)
+        self.declare_parameter('pick_safe_lift_deg', 0.0)
+        self.declare_parameter('pick_gripper_open_deg', 120.0)
+        self.declare_parameter('pick_gripper_close_deg', 35.0)
+        self.declare_parameter('pick_settle_ms', 800)
+        self.declare_parameter('pick_yaw_offset_deg', 0.0)
+        self.declare_parameter('pick_lift_offset_deg', 0.0)
+        self.declare_parameter('pick_extend_offset_deg', 0.0)
 
         self.arrive_tol_xy = float(self.get_parameter('arrive_tol_xy').value)
         self.arrive_tol_yaw = float(self.get_parameter('arrive_tol_yaw').value)
         self.arrive_timeout_s = float(self.get_parameter('arrive_timeout_s').value)
         self.turn_settle_s = float(self.get_parameter('turn_settle_s').value)
         self.turn_hold_s = float(self.get_parameter('turn_hold_s').value)
+        self.gimbal_tol_deg = float(
+            self.get_parameter('gimbal_arrive_tol_deg').value)
+        self.gimbal_timeout_s = float(
+            self.get_parameter('gimbal_arrive_timeout_s').value)
         sequence_file = str(self.get_parameter('sequence_file').value)
         self.default_script_timeout = float(self.get_parameter('script_timeout_s').value)
         self.calibrate_timeout_s = float(self.get_parameter('calibrate_timeout_s').value)
@@ -144,6 +200,13 @@ class MotionPlannerNode(Node):
         # 圆环视觉矫正（calibrate 指令）：把目标发给 ring_fix 节点，等它回结果
         self._pub_ring_target = self.create_publisher(Pose2D, '/ring_fix/target', 10)
         self.create_subscription(String, '/ring_fix/result', self._cb_ring_fix, 10)
+        # 任务码（qr_scanner 节点）：指令里的 $b1c1$ 等占位符在执行时用它的值替换
+        self.create_subscription(String, '/task_code_decoded',
+                                 self._cb_task_code, 10)
+        # 云台实测角：[yaw, lift, extend]。gimbal_yaw/lift/ext 相对指令要靠它起算，
+        # 因为 color_pick 期间是视觉子程序自己在动云台，状态机并不知道最终停在哪。
+        self.create_subscription(Float32MultiArray, '/gimbal_state',
+                                 self._cb_gimbal_state, 10)
 
         # ---- 内部状态 ----
         self.odom = None            # 最新里程计 (x, y, theta)，单位 米/米/弧度
@@ -159,6 +222,9 @@ class MotionPlannerNode(Node):
         # 圆环视觉矫正（calibrate 指令）等待状态
         self._fix_result = None     # ring_fix 节点回传的 JSON（/ring_fix/result）
         self._fix_deadline = 0.0    # 矫正超时时刻
+
+        # 任务码占位符表：{'b1c1': 4, 'b1p1': 3, ...}，来自 /task_code_decoded
+        self._task_params = {}
 
         # 绝对位姿目标（世界系）：从"当前里程计"出发，逐条指令累计
         self.tx = 0.0
@@ -176,6 +242,21 @@ class MotionPlannerNode(Node):
         # 舵机角度镜像（F407 上电默认：夹爪90 托盘0 相机90），供 plate/cam 单独设值时补齐整组
         self.servo = [90.0, 0.0, 90.0]
 
+        # 云台角度镜像 [yaw, lift, extend]
+        #   gimbal_actual：/gimbal_state 回传的实测角
+        #   gimbal_target：状态机这边认为"已经命令到位"的角度，供相对指令累加。
+        #                   None = 还没同步，下一条相对指令用实测角起算。
+        # 为什么要 target 而不是直接用 actual：`gimbal_lift -20` 连写两条时，
+        # 第一条还没物理到位就跑第二条，用 actual 会两条都算成 -20（只降一次）。
+        self.gimbal_actual = [0.0, 0.0, 0.0]
+        self.gimbal_target = None
+        # 单轴相对微调的"等到位"状态（phase == 'gimbal' 时有效）
+        #   轴号 0=yaw 1=lift 2=extend；_gimbal_wait_deg 是该轴的目标角
+        self._gimbal_wait_axis = -1
+        self._gimbal_wait_deg = 0.0
+        self._gimbal_wait_tol = 2.0
+        self.gimbal_deadline = 0.0
+
         # ---- 动作序列里启动的子程序（script / align / vision_pick）----
         self._proc = None              # subprocess.Popen
         self._proc_lines = queue.Queue()   # 后台线程把 stdout 行丢进来
@@ -189,8 +270,10 @@ class MotionPlannerNode(Node):
         if sequence_file:
             self._load_file(sequence_file)
 
-        # 执行器：每 0.1 秒推进一步（10Hz）
-        self._timer = self.create_timer(0.1, self._tick)
+        # 执行器推进频率。/gimbal_state 只有 20Hz，所以超过 20Hz 意义不大；
+        # 提频的收益是"到位判断更跟手"（10Hz = 最多多等 100ms）。
+        tick_hz = max(1.0, float(self.get_parameter('tick_hz').value))
+        self._timer = self.create_timer(1.0 / tick_hz, self._tick)
         self.get_logger().info('状态机就绪，等待 /motion_load 下发指令序列')
 
     # ---------------- 订阅回调 ----------------
@@ -202,6 +285,25 @@ class MotionPlannerNode(Node):
         theta = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.odom = (msg.pose.pose.position.x, msg.pose.pose.position.y, theta)
+
+    def _cb_gimbal_state(self, msg: Float32MultiArray):
+        """云台实测角 [yaw, lift, extend]（F407 每帧回传）。
+
+        第一次收到（或刚被重置）时顺手把"目标镜像"对齐到实测值，
+        这样相对指令永远是从云台现在的位置起算。
+        """
+        if len(msg.data) < 3:
+            return
+        self.gimbal_actual = [float(msg.data[0]), float(msg.data[1]),
+                              float(msg.data[2])]
+        if self.gimbal_target is None:
+            self.gimbal_target = list(self.gimbal_actual)
+
+    def _gimbal_target(self):
+        """取相对指令的累加基准；没有实测值时退回全 0。"""
+        if self.gimbal_target is None:
+            self.gimbal_target = list(self.gimbal_actual)
+        return self.gimbal_target
 
     def _cb_load(self, msg: String):
         """上位机下发序列：解析 JSON，立刻从"当前所在位置"开始执行。"""
@@ -232,6 +334,56 @@ class MotionPlannerNode(Node):
             data = {'ok': False, 'reason': f'结果不是合法 JSON：{msg.data[:80]}'}
         self._fix_result = data if isinstance(data, dict) else {'ok': False}
 
+    def _cb_task_code(self, msg: String):
+        """qr_scanner 的任务码：展开成 {b1c1: 颜色, b1p1: 位置, ...} 平铺表。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(data, dict):
+            return
+        flat = {}
+        for i, v in enumerate(data.get('batch1_colors') or []):
+            flat[f'b1c{i + 1}'] = v
+        for i, v in enumerate(data.get('batch1_places') or []):
+            flat[f'b1p{i + 1}'] = v
+        for i, v in enumerate(data.get('batch2_colors') or []):
+            flat[f'b2c{i + 1}'] = v
+        for i, v in enumerate(data.get('batch2_places') or []):
+            flat[f'b2p{i + 1}'] = v
+        if flat and flat != self._task_params:
+            self.get_logger().info(f'任务码就绪，占位符可用：{flat}')
+        self._task_params = flat
+
+    def _resolve_token(self, value, what: str):
+        """把 '$b1c1$' 占位符换成任务码数值；普通值原样返回。缺任务码抛 KeyError。"""
+        if isinstance(value, str):
+            m = re.fullmatch(r'\s*\$\s*(\w+)\s*\$\s*', value)
+            if m:
+                key = m.group(1)
+                if key in self._task_params:
+                    return self._task_params[key]
+                raise KeyError(f'${key}$（任务码还没扫到？）')
+        return value
+
+    def _ring_place_cmd(self, number: int, layer: int) -> dict:
+        """由环号(1~3)和层(0/1)查表得到 place 宏参数（三环角度独立标定，见
+        vehicle.yaml 注释；车必须已 calibrate 对位且不动）。层 1 = 同环角度 +
+        lift 抬高 stack_lift_deg（叠在第一批物料上方）。"""
+        gp = self.get_parameter
+        n = int(number)
+        return {
+            'cmd': 'place',
+            'yaw_deg': float(gp(f'place_ring{n}_yaw_deg').value),
+            'lift_deg': float(gp(f'place_ring{n}_lift_deg').value)
+                         + layer * float(gp('stack_lift_deg').value),
+            'safe_lift_deg': float(gp('place_safe_lift_deg').value),
+            'extend_deg': float(gp(f'place_ring{n}_extend_deg').value),
+            'gripper_open': float(gp('place_gripper_open_deg').value),
+            'gripper_close': 35.0,
+            'settle_ms': int(gp('place_settle_ms').value),
+        }
+
     # ---------------- 序列加载 ----------------
 
     def _load_file(self, path: str):
@@ -257,6 +409,9 @@ class MotionPlannerNode(Node):
             return
         # 抓取/放置宏展开成基本指令，状态机本体不用认识宏
         self.commands = self._expand_macros(self.commands)
+        # 新序列从"云台现在实际在哪"开始累加相对指令：两次运行之间可能用手柄
+        # 调过云台，不重新对齐的话第一条 gimbal_lift 会跳回上次的旧位置。
+        self.gimbal_target = None
         self._publish_state(f'已加载 {len(self.commands)} 条指令，等待开始')
         self.get_logger().info(f'加载序列：{len(self.commands)} 条')
         self._start()
@@ -374,6 +529,27 @@ class MotionPlannerNode(Node):
             if self._now() < self.deadline:   # 还没到时间，继续等
                 return
             self.phase = 'stepping'
+        elif self.phase == 'gimbal':
+            # 等单轴相对微调到位：只盯被命令的那一根轴，偏差进容差就放行。
+            # 不返回时 phase 已经是 'stepping'，本拍就直接走下面的 while 继续下一条。
+            idx = self._gimbal_wait_axis
+            if 0 <= idx < 3:
+                label = ('yaw', 'lift', 'extend')[idx]
+                err = self.gimbal_actual[idx] - self._gimbal_wait_deg
+                if abs(err) <= self._gimbal_wait_tol:
+                    self.phase = 'stepping'
+                elif self._now() > self.gimbal_deadline:
+                    self._publish_state(
+                        f'云台 {label} 到位超时：目标 {self._gimbal_wait_deg:+.1f}°'
+                        f'，实测 {self.gimbal_actual[idx]:+.1f}°（差 {err:+.1f}°，'
+                        f'容差 ±{self._gimbal_wait_tol:.1f}°），继续执行后续指令')
+                    self.get_logger().warning(
+                        f'云台 {label} 到位超时（差 {err:+.1f}°）')
+                    self.phase = 'stepping'
+                else:
+                    return
+            else:
+                self.phase = 'stepping'
 
         # 连续执行：不阻塞的指令（舵机/云台/注释…）一条接一条，遇到阻塞的（走/转/延时）就停下等
         while self.phase == 'stepping':
@@ -440,14 +616,73 @@ class MotionPlannerNode(Node):
             self.deadline = self._now() + float(cmd.get('ms', 0)) / 1000.0
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 等待 {cmd.get("ms", 0)}ms')
             self.phase = 'waiting'
-        elif name == 'gimbal':        # 云台轴（不阻塞，发了就走）
+        elif name == 'gimbal':        # 云台三轴绝对角（不阻塞，发了就走）
             a = Float32MultiArray()
             a.data = [float(cmd.get('yaw_deg', 0.0)),
                       float(cmd.get('lift_deg', 0.0)),
                       float(cmd.get('extend_deg', 0.0))]
             self._pub_gimbal.publish(a)
+            self.gimbal_target = list(a.data)   # 绝对指令：镜像直接对齐
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 云台 yaw={a.data[0]}° lift={a.data[1]}°')
             # 不阻塞：phase 保持 stepping
+        elif name in ('gimbal_yaw', 'gimbal_lift', 'gimbal_ext'):
+            # 单轴相对微调：只改一个轴，量是"相对当前角度加多少"。
+            # 典型用法：color_pick 用视觉把物料吊到正上方之后，不需要知道 yaw
+            # 具体是多少，只补一个 lift/extend 的量把夹爪降到抓取高度。
+            #
+            # 阻塞：发完目标进入 phase='gimbal'，等 /gimbal_state 的实测角进容差
+            # 才放行下一条。所以后面不用再写 delay，也不会出现"云台还没降下去
+            # 夹爪就合上了"。超时只报警、继续往下走。
+            axis, label = {'gimbal_yaw': (0, 'yaw'),
+                           'gimbal_lift': (1, 'lift'),
+                           'gimbal_ext': (2, 'extend')}[name]
+            try:
+                delta = float(cmd.get('delta_deg', 0.0))
+            except (TypeError, ValueError):
+                delta = 0.0
+            try:
+                tol = abs(float(cmd['tol_deg']))
+            except (KeyError, TypeError, ValueError):
+                tol = self.gimbal_tol_deg
+            try:
+                timeout = float(cmd['timeout_ms']) / 1000.0
+            except (KeyError, TypeError, ValueError):
+                timeout = self.gimbal_timeout_s
+
+            target = self._gimbal_target()
+            target[axis] += delta
+            a = Float32MultiArray()
+            a.data = list(target)
+            self._pub_gimbal.publish(a)
+
+            self._gimbal_wait_axis = axis
+            self._gimbal_wait_deg = target[axis]
+            self._gimbal_wait_tol = tol
+            self.gimbal_deadline = self._now() + max(0.0, timeout)
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 云台 {label} '
+                f'{delta:+.1f}° → {target[axis]:+.1f}°，等到位（±{tol:.1f}°）')
+            self.phase = 'gimbal'
+        elif name == 'tray_slot':    # 载物盘转到第 N 个料位（角度查 vehicle.yaml）
+            try:
+                n = int(self._resolve_token(cmd.get('number'), 'number'))
+            except (KeyError, ValueError) as error:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] tray_slot：参数无效'
+                    f'（{error}），跳过')
+                return
+            if not 1 <= n <= 3:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] tray_slot：料位 {n} 越界'
+                    '（只能 1~3），跳过')
+                return
+            deg = float(self.get_parameter(f'tray_slot{n}_deg').value)
+            self.servo[1] = deg                     # 载物盘 = 舵机组第 2 个
+            smsg = Float32MultiArray()
+            smsg.data = list(self.servo)            # 整组下发，避免缺值
+            self._pub_servo.publish(smsg)
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 载物盘 -> 料位{n} ({deg}°)')
         elif name in ('gripper', 'plate', 'cam'):   # 三个舵机
             idx = {'gripper': 0, 'plate': 1, 'cam': 2}[name]
             self.servo[idx] = float(cmd.get('deg', 0.0))
@@ -480,6 +715,49 @@ class MotionPlannerNode(Node):
                 f'[{self.index+1}/{len(self.commands)}] 圆环视觉矫正 → '
                 f'({rx:+.3f},{ry:+.3f})m，识别对位中…')
             self.phase = 'fixing'
+        elif name == 'color_pick':     # 按颜色抓物料：vision_pick 封装
+            try:
+                color = self._resolve_token(cmd.get('color'), 'color')
+                if isinstance(color, str) and color.isdigit():
+                    color = int(color)
+                if isinstance(color, int) and not 1 <= color <= 6:
+                    raise ValueError(f'颜色编号 {color} 越界（只能 1~6）')
+            except (KeyError, ValueError) as error:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] color_pick：{error}，跳过')
+                return
+            # 复用 vision_pick 全链路：跑视觉程序（带 --color），JSON 回来插 pick 宏
+            # no_pick：color_pick 只要求云台跟随到物料上方，不自动抓——
+            # 抓取/放载物盘等后续动作由序列里写死的 gimbal/gripper/plate 指令完成。
+            vp = {'cmd': 'vision_pick',
+                  'program': cmd.get('program')
+                             or self.get_parameter('vision_program').value or '',
+                  'args': (str(cmd.get('args')
+                               or self.get_parameter('vision_args').value or '')
+                           + f' --color {color}').strip(),
+                  'timeout_s': cmd.get('timeout_s', 60.0),
+                  'no_pick': True}
+            self._execute(vp)
+        elif name in ('number_put', 'double_put'):   # 按环号放置 / 叠放
+            try:
+                number = int(self._resolve_token(cmd.get('number'), 'number'))
+            except (KeyError, ValueError) as error:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] {name}：参数无效（{error}），跳过')
+                return
+            if not 1 <= number <= 3:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] {name}：环号 {number} 越界'
+                    '（只能 1~3），跳过')
+                return
+            layer = 1 if name == 'double_put' else 0
+            place = self._ring_place_cmd(number, layer)
+            expanded = self._macro_pick(place, 'place')
+            self.commands[self.index + 1:self.index + 1] = expanded
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] {name} → '
+                f'环{number} 层{layer}（yaw={place["yaw_deg"]}° '
+                f'lift={place["lift_deg"]}° ext={place["extend_deg"]}°），执行 place 宏')
         elif name == 'script':
             wait = bool(cmd.get('wait', True))
             if self._start_proc(cmd, 'script'):
@@ -670,6 +948,9 @@ class MotionPlannerNode(Node):
         if thr is not None:
             thr.join(timeout=1.0)
         self._proc_result = self._parse_proc_result()
+        # 子程序（尤其 color_pick 的视觉跟随）会直接动云台，状态机的目标镜像
+        # 已经对不上了。重置成 None，下一条相对指令用实测角重新起算。
+        self.gimbal_target = None
 
         if kind == 'align':
             self._apply_align()
@@ -749,13 +1030,53 @@ class MotionPlannerNode(Node):
         self.phase = 'moving'
 
     def _apply_vision_pick(self):
-        """视觉定点抓取：把识别出的云台角度填进 pick 宏，插到当前指令后面执行。"""
+        """视觉定点抓取：把识别出的云台角度填进 pick 宏，插到当前指令后面执行。
+
+        位姿优先级：视觉 JSON 值 → pick_default_* 兜底；yaw/lift/extend 再统一
+        加 pick_*_offset（机械标定修正，不改视觉程序就能整体平移抓取点）。
+        """
+        if (self._proc_cmd or {}).get('no_pick'):
+            # color_pick 语义：云台已跟随到目标上方，继续执行后续指令即可。
+            # 但不能只看"进程结束"就报成功——视觉超时/没找到物料/打不开摄像头
+            # 时 JSON 里是 ok:false，必须原样报到界面上，否则后续夹爪指令
+            # 会在云台还停在原地的情况下"抓空"，看起来却一切正常。
+            data = self._proc_result or {}
+            if not data:
+                self._publish_state(
+                    'color_pick 视觉程序没有返回 JSON（看程序输出：摄像头/路径/'
+                    'DISPLAY 问题）——继续执行后续指令')
+            elif not data.get('ok', True):
+                self._publish_state(
+                    f'color_pick 失败：{data.get("reason", "未知原因")}'
+                    '——继续执行后续指令')
+            else:
+                self._publish_state(
+                    f'云台已跟随到物料上方（color_pick，不自动抓取）：'
+                    f'yaw={data.get("yaw_deg", 0):+.1f}° '
+                    f'lift={data.get("lift_deg", 0):+.1f}° '
+                    f'ext={data.get("extend_deg", 0):+.1f}°')
+            self.phase = 'stepping'
+            return
         data = self._proc_result or {}
-        pick = {'cmd': 'pick'}
-        for key in ('yaw_deg', 'lift_deg', 'safe_lift_deg', 'extend_deg',
-                    'gripper_open', 'gripper_close', 'settle_ms'):
-            if key in data:
-                pick[key] = data[key]
+        gp = self.get_parameter
+
+        def _num(key, default_key):
+            return float(data.get(key, gp(default_key).value))
+
+        pick = {'cmd': 'pick',
+                'yaw_deg': _num('yaw_deg', 'pick_default_yaw_deg')
+                           + float(gp('pick_yaw_offset_deg').value),
+                'lift_deg': _num('lift_deg', 'pick_default_lift_deg')
+                            + float(gp('pick_lift_offset_deg').value),
+                'safe_lift_deg': _num('safe_lift_deg', 'pick_safe_lift_deg'),
+                'extend_deg': _num('extend_deg', 'pick_default_extend_deg')
+                              + float(gp('pick_extend_offset_deg').value),
+                'gripper_open': float(data.get(
+                    'gripper_open', gp('pick_gripper_open_deg').value)),
+                'gripper_close': float(data.get(
+                    'gripper_close', gp('pick_gripper_close_deg').value)),
+                'settle_ms': int(data.get(
+                    'settle_ms', gp('pick_settle_ms').value))}
 
         if not data:
             self._publish_state('视觉识别没有返回 JSON，使用默认抓取位')

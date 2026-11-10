@@ -87,7 +87,7 @@ enum
 #define SERVO_PULSE_MAX     2500    /* 180° 脉宽 us */
 
 /* 上电初始角度 */
-#define SERVO_GRIPPER_INIT  90.0f
+#define SERVO_GRIPPER_INIT  45.0f
 #define SERVO_PLATE_INIT    0.0f
 #define SERVO_CAM_INIT      90.0f
 

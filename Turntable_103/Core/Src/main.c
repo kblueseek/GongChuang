@@ -34,13 +34,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* ==================== 转盘参数（只改这里） ==================== */
-#define PULSE_MIN   500u   /* 起点脉宽 us（0°），实测后微调 */
-#define PULSE_MAX   2500u   /* 终点脉宽 us（360°），实测后微调 */
-#define STEP        2u      /* 每步增加多少 us */
-#define STEP_MS     4u      /* 每步间隔 ms */
-
-/* 一圈周期 = (PULSE_MAX - PULSE_MIN) / STEP × STEP_MS
-             = 1000 / 1 × 8 = 8000ms = 8 秒一圈 */
+# define v_8 1570
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,7 +45,6 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t s_Pulse = PULSE_MIN;   /* 当前输出的脉宽 us，Keil Watch 里能看 */
 
 /* USER CODE END PV */
 
@@ -110,22 +103,18 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM3_Init();
   //__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, PULSE_MIN);
-	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 100);
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, v_8);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-	int dir =1;
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    s_Pulse += dir*STEP;                        
-    if ((s_Pulse >= PULSE_MAX) || (s_Pulse <= PULSE_MIN)) dir = -dir; 
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, s_Pulse);
-    HAL_Delay(STEP_MS);
+
   }
   /* USER CODE END 3 */
 }

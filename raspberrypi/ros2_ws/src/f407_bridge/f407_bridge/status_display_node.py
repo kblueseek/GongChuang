@@ -13,7 +13,7 @@
     第 2 页 云台：三轴当前位置（相对 0 点，单位 °）
     第 3 页 限位：三轴当前的软限位（来自示教结果）
 
-  ── 开机限位示教（启动后自动进入）──
+  ── 开机限位示教（文件顶部 TEACHING_ENABLED 可整体关闭；默认已关）──
     1. 节点先让 F407 把云台三个电机"松轴"（电机控制板失能），并保持整车失能；
     2. 屏幕提示 "YAW -> MIN"，用手把 Yaw 轴拨到想要的最小点，按 按键3 记录；
     3. 提示 "YAW -> MAX"，拨到最大点，再按 按键3；
@@ -120,6 +120,15 @@ _STATE_TEXT = {0: "DISABLED", 1: "READY", 2: "FAULT"}
 _AXES = (("YAW", 0), ("LIFT", 1), ("EXT", 2))
 _PAGE_COUNT = 3
 
+# ==================== 条件编译开关：限位示教功能 ====================
+# False = 取消示教（当前默认）：开机不进入示教流程，示教按键（1 跳过 / 2 重来 /
+#         4 退出）全部无效；按键 3 保留"翻页"功能。云台零点/限位一律在上位机
+#         PID 页操作：上电摆好固定姿态 →【设为零点】→【下发限位】。
+#         已保存的限位文件仍会加载并下发（兜底），屏幕第 3 页照常显示。
+# True  = 恢复完整示教：开机自动进入限位示教（不带上位机跑场地时用这个）。
+# 改完重启本节点即生效（--symlink-install 下不需要重新 colcon build）。
+TEACHING_ENABLED = False
+
 
 class StatusDisplayNode(Node):
     def __init__(self):
@@ -147,7 +156,14 @@ class StatusDisplayNode(Node):
         self._width = int(self.get_parameter('width').value)
         self._height = int(self.get_parameter('height').value)
         self._timeout_s = float(self.get_parameter('timeout_s').value)
-        self._auto_setup = bool(self.get_parameter('auto_setup').value)
+        # TEACHING_ENABLED=False 时强制关闭示教：不开机自动进、状态机停在 'off'，
+        # 已保存限位仍会加载下发（见 _on_setup_tick 的常态重发），按键 3 仍可翻页。
+        self._auto_setup = (bool(self.get_parameter('auto_setup').value)
+                            and TEACHING_ENABLED)
+        if not TEACHING_ENABLED:
+            self._setup_state_forced_off = True
+        else:
+            self._setup_state_forced_off = False
         self._startup_delay_s = float(self.get_parameter('startup_delay_s').value)
         self._min_span_deg = float(self.get_parameter('min_span_deg').value)
         self._limits_file = os.path.expanduser(
@@ -208,7 +224,8 @@ class StatusDisplayNode(Node):
 
         # ================= 限位示教状态 =================
         # 'wait' 等 F407 上电锁存基准；'min'/'max' 示教中；'off' 正常
-        self._setup_state = 'wait'
+        # TEACHING_ENABLED=False 时直接从 'off' 起步（不示教，只显示+兜底重发限位）
+        self._setup_state = 'wait' if TEACHING_ENABLED else 'off'
         self._setup_axis = 0               # 当前示教的轴 0=yaw 1=lift 2=extend
         self._setup_min = [None, None, None]
         self._limits = self._load_limits()  # 上次保存的 {轴: (min, max)}
@@ -254,8 +271,12 @@ class StatusDisplayNode(Node):
             self.get_logger().info(
                 f'{self._startup_delay_s:.1f}s 后开始云台限位示教（依次 YAW -> LIFT -> EXT）。'
                 '按 按键3 立即开始，按 按键4 跳过。')
-        else:
+        elif TEACHING_ENABLED:
             self.get_logger().info('状态屏就绪（限位示教已跳过）')
+        else:
+            self.get_logger().info(
+                '状态屏就绪（TEACHING_ENABLED=False：示教功能已关闭，'
+                '零点/限位请在上位机 PID 页操作；按键3 仍可翻页）')
 
     # ---------------- 按键 ----------------
 
@@ -295,11 +316,13 @@ class StatusDisplayNode(Node):
 
     def _on_confirm(self):
         """按键3：示教中记录当前点；非示教时翻页。"""
-        if self._setup_state == 'wait':
+        if TEACHING_ENABLED and self._setup_state == 'wait':
             self._begin_setup()
             return
         if self._setup_state == 'off':
             self._page = (self._page + 1) % _PAGE_COUNT
+            return
+        if not TEACHING_ENABLED:
             return
 
         pos = self._current_pos()
@@ -328,6 +351,8 @@ class StatusDisplayNode(Node):
 
     def _on_skip(self):
         """按键1：跳过当前轴，保留上次保存的限位。"""
+        if not TEACHING_ENABLED:
+            return
         if self._setup_state not in ('min', 'max'):
             return
         name = _AXES[self._setup_axis][0]
@@ -337,6 +362,8 @@ class StatusDisplayNode(Node):
 
     def _on_redo(self):
         """按键2：当前轴重来。"""
+        if not TEACHING_ENABLED:
+            return
         if self._setup_state not in ('min', 'max'):
             return
         name = _AXES[self._setup_axis][0]
@@ -347,6 +374,8 @@ class StatusDisplayNode(Node):
 
     def _on_exit(self):
         """按键4：退出示教，已记录的轴生效，其余沿用上次保存值。"""
+        if not TEACHING_ENABLED:
+            return
         if self._setup_state == 'wait':
             self._setup_state = 'off'
             self._start_at = 0.0

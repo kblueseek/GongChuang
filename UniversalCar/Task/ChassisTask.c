@@ -19,9 +19,9 @@ Chassis_t Chassis;
 /* 已装进 PID 的调参版本号。PiTune.Version 变了才重装增益。 */
 static uint32_t s_TuneVersion = 0;
 
-/* 参数回显节奏：0=空闲，1..13=下一拍要回显的参数。
+/* 参数回显节奏：0=空闲，1..22=下一拍要回显的参数。
    调参帧在串口中断里解析，只把 Version+1；回显放到这里逐拍发一条，
-   既避开了中断里阻塞发送，也不会在 5ms 控制周期里连发 13 帧把底盘卡住。*/
+   既避开了中断里阻塞发送，也不会在 5ms 控制周期里连发 22 帧把底盘卡住。*/
 static uint8_t s_TuneEchoStep = 0;
 
 /* 已装进底盘 PID 的增益。Version 只要变（哪怕是调云台 PID）都会进来，
@@ -58,7 +58,7 @@ static void Chassis_ApplyTune(void)
         s_TuneEchoStep = 1;             /* 开始把当前整套参数回报给上位机 */
 }
 
-/* 每拍最多回显一条参数，13 拍（65ms）走完一轮。连续拖动滑杆时循环滚动，
+/* 每拍最多回显一条参数，22 拍（110ms）走完一轮。连续拖动滑杆时循环滚动，
    上位机最终能看到全部最新值。 */
 static void Chassis_TuneEchoTick(void)
 {
@@ -68,7 +68,7 @@ static void Chassis_TuneEchoTick(void)
     if (s_TuneEchoStep == 0)
         return;
 
-    id = (uint8_t)(PI_TUNE_MAX_VX + (s_TuneEchoStep - 1));   /* id 连续 0x01..0x0D */
+    id = (uint8_t)(PI_TUNE_MAX_VX + (s_TuneEchoStep - 1));   /* id 连续 0x01..0x16 */
     switch (id) {
     case PI_TUNE_MAX_VX:    v = PiTune.MaxSpeedX;    break;
     case PI_TUNE_MAX_VY:    v = PiTune.MaxSpeedY;    break;
@@ -83,13 +83,22 @@ static void Chassis_TuneEchoTick(void)
     case PI_TUNE_GIMBAL_KP: v = PiTune.GimbalKp;     break;
     case PI_TUNE_GIMBAL_KI: v = PiTune.GimbalKi;     break;
     case PI_TUNE_GIMBAL_KD: v = PiTune.GimbalKd;     break;
+    case PI_TUNE_GIMBAL_LIFT_KP: v = PiTune.GimbalLiftKp; break;
+    case PI_TUNE_GIMBAL_LIFT_KI: v = PiTune.GimbalLiftKi; break;
+    case PI_TUNE_GIMBAL_LIFT_KD: v = PiTune.GimbalLiftKd; break;
+    case PI_TUNE_GIMBAL_EXT_KP:  v = PiTune.GimbalExtKp;  break;
+    case PI_TUNE_GIMBAL_EXT_KI:  v = PiTune.GimbalExtKi;  break;
+    case PI_TUNE_GIMBAL_EXT_KD:  v = PiTune.GimbalExtKd;  break;
+    case PI_TUNE_GIMBAL_YAW_SPEED:  v = PiTune.GimbalYawSpeed;  break;
+    case PI_TUNE_GIMBAL_LIFT_SPEED: v = PiTune.GimbalLiftSpeed; break;
+    case PI_TUNE_GIMBAL_EXT_SPEED:  v = PiTune.GimbalExtSpeed;  break;
     default:
         s_TuneEchoStep = 0;
         return;
     }
 
     PiComm_SendTune(id, v);
-    s_TuneEchoStep = (s_TuneEchoStep >= 13) ? 0 : (uint8_t)(s_TuneEchoStep + 1);
+    s_TuneEchoStep = (s_TuneEchoStep >= 22) ? 0 : (uint8_t)(s_TuneEchoStep + 1);
 }
 
 /* 限幅工具：上限 <= 0 说明 PiTune 还没初始化，回退到宏，避免把车锁死。 */

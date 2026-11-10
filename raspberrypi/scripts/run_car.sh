@@ -16,4 +16,4 @@ bash "$REPO_ROOT/scripts/mk_libexec.sh"
 
 source "$REPO_ROOT/ros2_ws/install/setup.bash"
 
-exec ros2 launch lidar_bringup car_only.launch.py
+exec ros2 launch car_bringup car_only.launch.py

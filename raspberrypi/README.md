@@ -5,7 +5,7 @@
 1. **视觉**（`vision/`）——物料 / 转台 / 圆环工位识别，OpenCV + USB 摄像头，独立进程；
 2. **激光雷达避障**——两条链路：
    - `上位机/` 里的地图导航：D6 雷达串口扫描 → 识别障碍 → A* 绕障 → 下发 `goto` 路点；
-   - `ros2_ws/src/lidar_bringup` + `obstacle_detect`：YDLIDAR X3 PRO（`/scan`，旧链路）；
+   - `ros2_ws/src/car_bringup` + `obstacle_detect`：YDLIDAR X3 PRO（旧链路）（`/scan`，旧链路）；
 3. **运动指令下发**（`comm/pi_comm.py` + `f407_bridge`）——通过 USART 与 F407 通信（PiComm 协议）。
 
 ## 目录结构
@@ -21,12 +21,14 @@
 │   └── field.json            # 场地尺寸 / 雷达位姿 / 车起点 / 任务路线
 ├── ros2_ws/         # ROS2 工作区（Ubuntu 26.04 + Lyrical Luth）
 │   └── src/
-│       ├── lidar_bringup/    # X3 PRO 参数 + launch（system.launch.py = 总启动）
+│       ├── car_bringup/     # 整车启动包：launch + 集中配置 vehicle.yaml（雷达参数 x3_pro.yaml）
 │       ├── obstacle_detect/  # /scan -> /obstacles（前后左右扇区最近距离）
-│       ├── f407_bridge/      # ROS2 话题 <-> F407 串口（PiComm）
-│       └── motion_planner/   # /motion_load 指令序列状态机（move/turn/goto/云台…）
+│       ├── f407_bridge/      # ROS2 话题 <-> F407 串口（PiComm）+ /set_odom 里程计修正
+│       ├── motion_planner/   # /motion_load 指令序列状态机（move/turn/goto/宏/calibrate）
+│       ├── ring_fix/         # 圆环工位视觉矫正（calibrate 指令的执行者）
+│       └── joy_control/      # USB 手柄 -> 控制话题（任务执行时自动让位）
 ├── scripts/         # run_car.sh / run_gui.sh / setup.sh / bringup.sh
-└── docs/            # 树莓派构建指南
+└── docs/            # 树莓派架构 / 构建指南 / 上位机使用说明 / 使用指南 / 无线链路搭建
 ```
 
 ## 快速开始
@@ -82,12 +84,15 @@ bash scripts/run_gui.sh    # 另开终端跑上位机（动作序列 + 雷达地
 ## 数据流
 
 ```
-D6 雷达 ──串口──> 上位机地图（扫描/识别/A*）──/motion_load(goto)──> motion_planner ──/cmd_pose──┐
-                                                                                             v
-USB摄像头 ──> vision（独立进程，旧协议，待迁移）                                       f407_bridge ──PiComm(AA 55)──> F407
-                                                                                             ^
-X3 PRO ──/scan──> obstacle_detect ──/obstacles──>（旧避障占位）        /odom /robot_status <──┘
+D6 雷达 ──串口──> 上位机地图（扫描/识别/A* 含转向惩罚）──/motion_load(序列)──> motion_planner ──/cmd_pose──┐
+                                                                                                         v
+vision/圆环检测 <──摄像头── ring_fix（calibrate 触发，/set_odom 重置里程计）                   f407_bridge ──PiComm(AA 55)──> F407
+                                                                                                         ^
+USB手柄 ──/joy──> joy_control ──/cmd_vel…──┐                          /odom /robot_status /odom_shift <──┘
+X3 PRO ──/scan──> obstacle_detect ──/obstacles──> 上位机（绕障规划用）
 ```
+
+**整车架构（分层、链路、频率、控制环）见 [docs/树莓派架构.md](docs/树莓派架构.md)**。
 
 ## 通信协议
 

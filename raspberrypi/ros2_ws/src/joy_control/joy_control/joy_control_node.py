@@ -224,10 +224,11 @@ class JoyControlNode(Node):
         self._planner_active_t = 0.0           # 最近一次收到 /motion_active=True 的时刻（做超时自恢复）
 
         # 定时器 100Hz：F407 控制环 200Hz，指令源跟到 100Hz（每 2 拍刷一次）。
-        # 链路预算：每拍下行 = VEL 13B + 云台 3×10B = 43B，100Hz 约 4.3kB/s，
-        # 加上 20Hz 里程计回传 ~0.4kB/s，115200 只用到 ~41%。
+        # 链路预算（115200 8N1 = 11520 B/s，上下行各自独立，全双工）：
+        #   每拍上行 = VEL 13B + 云台 3×10B = 43B，100Hz ≈ 4.3kB/s = 37%；
+        #   云台回中也是每拍一帧 0（刻意保留：不依赖 F407 的 300ms 超时兜底）。
         # 再往上就受限于 /joy 本身的事件率（手柄一般 100~125Hz），加频收益很小；
-        # 真要 200Hz 得先把两端波特率提到 460800。云台每拍都发（回中发 0），F407 侧 300ms 超时兜底。
+        # 真要 200Hz 得先把两端波特率提到 460800。
         self._timer = self.create_timer(0.01, self._tick)
         self.get_logger().info(
             f'joy_control 就绪：layout={self.layout}（收到 /joy 后自动识别 PS2/Xbox 编号）'

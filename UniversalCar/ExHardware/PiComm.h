@@ -56,6 +56,15 @@
 #define PI_TUNE_GIMBAL_KP    0x0B    /* 云台位置环 Kp（度域：误差 ° → 速度 °/s） */
 #define PI_TUNE_GIMBAL_KI    0x0C    /* 云台位置环 Ki */
 #define PI_TUNE_GIMBAL_KD    0x0D    /* 云台位置环 Kd */
+#define PI_TUNE_GIMBAL_LIFT_KP 0x0E  /* 云台 lift 位置环 Kp（0x0B~0x0D 是 yaw 轴） */
+#define PI_TUNE_GIMBAL_LIFT_KI 0x0F
+#define PI_TUNE_GIMBAL_LIFT_KD 0x10
+#define PI_TUNE_GIMBAL_EXT_KP  0x11  /* 云台 extend 位置环 Kp */
+#define PI_TUNE_GIMBAL_EXT_KI  0x12
+#define PI_TUNE_GIMBAL_EXT_KD  0x13
+#define PI_TUNE_GIMBAL_YAW_SPEED   0x14  /* 云台 yaw 最大速度 °/s（位置环输出限幅） */
+#define PI_TUNE_GIMBAL_LIFT_SPEED  0x15
+#define PI_TUNE_GIMBAL_EXT_SPEED   0x16
 
 /// @brief 在线可调参数（上位机 PID 调参页下发，立即生效，不烧录）
 /// @note  Version 每次收到调参帧 +1；底盘任务发现版本变了才重装 PID 增益，
@@ -77,9 +86,18 @@ typedef struct
     float HeadingKi;
     float HeadingKd;
 
-    float GimbalKp;     //云台位置环 Kp（度域：误差 ° → 速度 °/s）
+    float GimbalKp;     //云台 yaw 位置环 Kp（度域：误差 ° → 速度 °/s）
     float GimbalKi;
     float GimbalKd;
+    float GimbalLiftKp; //云台 lift 位置环（yaw/lift/extend 三环独立整定）
+    float GimbalLiftKi;
+    float GimbalLiftKd;
+    float GimbalExtKp;  //云台 extend 位置环
+    float GimbalExtKi;
+    float GimbalExtKd;
+    float GimbalYawSpeed;   //云台三轴最大速度 °/s（0 或负 = 用固件默认）
+    float GimbalLiftSpeed;
+    float GimbalExtSpeed;
 
     uint32_t Version;   //调参版本号，底盘/云台任务用它判断是否需要重装
 } PiTune_t;

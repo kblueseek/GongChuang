@@ -267,9 +267,18 @@ TUNE_POS_KD = 0x07
 TUNE_HEAD_KP = 0x08     # 转向环 Kp
 TUNE_HEAD_KI = 0x09
 TUNE_HEAD_KD = 0x0A
-TUNE_GIMBAL_KP = 0x0B   # 云台位置环 Kp（误差 ° → 速度 °/s）
+TUNE_GIMBAL_KP = 0x0B   # 云台 yaw 位置环 Kp（误差 ° → 速度 °/s）
 TUNE_GIMBAL_KI = 0x0C
 TUNE_GIMBAL_KD = 0x0D
+TUNE_GIMBAL_LIFT_KP = 0x0E   # 云台 lift 位置环（yaw/lift/extend 独立整定）
+TUNE_GIMBAL_LIFT_KI = 0x0F
+TUNE_GIMBAL_LIFT_KD = 0x10
+TUNE_GIMBAL_EXT_KP = 0x11   # 云台 extend 位置环
+TUNE_GIMBAL_EXT_KI = 0x12
+TUNE_GIMBAL_EXT_KD = 0x13
+TUNE_GIMBAL_YAW_SPEED = 0x14   # 云台 yaw 最大速度 °/s（位置环输出限幅）
+TUNE_GIMBAL_LIFT_SPEED = 0x15
+TUNE_GIMBAL_EXT_SPEED = 0x16
 
 
 def encode_tune(param_id: int, value: float) -> bytes:

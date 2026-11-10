@@ -1,6 +1,6 @@
 # 视觉跟随云台 demo：物料识别 + 像素误差 PID 控制 yaw/extend。
 #
-# 依赖：先跑 run_car（= lidar_bringup car_only.launch.py，f407_bridge +
+# 依赖：先跑 run_car（= car_bringup car_only.launch.py，f407_bridge +
 #       joy_control + 状态屏 + 运动规划都在里面），再另开一个终端起本 launch。
 #       select 键（手柄）切换视觉接管。
 #
