@@ -87,6 +87,7 @@ field.json 和"车起点 / 雷达安装位姿"这类安装参数里。屏幕上�
 导航过程中手柄除 B（失能）外全部让位，见 joy_control 的说明。
 """
 
+import copy
 import json
 import math
 import re
@@ -101,7 +102,7 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray, String
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import lidar_d6
 import mapping
@@ -112,6 +113,15 @@ NODES_PATH = os.path.join(HERE, "nodes.json")
 # PID 调参页的配置文件：滑杆改动自动保存到这里，下次开 GUI 自动恢复。
 # 想还原固件默认，PID 页点【恢复默认】即可（会把默认值写回此文件）。
 TUNE_PROFILE_PATH = os.path.join(HERE, "tune_profile.json")
+
+# 视觉跟踪 PID（color_pick 用的云台速度环）：直接读写这个 JSON，不走 407 调参通道。
+# gimbal_track_pick.py 每次启动都会读它，所以改完、下次执行 color_pick 就生效。
+TRACK_PID_PATH = os.path.normpath(
+    os.path.join(HERE, "..", "vision", "config", "track_pid.json"))
+
+# 舵机角度（夹爪 / 载物盘）：滑杆改动自动保存，下次开 GUI 恢复。
+# 直接发 /cmd_servo，由 f407_bridge 转发 F407，不经过 motion_planner。
+SERVO_PROFILE_PATH = os.path.join(HERE, "servo_profile.json")
 
 # ---------------- 配色（和 map_app 一致） ----------------
 C_BG      = "#ffffff"
@@ -393,6 +403,45 @@ TUNE_GROUPS = [
     ('云台最大速度 °/s', ('gim_yaw_speed', 'gim_lift_speed', 'gim_ext_speed')),
 ]
 
+# 视觉跟踪 PID（gimbal_track_pick.py 的速度环，存 vision/config/track_pid.json）
+# (键名, 显示名, 最小, 最大, 步长, 默认值, 是否整数)
+TRACK_PARAMS = [
+    ('kp_yaw',           '跟踪yaw Kp (px→°/s)',    0.0,  5.0, 0.01, 0.2, False),
+    ('ki_yaw',           '跟踪yaw Ki',             0.0,  2.0, 0.005, 0.0, False),
+    ('kd_yaw',           '跟踪yaw Kd',             0.0,  2.0, 0.005, 0.0, False),
+    ('kp_extend',        '跟踪extend Kp (px→°/s)', 0.0, 10.0, 0.01, 0.8, False),
+    ('ki_extend',        '跟踪extend Ki',          0.0,  2.0, 0.005, 0.0, False),
+    ('kd_extend',        '跟踪extend Kd',          0.0,  2.0, 0.005, 0.0, False),
+    # 固件速度模式（/cmd_gimbal_vel）不做任何限幅，这里就是跟踪的实际上限。
+    # 滑杆上限和调参页"云台最大速度"（0x14~0x16 的 2000）对齐，别在这里先卡死。
+    ('max_yaw_deg_s',    'yaw速度限幅 °/s',        10.0, 2000.0, 5.0, 120.0, False),
+    ('max_extend_deg_s', 'extend速度限幅 °/s',     10.0, 2000.0, 5.0, 300.0, False),
+    # 相机装在夹爪后方：画面"对中"之后还要再前伸一段才够到物料。
+    # 这段是纯机械偏移，随摄像头安装位置变——改装后只改这一项，序列里
+    # 不用再写 gimbal_ext。视觉程序随结果 JSON 回传，color_pick 结束时自动执行。
+    ('ext_offset_deg',   '对中后前伸补偿 °',       -500.0, 500.0, 1.0, 0.0, False),
+    ('deadband_px',      '死区 (px)',              0.0, 100.0, 1.0, 10.0, False),
+    ('deriv_tau',        '微分低通 τ (s)',         0.0,  0.5, 0.01, 0.05, False),
+    ('cam_rotation',     '摄像头旋转 °',           0,   270, 90,  180, True),
+    ('yaw_sign',         'yaw 方向 (+1/-1)',       -1.0, 1.0, 2.0, 1.0, True),
+    ('ext_sign',         'extend 方向 (+1/-1)',    -1.0, 1.0, 2.0, 1.0, True),
+]
+
+TRACK_GROUPS = [
+    ('跟踪 yaw 环', ('kp_yaw', 'ki_yaw', 'kd_yaw')),
+    ('跟踪 extend 环', ('kp_extend', 'ki_extend', 'kd_extend')),
+    ('跟踪限幅 / 死区', ('max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau')),
+    ('抓取补偿（相机→夹爪）', ('ext_offset_deg',)),
+    ('摄像头 / 方向', ('cam_rotation', 'yaw_sign', 'ext_sign')),
+]
+
+# 舵机角度（上位机直接下发 /cmd_servo）：(键名, 显示名, 最小, 最大, 步长, 默认值)
+# 默认值和固件上电初始角一致（RobotConfig.h：夹爪 45 / 载物盘 0）。
+SERVO_PARAMS = [
+    ('gripper', '夹爪',   0, 180, 1, 100),   # 与 RobotConfig.h SERVO_GRIPPER_INIT 一致
+    ('plate',   '载物盘', 0, 180, 1, 180),   # 与 RobotConfig.h SERVO_PLATE_INIT 一致
+]
+
 # 云台标定：轴名、位置显示键
 GIMBAL_AXES = (('Yaw', 'yaw'), ('Lift', 'lift'), ('Extend', 'ext'))
 
@@ -412,6 +461,8 @@ class GuiRosNode(Node):
         self.pub_gimbal_zero = self.create_publisher(Int32, '/cmd_gimbal_zero', 10)
         self.pub_gimbal_limit = self.create_publisher(Float32MultiArray, '/cmd_gimbal_limit', 10)
         self.pub_gimbal_release = self.create_publisher(Bool, '/cmd_gimbal_release', 10)
+        # 舵机角度：[夹爪, 载物盘]（只发这两个，相机角度不动）
+        self.pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
         self.create_subscription(String, '/motion_state', self._cb_state, 10)
         self.create_subscription(Int32MultiArray, '/robot_status', self._cb_status, 10)
@@ -547,6 +598,11 @@ class GuiRosNode(Node):
         self.pub_tune.publish(m)
         return True
 
+    def send_servo(self, gripper: float, plate: float):
+        """下发夹爪 / 载物盘角度（0~180°）。只发前两个元素，相机角度不动。"""
+        self.pub_servo.publish(
+            Float32MultiArray(data=[float(gripper), float(plate)]))
+
 
 # ==================== tkinter 界面 ====================
 
@@ -622,6 +678,24 @@ class App:
         self._tune_after = None
         self._tune_was_online = False
         self.tune_status = tk.StringVar(value='调参：等待 /f407_online…')
+
+        # ---------- 视觉跟踪 PID（color_pick 速度环，存 vision/config/track_pid.json） ----------
+        self.track_tune = {key: float(default)
+                           for (key, _label, _lo, _hi, _step, default, _is_int) in TRACK_PARAMS}
+        self._load_track_profile()   # 有上次保存的就覆盖默认值
+        self.track_scales = {}
+        self._track_after = None
+        self._track_applying = False
+        self.track_status = tk.StringVar(value='')
+
+        # ---------- 舵机角度（夹爪/载物盘，上位机直接 /cmd_servo） ----------
+        self.servo_vals = {key: float(default)
+                           for (key, _label, _lo, _hi, _step, default) in SERVO_PARAMS}
+        self._load_servo_profile()
+        self.servo_scales = {}
+        self._servo_after = None
+        self._servo_applying = False
+        self.servo_status = tk.StringVar(value='')
 
         # ---------- 波形历史（10Hz 采样，各存 60 秒） ----------
         self.wave_pos = deque(maxlen=600)      # (目标x, 目标y, 实际x, 实际y)
@@ -783,12 +857,150 @@ class App:
             self._reload_actions(listbox, get_cmds())
             on_change()
 
+        def duplicate(count):
+            """把选中的动作原地复制 count 份，插在它后面。"""
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showinfo('复制', '先在列表里选中一条动作', parent=listbox)
+                return
+            i = sel[0]
+            cmds = get_cmds()
+            if not (0 <= i < len(cmds)):
+                return
+            new = [copy.deepcopy(cmds[i]) for _ in range(max(1, int(count)))]
+            cmds[i + 1:i + 1] = new
+            self._reload_actions(listbox, cmds)
+            listbox.selection_clear(0, tk.END)
+            for k in range(i + 1, i + 1 + len(new)):
+                listbox.selection_set(k)
+            listbox.see(i + len(new))
+            on_change()
+
+        def duplicate_many():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showinfo('批量复制', '先在列表里选中一条动作', parent=listbox)
+                return
+            n = simpledialog.askinteger(
+                '批量复制', '复制多少份（插在选中项后面）？', parent=listbox,
+                initialvalue=2, minvalue=1, maxvalue=200)
+            if n:
+                duplicate(n)
+
+        def edit_selected(event=None):
+            """双击某条动作 → 弹出参数编辑框。
+
+            双击时 tk 是先触发本函数、后执行 Listbox 自己的"点击选中"，
+            所以这里按鼠标坐标取行号，不能只看 curselection（可能是上一条）。
+            """
+            if event is not None:
+                try:
+                    i = listbox.index(f'@{event.x},{event.y}')
+                except tk.TclError:
+                    return
+                if i is None or not (0 <= i < listbox.size()):
+                    return
+            else:
+                sel = listbox.curselection()
+                if not sel:
+                    return
+                i = sel[0]
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(i)
+            self._edit_action_dialog(listbox, get_cmds(), i, on_change)
+
+        listbox.bind('<Double-Button-1>', edit_selected)
+
         ttk.Button(addrow, text='＋添加', command=add).pack(side=tk.LEFT)
         ttk.Button(editrow, text='上移', command=lambda: move(-1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='下移', command=lambda: move(+1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='删除', command=delete).pack(side=tk.LEFT, padx=2)
+        ttk.Button(editrow, text='复制', command=lambda: duplicate(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(editrow, text='批量复制', command=duplicate_many).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='清空', command=clear).pack(side=tk.LEFT, padx=2)
+        ttk.Label(editrow, text='双击动作可改参数', foreground='gray').pack(
+            side=tk.RIGHT, padx=4)
         return {'type': cmd_type, 'entry': entry, 'hint': hint}
+
+    # ---------- 双击编辑单条动作 ----------
+
+    @staticmethod
+    def _val_to_str(val):
+        if isinstance(val, bool):
+            return 'true' if val else 'false'
+        return '' if val is None else str(val)
+
+    @staticmethod
+    def _coerce_val(text, old):
+        """按原值类型把输入框里的字符串转回去（bool/int/float/str）。"""
+        text = text.strip()
+        if isinstance(old, bool):
+            return text.lower() in ('1', 'true', 'on', 'yes', 'y', '是', '开')
+        if isinstance(old, int):
+            return int(float(text))
+        if isinstance(old, float):
+            return float(text)
+        return text
+
+    def _edit_action_dialog(self, listbox, cmds, index, on_change):
+        """双击动作时弹出的参数编辑框：每个字段一行，改完按"确定"。"""
+        if not (0 <= index < len(cmds)):
+            return
+        cmd = cmds[index]
+        name = cmd.get('cmd', '?')
+
+        win = tk.Toplevel(self.root)
+        win.title(f'编辑第 {index + 1} 条：{name}')
+        win.transient(self.root)
+
+        ttk.Label(win, text=f'类型：{name}（只改参数，不改类型）',
+                  font=('', 10, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky='w', padx=8, pady=(10, 4))
+
+        entries = {}
+        r = 1
+        for key, val in cmd.items():
+            if key == 'cmd':
+                continue
+            ttk.Label(win, text=key).grid(row=r, column=0, sticky='e',
+                                          padx=(8, 4), pady=2)
+            var = tk.StringVar(value=self._val_to_str(val))
+            e = ttk.Entry(win, textvariable=var, width=38)
+            e.grid(row=r, column=1, sticky='we', padx=(0, 8), pady=2)
+            entries[key] = (var, val)
+            if len(entries) == 1:
+                e.focus_set()
+                e.select_range(0, tk.END)
+            r += 1
+        if not entries:
+            ttk.Label(win, text='（这条动作没有参数）').grid(
+                row=r, column=0, columnspan=2, pady=8)
+        win.columnconfigure(1, weight=1)
+
+        def ok(_event=None):
+            new = {'cmd': name}
+            try:
+                for key, (var, old) in entries.items():
+                    new[key] = self._coerce_val(var.get(), old)
+            except Exception as error:  # noqa: BLE001
+                messagebox.showerror('参数错误', f'{error}', parent=win)
+                return
+            cmds[index] = new
+            self._reload_actions(listbox, cmds)
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(index)
+            listbox.see(index)
+            on_change()
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=r, column=0, columnspan=2, pady=10)
+        ttk.Button(btns, text='确定', command=ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text='取消', command=win.destroy).pack(side=tk.LEFT, padx=4)
+        win.bind('<Return>', ok)
+        win.bind('<Escape>', lambda e: win.destroy())
+        win.grab_set()
+        win.focus_force()
 
     def _reload_actions(self, listbox, cmds):
         listbox.delete(0, tk.END)
@@ -1005,6 +1217,78 @@ class App:
 
         ttk.Label(tab, textvariable=self.tune_status, foreground='#7a4fbf',
                   wraplength=310).pack(anchor='w', pady=(3, 0))
+
+        # ---------- 视觉跟踪 PID（color_pick 用，改完下次运行生效） ----------
+        track_box = ttk.LabelFrame(tab, text='视觉跟踪 PID（color_pick 用）', padding=4)
+        track_box.pack(fill=tk.X, pady=(6, 3))
+        ttk.Label(track_box, foreground='#666', wraplength=310,
+                  text='云台"跟物料"的速度环 PID，存在树莓派 '
+                       'vision/config/track_pid.json，不走 407 调参通道。'
+                       '拖动即保存，下次执行 color_pick 生效。').pack(anchor='w')
+
+        self._track_applying = True
+        for title, keys in TRACK_GROUPS:
+            grp = ttk.LabelFrame(track_box, text=title, padding=2)
+            grp.pack(fill=tk.X, pady=2)
+            for key in keys:
+                spec = next(s for s in TRACK_PARAMS if s[0] == key)
+                _k, label, vmin, vmax, step, default, is_int = spec
+                val = self.track_tune.get(key, float(default))
+                row = ttk.Frame(grp)
+                row.pack(fill=tk.X)
+                var = tk.StringVar(value=f'{val:g}')
+                scale = tk.Scale(
+                    row, from_=vmin, to=vmax, resolution=step, orient=tk.HORIZONTAL,
+                    length=220, showvalue=False, label=label, bd=0,
+                    highlightthickness=0,
+                    command=lambda v, k=key: self._on_track_slide(k, v))
+                scale.set(val)
+                scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Label(row, textvariable=var, width=7, anchor='e').pack(
+                    side=tk.LEFT, padx=(2, 0))
+                self.track_scales[key] = (scale, var, is_int)
+        self._track_applying = False
+
+        track_row = ttk.Frame(track_box)
+        track_row.pack(fill=tk.X, pady=(3, 0))
+        ttk.Button(track_row, text='恢复跟踪默认',
+                   command=self._restore_track_defaults).pack(side=tk.LEFT)
+        ttk.Label(track_box, textvariable=self.track_status, foreground='#2e7d32',
+                  wraplength=310).pack(anchor='w')
+
+        # ---------- 舵机角度（夹爪 / 载物盘） ----------
+        servo_box = ttk.LabelFrame(tab, text='舵机角度（夹爪 / 载物盘）', padding=4)
+        servo_box.pack(fill=tk.X, pady=(6, 3))
+        ttk.Label(servo_box, foreground='#666', wraplength=310,
+                  text='拖动即下发 /cmd_servo（0~180°），用来现场找抓取/放置角度。'
+                       '动作序列里的 gripper/plate 指令会覆盖这里。').pack(anchor='w')
+
+        self._servo_applying = True
+        for key, label, vmin, vmax, step, default in SERVO_PARAMS:
+            val = self.servo_vals.get(key, float(default))
+            row = ttk.Frame(servo_box)
+            row.pack(fill=tk.X)
+            var = tk.StringVar(value=f'{val:g}')
+            scale = tk.Scale(
+                row, from_=vmin, to=vmax, resolution=step, orient=tk.HORIZONTAL,
+                length=240, showvalue=False, label=label, bd=0,
+                highlightthickness=0,
+                command=lambda v, k=key: self._on_servo_slide(k, v))
+            scale.set(val)
+            scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ttk.Label(row, textvariable=var, width=7, anchor='e').pack(
+                side=tk.LEFT, padx=(2, 0))
+            self.servo_scales[key] = (scale, var)
+        self._servo_applying = False
+
+        servo_row = ttk.Frame(servo_box)
+        servo_row.pack(fill=tk.X, pady=(3, 0))
+        ttk.Button(servo_row, text='下发当前角度',
+                   command=self._send_servo_now).pack(side=tk.LEFT)
+        ttk.Button(servo_row, text='恢复上电角',
+                   command=self._restore_servo_defaults).pack(side=tk.LEFT, padx=4)
+        ttk.Label(servo_box, textvariable=self.servo_status, foreground='#2e7d32',
+                  wraplength=310).pack(anchor='w')
 
         # ---------- 云台零点 / 限位 / 松轴 ----------
         cal = ttk.LabelFrame(tab, text='云台零点 / 限位 / 松轴', padding=4)
@@ -1235,6 +1519,130 @@ class App:
                 sorted(acks.items())))
         else:
             self.tune_status.set('调参：407 离线（参数值保留在界面上）')
+
+    # ---------- 视觉跟踪 PID（color_pick 速度环，直接读写 JSON） ----------
+
+    def _on_track_slide(self, key, value):
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return
+        entry = self.track_scales.get(key)
+        if entry:
+            scale, var, is_int = entry
+            var.set(f'{fv:.0f}' if is_int else f'{fv:g}')
+        self.track_tune[key] = fv
+        if getattr(self, '_track_applying', False):
+            return
+        if self._track_after is not None:
+            try:
+                self.root.after_cancel(self._track_after)
+            except Exception:  # noqa: BLE001
+                pass
+        self._track_after = self.root.after(150, self._save_track_profile)
+
+    def _load_track_profile(self):
+        """读 vision/config/track_pid.json（color_pick 实际用的跟踪参数）。"""
+        try:
+            with open(TRACK_PID_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for key in self.track_tune:
+                if key in data:
+                    self.track_tune[key] = float(data[key])
+        except Exception:  # noqa: BLE001 - 文件不存在是正常情况
+            pass
+
+    def _save_track_profile(self):
+        """把跟踪参数写回 JSON；保留文件里可能有的其它键。"""
+        self._track_after = None
+        data = {}
+        try:
+            with open(TRACK_PID_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            data = {}
+        data.update(self.track_tune)
+        try:
+            os.makedirs(os.path.dirname(TRACK_PID_PATH), exist_ok=True)
+            with open(TRACK_PID_PATH, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.track_status.set('已保存到 vision/config/track_pid.json（下次 color_pick 生效）')
+        except Exception as e:  # noqa: BLE001
+            self.track_status.set(f'保存失败：{e}')
+
+    def _restore_track_defaults(self):
+        self._track_applying = True
+        try:
+            for key, _label, _lo, _hi, _step, default, _is_int in TRACK_PARAMS:
+                self.track_tune[key] = float(default)
+                entry = self.track_scales.get(key)
+                if entry:
+                    scale, var, _ = entry
+                    scale.set(default)
+                    var.set(f'{default:g}')
+        finally:
+            self._track_applying = False
+        self._save_track_profile()
+
+    # ---------- 舵机角度（夹爪 / 载物盘） ----------
+
+    def _on_servo_slide(self, key, value):
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return
+        entry = self.servo_scales.get(key)
+        if entry:
+            scale, var = entry
+            var.set(f'{fv:.0f}')
+        self.servo_vals[key] = fv
+        if getattr(self, '_servo_applying', False):
+            return
+        if self._servo_after is not None:
+            try:
+                self.root.after_cancel(self._servo_after)
+            except Exception:  # noqa: BLE001
+                pass
+        self._servo_after = self.root.after(80, self._send_servo_now)
+
+    def _load_servo_profile(self):
+        try:
+            with open(SERVO_PROFILE_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for key in self.servo_vals:
+                if key in data:
+                    self.servo_vals[key] = float(data[key])
+        except Exception:  # noqa: BLE001 - 文件不存在是正常情况
+            pass
+
+    def _save_servo_profile(self):
+        try:
+            with open(SERVO_PROFILE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self.servo_vals, f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _send_servo_now(self):
+        self._servo_after = None
+        g = float(self.servo_vals.get('gripper', 100.0))
+        p = float(self.servo_vals.get('plate', 180.0))
+        self.node.send_servo(g, p)
+        self._save_servo_profile()
+        self.servo_status.set(f'已下发：夹爪 {g:.0f}° / 载物盘 {p:.0f}°')
+
+    def _restore_servo_defaults(self):
+        self._servo_applying = True
+        try:
+            for key, _label, _lo, _hi, _step, default in SERVO_PARAMS:
+                self.servo_vals[key] = float(default)
+                entry = self.servo_scales.get(key)
+                if entry:
+                    scale, var = entry
+                    scale.set(default)
+                    var.set(f'{default:g}')
+        finally:
+            self._servo_applying = False
+        self._send_servo_now()
 
     # ---------- 右侧波形面板 ----------
 
@@ -3390,10 +3798,36 @@ class App:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             cmds = data['commands'] if isinstance(data, dict) else data
-            self.commands = list(cmds)
-            self._reload_listbox()
+            if not isinstance(cmds, list):
+                raise ValueError('文件里没有 commands 数组')
+            cmds = [c for c in cmds if isinstance(c, dict) and c.get('cmd')]
+            if not cmds:
+                raise ValueError('文件里没有可用的动作')
         except Exception as e:
             messagebox.showerror('导入失败', str(e))
+            return
+
+        # 不再静默覆盖：先问清楚是追加还是替换
+        choice = messagebox.askyesnocancel(
+            '导入 JSON',
+            f'{os.path.basename(path)} 里有 {len(cmds)} 条动作。\n'
+            f'当前序列有 {len(self.commands)} 条。\n\n'
+            '“是”   → 追加到当前序列末尾\n'
+            '“否”   → 替换当前序列（原来的会被清掉）\n'
+            '“取消” → 不导入',
+            parent=self.root)
+        if choice is None:
+            return
+        if choice:
+            self.commands.extend(cmds)
+            self._reload_listbox()
+            self.listbox.see(tk.END)
+            self._set_status(f'已追加 {len(cmds)} 条动作')
+        else:
+            self.commands = list(cmds)
+            self._reload_listbox()
+            self.listbox.see(0)
+            self._set_status(f'已替换为 {len(cmds)} 条动作')
 
     def export_json(self):
         path = filedialog.asksaveasfilename(defaultextension='.json',

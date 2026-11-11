@@ -142,8 +142,14 @@ void ZdtUart_MultiSend(void)
 
 /* ============ 电机级命令 ============ */
 
+/* 加速度档位按地址分组：1~4 底盘轮、5~7 云台三轴（和 ZdtMotor.c 保持一致） */
+static uint8_t ZdtMotor_AccFor(uint8_t addr)
+{
+    return (addr >= ZDT_MOTOR_YAW) ? ZDT_GIMBAL_ACC : ZDT_WHEEL_ACC;
+}
+
 /* 速度模式（Emm 固件 F6）：dir + 速度(整数RPM,2B) + 加速度(档位,1B) + 同步标志 */
-static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t* out)
+static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t acc, uint8_t* out)
 {
     uint8_t dir = (rpm >= 0) ? 0 : 1;
     uint16_t mag = (uint16_t)(fabsf(rpm));   /* RPM（整数，0~3000） */
@@ -152,7 +158,7 @@ static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t* out)
     out[1] = dir;
     out[2] = mag >> 8;
     out[3] = mag & 0xFF;
-    out[4] = ZDT_WHEEL_ACC;
+    out[4] = acc;
     out[5] = 0x00;
     return 6;
 }
@@ -160,7 +166,7 @@ static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t* out)
 void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm)
 {
     uint8_t c[6];
-    ZdtMotor_BuildSpeed(rpm, c);
+    ZdtMotor_BuildSpeed(rpm, ZdtMotor_AccFor(motor->Addr), c);
     ZdtUart_SendFrame(motor->Addr, c, sizeof(c));
 
     motor->Speed.Set = rpm;
@@ -169,30 +175,13 @@ void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm)
 void ZdtMotor_MultiAddSpeed(ZdtMotor_t* motor, float rpm)
 {
     uint8_t c[6];
-    ZdtMotor_BuildSpeed(rpm, c);
+    ZdtMotor_BuildSpeed(rpm, ZdtMotor_AccFor(motor->Addr), c);
     ZdtUart_MultiAdd(motor->Addr, c, sizeof(c));
 
     motor->Speed.Set = rpm;
 }
 
-/* 位置模式（Emm 固件 FD）：dir + 速度(整数RPM,2B) + 加速度(档位,1B) + 脉冲(4B,3200/圈) + 模式 + 同步 */
-void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode)
-{
-    /* 方向按目标与当前实时位置的差自动取 */
-    uint8_t dir = (deg >= motor->Position.Real) ? 0 : 1;
-    uint32_t pulse = (uint32_t)(fabsf(deg) * ZDT_PULSE_PER_REV / 360.0f);   /* ° → 脉冲 */
-
-    uint8_t c[] = {
-        0xFD, dir,
-        ZDT_POS_SPEED_MAX >> 8, ZDT_POS_SPEED_MAX & 0xFF,   /* 速度，整数 RPM */
-        ZDT_ACC_DEFAULT,                                     /* 加速度档位 */
-        pulse >> 24, pulse >> 16, pulse >> 8, pulse & 0xFF,  /* 脉冲 4B */
-        mode, 0x00
-    };
-    ZdtUart_SendFrame(motor->Addr, c, sizeof(c));
-
-    motor->Position.Set = deg;
-}
+/* 驱动器内部位置模式(0xFD)不用：位置环在 GimbalTask 里做，只发速度帧。 */
 
 /* ============ 接收解析 ============ */
 

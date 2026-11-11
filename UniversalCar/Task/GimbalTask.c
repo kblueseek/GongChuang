@@ -40,7 +40,11 @@
 #define GIMBAL_CONFIG_RETRY_MS   500    /* 位置回传配置重发周期（ms） */
 #define GIMBAL_VEL_TIMEOUT_MS    300    /* 这么久没收到该轴新速度就发 0 */
 #define GIMBAL_POS_HOLD_MS      3000    /* 收到角度目标后位置环保持多久（期间速度指令让位） */
-#define GIMBAL_POS_MAX_ERROR    60.0f   /* 位置环误差限幅（°），目标跳变时别一脚油门 */
+/* 位置环误差限幅（°）。P 项最大值 = 这个值 × Kp，原来 60 会把 Kp=15 的轴
+   卡在 900°/s：上位机把该轴最大速度调到 900 以上也提不上去。
+   现在放到 200，保证在调参页合法速度（≤2000°/s）内 P 项都够用，
+   真正的速度上限只剩 PiTune.Gimbal*Speed 一处（见 Gimbal_SyncSpeedLimit）。 */
+#define GIMBAL_POS_MAX_ERROR    200.0f
 #define GIMBAL_POS_INTEGRAL_BAND 8.0f   /* 误差小于它才积分，避免大误差时积分饱和 */
 
 Gimbal_t  Gimbal;
@@ -79,11 +83,12 @@ static float   s_Offset[3]      = { 0.0f, 0.0f, 0.0f };
 static uint8_t s_OffsetValid[3] = { 0, 0, 0 };
 
 /* ---- 位置环状态（角度目标 → 速度） ---- */
-/* 三轴位置环输出限幅（°/s）。初值取固件默认，上位机 0x14~0x16 可随时改，
-   0/负值 = 回退固件宏。运行中改动由 Gimbal_SyncSpeedLimit 热更新（含 PID 限幅）。 */
-static float s_MaxSpeedDegPerSec[3] = {
-    GIMBAL_YAW_SPEED_MAX, GIMBAL_LIFT_SPEED_MAX, GIMBAL_EXTEND_SPEED_MAX
-};
+/* 三轴位置环输出限幅（°/s）。**唯一来源是上位机调参**（0x14~0x16）：
+   PiTune 在 PiComm_TuneReset 里给上电初值，之后运行中只认上位机下发的值，
+   固件里不再有任何速度宏参与。0 = 该轴输出锁 0。
+   运行中改动由 Gimbal_SyncSpeedLimit 热更新（含 PID 限幅）。
+   这里初值给 0，真正的值在 Gimbal_InitPosPid 里先 Sync 再建 PID。 */
+static float s_MaxSpeedDegPerSec[3] = { 0.0f, 0.0f, 0.0f };
 
 /* 位置环状态要在 Gimbal_SyncSpeedLimit 之前声明：那个函数里会直接改 PID 限幅。 */
 static float    s_TargetDeg[3]   = { 0.0f, 0.0f, 0.0f };
@@ -96,10 +101,12 @@ static void Gimbal_SyncSpeedLimit(void)
 {
     const float tune[3] = { PiTune.GimbalYawSpeed, PiTune.GimbalLiftSpeed,
                             PiTune.GimbalExtSpeed };
-    const float dft[3]  = { GIMBAL_YAW_SPEED_MAX, GIMBAL_LIFT_SPEED_MAX,
-                            GIMBAL_EXTEND_SPEED_MAX };
     for (uint8_t i = 0; i < 3; i++) {
-        float spd = (tune[i] > 0.0f) ? tune[i] : dft[i];
+        /* 只用上位机值：负值/NaN 按 0 处理，固件里没有可回退的速度宏。
+           PiComm_TuneReset() 里的数字只是树莓派连上前的初值。 */
+        float spd = tune[i];
+        if (!(spd > 0.0f))
+            spd = 0.0f;
         if (spd == s_MaxSpeedDegPerSec[i])
             continue;
         s_MaxSpeedDegPerSec[i] = spd;
@@ -264,14 +271,25 @@ static void Gimbal_TakeTargets(uint32_t now)
         if (!s_AxisInstalled[i])
             continue;
 
-        s_TargetDeg[i] = ConstrainF(PiCommand.GimbalTarget[i].Deg,
-                                    s_MaxDeg[i], s_MinDeg[i]);
+        float newDeg = ConstrainF(PiCommand.GimbalTarget[i].Deg,
+                                  s_MaxDeg[i], s_MinDeg[i]);
+        /* 只有目标真的变了才清 PID：上位机会按 1Hz 重发同一个目标，给 F407 的
+           3s 位置保持续命。目标没变时保留积分/微分，否则 Ki/Kd 会被每秒清零。
+           若位置目标已经过期（期间可能被速度模式带走过），即使角度相同也要清。 */
+        uint8_t expired = (uint8_t)(!s_TargetValid[i] ||
+                                    (uint32_t)(now - s_TargetTick[i]) >=
+                                        GIMBAL_POS_HOLD_MS);
+        uint8_t changed = (uint8_t)(expired ||
+                                    newDeg > s_TargetDeg[i] + 1e-4f ||
+                                    newDeg < s_TargetDeg[i] - 1e-4f);
+
+        s_TargetDeg[i]   = newDeg;
         s_TargetValid[i] = 1;
         s_TargetTick[i]  = now;
 
         /* 位置指令立即接管：清速度时间戳，别让旧速度再掺和 */
         PiCommand.GimbalVel[i].Tick = 0;
-        if (s_PosPidReady)
+        if (s_PosPidReady && changed)
             PID_Clear(&s_PosPid[i]);
     }
 }

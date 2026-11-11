@@ -1,0 +1,16 @@
+{
+  "cam_rotation": 180.0,
+  "kp_yaw": 0.9,
+  "ki_yaw": 0.0,
+  "kd_yaw": 0.0,
+  "kp_extend": 3.4,
+  "ki_extend": 0.0,
+  "kd_extend": 0.0,
+  "max_yaw_deg_s": 500.0,
+  "max_extend_deg_s": 800.0,
+  "deadband_px": 8.0,
+  "deriv_tau": 0.05,
+  "yaw_sign": -1.0,
+  "ext_sign": -1.0,
+  "ext_offset_deg": 115.0
+}

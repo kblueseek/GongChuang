@@ -6,11 +6,12 @@
 # 本文件只列节点清单。雷达自身的驱动参数在 config/x3_pro.yaml。
 
 from launch import LaunchDescription
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-VEHICLE_CFG = FindPackageShare('car_bringup') + '/config/vehicle.yaml'
-X3PRO_CFG = FindPackageShare('car_bringup') + '/config/x3_pro.yaml'
+VEHICLE_CFG = PathJoinSubstitution([FindPackageShare('car_bringup'), 'config', 'vehicle.yaml'])
+X3PRO_CFG = PathJoinSubstitution([FindPackageShare('car_bringup'), 'config', 'x3_pro.yaml'])
 
 
 def car_node(package, executable, name, **kwargs):

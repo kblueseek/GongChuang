@@ -456,9 +456,11 @@ class JoyControlNode(Node):
             self._planner_active = False
             self.get_logger().warning('上位机心跳中断（/motion_active 0.6s 没更新），手柄恢复控制')
         if self._planner_active:
-            # 上位机控制中：手柄一个动作都不发（B 失能在按键回调里单独处理）
+            # 上位机控制中：手柄一个动作都不发（B 失能在按键回调里单独处理）。
+            # ⚠ 云台速度这里绝对不能补零：color_pick 的视觉子程序正用
+            #   /cmd_gimbal_vel 连续驱动云台，每 10ms 补一帧 0 会把它冲成
+            #   "一顿一顿"。真没人驱动云台时，F407 的 300ms 速度超时会自己停。
             self._release_chassis()
-            self._release_gimbal()
             return
         self._tick_drive()
         self._tick_gimbal()

@@ -5,6 +5,7 @@
 # 先确认雷达能不能出数据，再去启动整个系统。
 
 from launch import LaunchDescription          # 启动描述：一个"要启动哪些东西"的清单
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node           # Node：清单里的一项 = 一个节点
 from launch_ros.substitutions import FindPackageShare  # 用来找"某个包被安装到哪了"
 
@@ -20,6 +21,6 @@ def generate_launch_description():
             # 参数：从 car_bringup 包的 config/x3_pro.yaml 加载
             # FindPackageShare('car_bringup') 会展开成 ".../install/car_bringup/share/car_bringup"，
             # 再拼上 '/config/x3_pro.yaml'，就找到参数文件了。
-            parameters=[FindPackageShare('car_bringup') + '/config/x3_pro.yaml'],
+            parameters=[PathJoinSubstitution([FindPackageShare('car_bringup'), 'config', 'x3_pro.yaml'])],
         ),
     ])

@@ -10,16 +10,21 @@
   1. 打开 USB 摄像头（与 vision/main.py 同一套畸变矫正配置）；
   2. 按颜色标定配置（config/material_color_thresholds.json）分割指定颜色物料；
   3. 实时窗口显示画面 + 识别框 + 十字线 + 当前云台角（--headless 关闭）；
-  4. 物料偏离画面中心 → 发 /cmd_gimbal 让云台 yaw/extend 跟随（lift 保持不动），
-     把物料"吊"到云台正下方；
+  4. 物料偏离画面中心 → PID 把像素误差转成角速度，发 /cmd_gimbal_vel 让云台
+     yaw/extend 平滑跟随（lift 保持不动），把物料"吊"到云台正下方；
   5. 连续稳定若干帧后退出，最后一行打印 JSON 结果：
          {"ok": true, "color": 4, "yaw_deg": …, "lift_deg": …, "extend_deg": …}
      motion_planner 的 color_pick 只跟随不抓取（no_pick），收到 JSON 后继续执行
      序列里后续的抓取/放置指令（你自己写死的 gimbal/gripper/tray 指令）。
 
-需要现场标定的量（命令行参数，先用默认值试，方向反了就加负号）：
-  --yaw-deg-per-px / --yaw-sign   像素误差 → 云台 yaw 增量（符号看机械装配）
-  --ext-deg-per-px / --ext-sign   像素误差 → 云台 extend 增量
+需要现场标定的量（改 config/track_pid.json，上位机也能直接改；轴方向反了就翻号）：
+  --kp-yaw / --kp-extend          像素误差 → 角速度 °/s 的比例（越大跟得越猛，太大振荡）
+  --yaw-sign / --ext-sign         轴方向（±1）
+  --max-yaw-deg-s / --max-extend-deg-s  速度限幅
+  --cam-rotation                  摄像头安装旋转角（180=倒装）
+  --ext-offset-deg                对中后再前伸多少度（相机→夹爪的机械偏移）。
+                                  只随结果 JSON 回传，由 motion_planner 在 color_pick
+                                  结束后自动执行；摄像头改装后只改这个数即可。
 """
 
 from __future__ import annotations
@@ -39,6 +44,53 @@ sys.path.insert(0, str(HERE))          # 颜色标定 等同目录模块
 from 颜色标定 import load_color_config  # noqa: E402
 
 COLOR_NAMES = {1: '红', 2: '黄', 3: '蓝', 4: '绿', 5: '黑', 6: '浅蓝'}
+
+
+class PID:
+    """带输出限幅、积分抗饱和、微分低通的小 PID（移植自 gimbal_track 包）。
+
+    ki=kd=0 就是纯 P。加 kd 后能在不增大振荡的前提下把 kp 提得更高（微分提供阻尼）；
+    ki 消稳态误差，但像素测量有噪声，建议先用小值或保持 0。
+    """
+
+    def __init__(self, kp, ki, kd, limit, deriv_tau=0.05):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self.limit = float(limit)
+        self.deriv_tau = max(0.0, float(deriv_tau))
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.deriv = 0.0          # 低通后的微分值
+
+    def update(self, err, dt):
+        if dt <= 0.0:
+            dt = 0.01
+
+        # 微分：先求原始微分，再做一阶低通，压住像素噪声的抖动
+        raw_deriv = (err - self.prev_err) / dt
+        self.prev_err = err
+        if self.deriv_tau > 0.0:
+            alpha = dt / (self.deriv_tau + dt)
+            self.deriv += alpha * (raw_deriv - self.deriv)
+        else:
+            self.deriv = raw_deriv
+        d = self.kd * self.deriv
+        p = self.kp * err
+
+        # 积分：条件积分抗饱和，饱和且误差还往同方向推时不再累积
+        pre = p + self.ki * self.integral + d
+        saturated = abs(pre) >= self.limit
+        if self.ki != 0.0 and not (saturated and pre * err > 0.0):
+            self.integral += err * dt
+            bound = self.limit / abs(self.ki)
+            self.integral = max(-bound, min(bound, self.integral))
+
+        out = p + self.ki * self.integral + d
+        return max(-self.limit, min(self.limit, out))
 
 
 def build_undistort_maps(width: int, height: int):
@@ -68,7 +120,10 @@ class GimbalTrackPick(Node):
     def __init__(self, args):
         super().__init__('gimbal_track_pick')
         self._args = args
-        self._pub_gimbal = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
+        # 速度模式：发 /cmd_gimbal_vel（°/s），由 F407 的速度环直接执行。
+        # 上位机序列里的 gimbal 指令走 /cmd_gimbal（位置环），F407 端"位置优先"，
+        # 两条通道互不冲突。
+        self._pub_vel = self.create_publisher(Float32MultiArray, '/cmd_gimbal_vel', 10)
         self.create_subscription(Float32MultiArray, '/gimbal_state',
                                  self._cb_gimbal_state, 10)
         self._gimbal = [0.0, 0.0, 0.0]
@@ -79,8 +134,8 @@ class GimbalTrackPick(Node):
             self._gimbal = [float(v) for v in msg.data[:3]]
             self._gimbal_ok = True
 
-    def send_gimbal(self, yaw: float, lift: float, extend: float):
-        self._pub_gimbal.publish(Float32MultiArray(data=[yaw, lift, extend]))
+    def send_gimbal_vel(self, yaw: float, lift: float, extend: float):
+        self._pub_vel.publish(Float32MultiArray(data=[yaw, lift, extend]))
 
 
 def detect_target(bgr, color_id: int, document: dict, args,
@@ -146,9 +201,9 @@ def detect_target(bgr, color_id: int, document: dict, args,
         if not touches_border:
             if 0.0 < args.max_area < area:
                 continue
-            if min(fw, fh) < args.min_dimension:
+            if min(fw, fh) < args.min_dimension_px:
                 continue
-            if 0.0 < args.max_dimension < max(fw, fh):
+            if 0.0 < args.max_dimension_px < max(fw, fh):
                 continue
             aspect = max(fw, fh) / max(1.0, min(fw, fh))
             if 0.0 < args.max_aspect < aspect:
@@ -169,6 +224,27 @@ def detect_target(bgr, color_id: int, document: dict, args,
     return best
 
 
+def _apply_track_config(args, here: Path):
+    """从 config/track_pid.json 读跟踪 PID/方向/旋转，覆盖命令行默认值。
+
+    上位机（motion_gui）直接改这个 JSON，color_pick 每次启动都重新读，
+    所以在上位机调完、下次跑 color_pick 就生效。文件不存在或解析失败就用默认值。
+    """
+    path = here / 'config' / 'track_pid.json'
+    if not path.is_file():
+        return args
+    try:
+        doc = json.loads(path.read_text(encoding='utf-8'))
+    except Exception as error:  # noqa: BLE001
+        print(f'[gimbal_track_pick] track_pid.json 解析失败，用默认值：{error}',
+              flush=True)
+        return args
+    for key, val in doc.items():
+        if hasattr(args, key):
+            setattr(args, key, val)
+    return args
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='云台跟随颜色物料（color_pick 视觉端）')
     parser.add_argument('--color', type=int, required=True, help='颜色编号 1~6')
@@ -176,7 +252,7 @@ def main() -> int:
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
     parser.add_argument('--fps', type=float, default=30.0)
-    parser.add_argument('--timeout', type=float, default=30.0, help='跟随总超时 s')
+    parser.add_argument('--timeout', type=float, default=1000.0, help='跟随总超时 s')
     parser.add_argument('--tol-px', type=float, default=25.0, help='认为对准的像素容差')
     parser.add_argument('--stable', type=int, default=8, help='连续多少帧对准才收工')
     parser.add_argument('--min-area', type=float, default=800.0, help='物料最小像素面积')
@@ -196,15 +272,31 @@ def main() -> int:
                         help='实心度下限 轮廓面积/凸包面积（0=不查）')
     parser.add_argument('--min-extent', type=float, default=0.0,
                         help='占比下限 轮廓面积/外接框面积（0=不查）')
-    parser.add_argument('--yaw-deg-per-px', type=float, default=0.04,
-                        help='像素误差→yaw 增量比例（待标定）')
+    # —— 速度环跟随：像素误差 → 角速度 °/s ——
+    parser.add_argument('--kp-yaw', type=float, default=0.2,
+                        help='yaw 环 P（px → °/s），越大跟得越猛')
+    parser.add_argument('--ki-yaw', type=float, default=0.0)
+    parser.add_argument('--kd-yaw', type=float, default=0.0)
+    parser.add_argument('--kp-extend', type=float, default=0.8,
+                        help='extend 环 P（px → °/s）')
+    parser.add_argument('--ki-extend', type=float, default=0.0)
+    parser.add_argument('--kd-extend', type=float, default=0.0)
+    parser.add_argument('--max-yaw-deg-s', type=float, default=120.0,
+                        help='yaw 速度限幅 °/s')
+    parser.add_argument('--max-extend-deg-s', type=float, default=300.0,
+                        help='extend 速度限幅 °/s')
+    parser.add_argument('--deadband-px', type=float, default=10.0,
+                        help='误差小于这个像素数就停（也算对准）')
+    parser.add_argument('--deriv-tau', type=float, default=0.05,
+                        help='微分低通时间常数 s，越大越平滑')
+    parser.add_argument('--ext-offset-deg', type=float, default=0.0,
+                        help='对中后自动前伸补偿 °（相机→夹爪机械偏移，0=不补偿）')
     parser.add_argument('--yaw-sign', type=float, default=1.0, choices=[1.0, -1.0],
-                        help='yaw 修正方向反了改成 -1')
-    parser.add_argument('--ext-deg-per-px', type=float, default=0.02,
-                        help='像素误差→extend 增量比例（待标定）')
-    parser.add_argument('--ext-sign', type=float, default=1.0, choices=[1.0, -1.0])
+                        help='yaw 速度方向反了改成 -1')
+    parser.add_argument('--ext-sign', type=float, default=1.0, choices=[1.0, -1.0],
+                        help='extend 速度方向反了改成 -1')
     # —— 画面约束 ——
-    parser.add_argument('--roi-bottom', type=float, default=0.5,
+    parser.add_argument('--roi-bottom', type=float, default=0.9,
                         help='只在画面下半这部分找物料：取值 0~1 = 从底部往上占画面比例'
                              '（圆盘大、只够得到最近物料时用；1.0 = 全画面）')
     parser.add_argument('--cam-rotation', type=int, default=180,
@@ -220,6 +312,7 @@ def main() -> int:
 
     parser.add_argument('--headless', action='store_true', help='不开预览窗口（无显示器环境）')
     args = parser.parse_args()
+    args = _apply_track_config(args, HERE)   # 上位机可改 config/track_pid.json 调 PID/方向/旋转
 
     import cv2
     import numpy as np
@@ -254,8 +347,16 @@ def main() -> int:
               180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 
     if not args.headless:
-        cv2.namedWindow('gimbal_track_pick', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('gimbal_track_pick', 960, 540)
+        try:
+            cv2.namedWindow('gimbal_track_pick', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('gimbal_track_pick', 960, 540)
+        except cv2.error as error:
+            # 通过 SSH 跑 run_car 时没有 DISPLAY，开预览窗口会直接抛异常，
+            # 整个脚本没来得及打印 JSON 就退出 → color_pick 看起来"没反应"。
+            # 这种情况自动退回 headless，只识别/跟随，不显示画面。
+            print(f'[gimbal_track_pick] 没有图形界面，自动 headless：{error}',
+                  flush=True)
+            args.headless = True
 
     # 画面尺寸经旋转后才知道（90/270 宽高互换）
     if args.cam_rotation in (90, 270):
@@ -266,14 +367,19 @@ def main() -> int:
     roi_y = int(frame_h * (1.0 - max(0.0, min(1.0, args.roi_bottom))))
     roi_y_scaled = roi_y   # detect_target 内部按同尺度缩放，见调用处
 
+    # ---- 速度环 PID：像素误差 → 角速度 °/s（平滑跟随，Kp 直接决定跟得有多猛）----
+    pid_yaw = PID(args.kp_yaw, args.ki_yaw, args.kd_yaw,
+                  args.max_yaw_deg_s, args.deriv_tau)
+    pid_extend = PID(args.kp_extend, args.ki_extend, args.kd_extend,
+                     args.max_extend_deg_s, args.deriv_tau)
+
     stable = 0
-    # wait = 等物料静止（不跟随，不动云台）；track = 静止确认后一次性跟随对中
+    # wait = 等物料静止（不跟随，不动云台）；track = 静止确认后跟随对中
     phase = 'track' if args.still_time <= 0.0 else 'wait'
     hist = []                     # (t, cx, cy) 静止判定窗口（wait 阶段积累）
     started = time.monotonic()
-    last_send = 0.0
+    last_t = time.monotonic()     # PID 差分时间戳
     result = {'ok': False, 'reason': 'timeout'}
-    yaw_hold = extend_hold = None
 
     def _is_still(now):
         '''最近 still_time 秒内质心抖动 <= still_px = 物料没动。'''
@@ -317,8 +423,13 @@ def main() -> int:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                     (0, 165, 255), 2, cv2.LINE_AA)
 
+            now = time.monotonic()   # 本帧时间戳：静止判定/hist/PID 差分共用
+            dt = now - last_t
+            last_t = now
+
+            yaw_vel = ext_vel = 0.0
+
             if found:
-                now = time.monotonic()   # 本帧时间戳：静止判定/hist/发送节流共用
                 if phase == 'wait':
                     # 不跟随、不动云台，只观察：物料持续静止才算数（转盘场景）
                     hist.append((now, target['cx'], target['cy']))
@@ -326,35 +437,43 @@ def main() -> int:
                         phase = 'track'
                         hist.clear()
                         stable = 0
+                        pid_yaw.reset()
+                        pid_extend.reset()
                         print('[gimbal_track_pick] 物料已静止，开始跟随对中', flush=True)
                     status = (f'WAIT_STILL {now - started:.1f}s '
                               f'({args.still_time}s 内抖动<{args.still_px:.0f}px)')
                 else:
-                    # track：一次性跟随到物料正上方
-                    if node._gimbal_ok:
-                        yaw_hold, extend_hold = node._gimbal[0], node._gimbal[2]
-                        yaw_t = yaw_hold - args.yaw_sign * args.yaw_deg_per_px * ex
-                        ext_t = extend_hold + args.ext_sign * args.ext_deg_per_px * ey
-                        if now - last_send >= 1.0 / 15.0:    # 15Hz 足够，别刷爆总线
-                            node.send_gimbal(yaw_t, node._gimbal[1], ext_t)
-                            last_send = now
-                    if abs(ex) <= args.tol_px and abs(ey) <= args.tol_px:
+                    # track：PID 把像素误差直接转成角速度，每帧连续输出（平滑跟随）
+                    if abs(ex) <= args.deadband_px and abs(ey) <= args.deadband_px:
+                        # 已进死区：停住并累计"对准"帧数
                         stable += 1
+                        pid_yaw.reset()
+                        pid_extend.reset()
                     else:
                         stable = 0
-                    status = (f'TRACK ex={ex:+.0f} ey={ey:+.0f} stable={stable}'
-                              f'/{args.stable}')
+                        yaw_vel = args.yaw_sign * pid_yaw.update(ex, dt)
+                        ext_vel = args.ext_sign * pid_extend.update(ey, dt)
+                    status = (f'TRACK ex={ex:+.0f} ey={ey:+.0f} '
+                              f'yaw={yaw_vel:+.0f}°/s ext={ext_vel:+.0f}°/s '
+                              f'stable={stable}/{args.stable}')
                     if stable >= args.stable and node._gimbal_ok:
                         result = {'ok': True, 'color': args.color,
                                   'yaw_deg': round(node._gimbal[0], 2),
                                   'lift_deg': round(node._gimbal[1], 2),
-                                  'extend_deg': round(node._gimbal[2], 2)}
+                                  'extend_deg': round(node._gimbal[2], 2),
+                                  'ext_offset_deg': round(float(args.ext_offset_deg), 2)}
                         print(f'[gimbal_track_pick] 对准收工：{status}', flush=True)
                         break
             else:
                 stable = 0
                 hist.clear()
+                pid_yaw.reset()
+                pid_extend.reset()
                 status = f'SEARCH color={args.color}({COLOR_NAMES[args.color]}) area={area:.0f}'
+
+            # 每帧都发速度：跟踪时发 PID 输出，等停/丢目标/死区时发 0，
+            # 既保证 F407 速度环 300ms 超时不会停得一顿一顿，也保证收工瞬间立即停住。
+            node.send_gimbal_vel(yaw_vel, 0.0, ext_vel)
 
             if not args.headless:
                 cv2.drawMarker(frame, (int(cx_target), int(cy_target)),
@@ -378,6 +497,8 @@ def main() -> int:
                     result = {'ok': False, 'reason': 'user quit'}
                     break
     finally:
+        # 收工/异常退出：发一帧零速，云台立刻停住，别带着最后一拍速度漂。
+        node.send_gimbal_vel(0.0, 0.0, 0.0)
         camera.release()
         if not args.headless:
             cv2.destroyAllWindows()

@@ -13,12 +13,23 @@ motion_planner:
     # 超时（秒）到了只报警、继续执行，不会卡死任务。
     gimbal_arrive_tol_deg: 2.0
     gimbal_arrive_timeout_s: 2.5
+    # ---- 云台位置目标续命（F407 只保持 3s，过期就退回速度模式停下）----
+    # 下发 gimbal 目标后按 0.5s 重发，直到三轴都进 ±tol；序列结束进入 idle
+    # 后仍继续，防止最后一条 gimbal 指令"走一半停住"。keepalive_s 是安全上限。
+    gimbal_keepalive_s: 30.0
+    gimbal_keepalive_tol_deg: 2.0
+    # 绝对 gimbal 指令默认阻塞等三轴到位再执行下一条（大角度移动要留足时间）。
+    # 超时只报警继续；确认要"发了就走"时在该条指令里写 "wait": false。
+    gimbal_abs_arrive_timeout_s: 20.0
     # 状态机推进频率。10Hz 时"到位后最多多等 100ms"，20Hz → 50ms。
     # 云台位置回传是 20Hz，再往上吃不到新数据，只多占上行位姿帧。
     tick_hz: 20.0
     # ---- color_pick 的视觉端（云台跟随抓取跟踪器）----
+    # 路径支持 $HOME 变量（motion_planner 启动子程序前会展开），
+    # 这样仓库放在哪个用户名下都不用改。脚本不存在时 color_pick 会静默失败，
+    # 状态栏只报"视觉程序没有返回 JSON"。
     vision_program: 'python3'
-    vision_args: '/home/pi/GongChuang/raspberrypi/vision/gimbal_track_pick.py'
+    vision_args: '$HOME/GongChuang/raspberrypi/vision/gimbal_track_pick.py'
     # ---- number_put / double_put 放置位姿（三环独立查表）----
     # 标定方法：车开到位 → calibrate 对位 → 用"夹爪微动+暂停"逐环试放：
     #   每次放到环 N 成功时，读 /gimbal_state（或 PID 页"当前"）的 yaw/lift/extend
@@ -38,23 +49,23 @@ motion_planner:
     # ---- 载物盘三个料位角度（tray_slot 指令用）。实测法：手柄按住 L1 步进转盘到
     #      "能接住物料"的位置，ros2 topic echo /cmd_servo --once 读目标角填入。
     #      0/60/120 是示例分布，必须按你的机构实测 ----
-    tray_slot1_deg: 0.0
-    tray_slot2_deg: 60.0
-    tray_slot3_deg: 120.0
+    tray_slot1_deg: 180.0
+    tray_slot2_deg: 90.0
+    tray_slot3_deg: 0.0
     # ---- vision_pick/color_pick 抓取位姿兜底与整体偏移（视觉 JSON 缺字段时用；
     #      offset 加在视觉输出上，机械标定修正不用改视觉程序）----
     pick_default_yaw_deg: 0.0
     pick_default_lift_deg: 0.0
     pick_default_extend_deg: 0.0
     pick_safe_lift_deg: 0.0
-    pick_gripper_open_deg: 120.0
-    pick_gripper_close_deg: 35.0
+    pick_gripper_open_deg: 100.0
+    pick_gripper_close_deg: 173.0
     pick_settle_ms: 800
     pick_yaw_offset_deg: 0.0
     pick_lift_offset_deg: 0.0
     pick_extend_offset_deg: 0.0
     # ---- calibrate（圆环视觉矫正）等待上限 ----
-    calibrate_timeout_s: 60.0
+    calibrate_timeout_s: 1000.0
 
 ring_fix:
   ros__parameters:
@@ -74,6 +85,9 @@ qr_scanner:
     # USB 转接模块把 device 改成 /dev/ttyUSB0
     device: '/dev/ttyAMA3'
     baudrate: 115200
+    # 模块没接时节点每 2s 重试一次，但同样的错误最多每 60s 报一次，不刷屏。
+    retry_interval_s: 2.0
+    warn_repeat_s: 60.0
 
 f407_bridge:
   ros__parameters:
@@ -86,8 +100,8 @@ f407_bridge:
 joy_control:
   ros__parameters:
     # 手柄按键控制夹爪的开/合角度
-    gripper_open_deg: 90.0
-    gripper_close_deg: 40.0
+    gripper_open_deg: 100.0
+    gripper_close_deg: 173.0
     # 载物盘（L1 按住步进）：每 tick 步进角度 / 方向（顺反了改 -1.0）
     servo_step_deg: 5.0
     plate_dir: 1.0

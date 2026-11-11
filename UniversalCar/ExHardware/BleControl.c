@@ -157,12 +157,14 @@ void BLE_ApplyToCommand(void)
     float Ly = (fabsf((float)BleRemote.Joy.Ly) < DeadZone) ? 0 : BleRemote.Joy.Ly;
     float Rx = (fabsf((float)BleRemote.Joy.Rx) < DeadZone) ? 0 : BleRemote.Joy.Rx;
 
-    PiCommand.Vel.Vx = Ly / JoyRange * CHASSIS_MAX_SPEED_X;     /* 推上(Ly负)→Vx负；实测前后反了，翻转符号 */
-    PiCommand.Vel.Vy =  -Rx / JoyRange * CHASSIS_MAX_SPEED_Y;
+    /* 摇杆满量程 = 1.0 m/s（这里只是输入标定；真正的限幅仍是 ChassisTask 里
+       的 PiTune.MaxSpeedX/Y，上位机调小就跟着变小） */
+    PiCommand.Vel.Vx = Ly / JoyRange * 1.0f;     /* 推上(Ly负)→Vx负；实测前后反了，翻转符号 */
+    PiCommand.Vel.Vy =  -Rx / JoyRange * 1.0f;
 
     /* 自旋速度指令 PiCommand.Vel.Wz 暂不使用 —— 改由 spin 滑杆给目标航向，
        自旋速度由航向 PID 算出（见 ChassisTask）。原摇杆映射保留备用：
-         PiCommand.Vel.Wz = Rx / JoyRange * CHASSIS_MAX_SPEED_W; */
+         PiCommand.Vel.Wz = Rx / JoyRange * 3.0f; */
 
     /* ---- spin 滑杆 → 目标航向（航向 PID 的被控目标） ---- */
     if (BleRemote.Slider.SpinValid) {

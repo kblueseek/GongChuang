@@ -100,6 +100,7 @@ class QrScannerNode(Node):
         self.declare_parameter('device', '/dev/ttyAMA3')
         self.declare_parameter('baudrate', 115200)
         self.declare_parameter('retry_interval_s', 2.0)
+        self.declare_parameter('warn_repeat_s', 60.0)  # 同一错误最短多久再报一次（防刷屏）
         self.declare_parameter('republish_hz', 1.0)   # 锁存结果的周期重发（迟到的订阅者用）
         self.declare_parameter('rx_poll_hz', 20.0)    # 串口收数节拍
         self.declare_parameter('max_buffer', 512)     # 滚动缓冲区上限，防模块异常刷屏撑爆内存
@@ -107,7 +108,10 @@ class QrScannerNode(Node):
         self._device = str(self.get_parameter('device').value)
         self._baud = int(self.get_parameter('baudrate').value)
         self._retry_s = float(self.get_parameter('retry_interval_s').value)
+        self._warn_repeat_s = float(self.get_parameter('warn_repeat_s').value)
         self._max_buf = int(self.get_parameter('max_buffer').value)
+        self._last_warn_t = 0.0
+        self._last_warn_msg = ''
 
         self._pub_code = self.create_publisher(String, '/task_code', 10)
         self._pub_decoded = self.create_publisher(String, '/task_code_decoded', 10)
@@ -138,9 +142,19 @@ class QrScannerNode(Node):
         try:
             self._port = serial.Serial(self._device, self._baud, timeout=0)
             self._buf.clear()
+            self._last_warn_msg = ''
             self.get_logger().info(f'扫码模块已连接 {self._device}')
         except Exception as error:  # noqa: BLE001 - 打不开就按间隔重试
-            self.get_logger().warning(f'扫码模块打不开（{self._device}）：{error}')
+            # 模块没接时每 2s 重试一次，但同样的错误最多每 warn_repeat_s 报一次，
+            # 否则整个终端被这条 WARN 刷屏。错误内容变了会立即报。
+            msg = f'扫码模块打不开（{self._device}）：{error}'
+            now = time.monotonic()
+            if (msg != self._last_warn_msg
+                    or now - self._last_warn_t >= self._warn_repeat_s):
+                self.get_logger().warning(
+                    msg + ' —— 模块没接可忽略，插上后会自动重连')
+                self._last_warn_msg = msg
+                self._last_warn_t = now
         return self._port is not None
 
     def _poll_serial(self):

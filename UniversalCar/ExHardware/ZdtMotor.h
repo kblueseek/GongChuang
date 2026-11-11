@@ -13,18 +13,8 @@
 
 #include "stdint.h"
 
-/* 位置运动模式 */
-#define ZDT_POS_REL_PREV  0  /* 相对上一输入目标位置 */
-#define ZDT_POS_ABS       1  /* 绝对位置（相对坐标零点） */
-#define ZDT_POS_REL_CUR   2  /* 相对当前实时位置 */
-
-/* 回零模式 */
-#define ZDT_HOME_NEAR       0  /* 单圈就近 */
-#define ZDT_HOME_DIR        1  /* 单圈方向 */
-#define ZDT_HOME_SENSORLESS 2  /* 无限位碰撞 */
-#define ZDT_HOME_LIMIT      3  /* 限位 */
-#define ZDT_HOME_ABSZERO    4  /* 绝对坐标零点 */
-#define ZDT_HOME_POWERCUT   5  /* 掉电位置 */
+/* 本工程只用速度模式(0xF6)：位置环在 GimbalTask 里做，驱动器内部位置/回零
+   模式一律不用（那两个模式的限幅在驱动器内部，会绕开上位机调参）。 */
 
 /* 电机状态标志（status，bit0 使能 / bit1 到位） */
 #define ZDT_STATUS_ENABLE   (1 << 0)
@@ -107,12 +97,6 @@ void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm);
 
 /// @brief 速度子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动）
 void ZdtMotor_MultiAddSpeed(ZdtMulti_t* ctx, ZdtMotor_t* motor, float rpm);
-
-/// @brief 位置子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动）
-void ZdtMotor_MultiAddPosition(ZdtMulti_t* ctx, ZdtMotor_t* motor, float deg, uint8_t mode);
-
-/// @brief 位置模式：pos 单位 °（内部转脉冲 3200/圈），mode 见 ZDT_POS_*
-void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode);
 
 /* ============ 接收解析（由 can.c 的 HAL_CAN_RxFifo0MsgPendingCallback 调用） ============ */
 void ZdtCan_RxCallback(uint32_t id, uint8_t* data, uint8_t len);

@@ -6,11 +6,12 @@
 # 本文件只列节点清单。改参数改 vehicle.yaml，不要在这里加 parameters。
 
 from launch import LaunchDescription
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 # 整车集中配置：每个节点只应用与自己名字匹配的那一节
-VEHICLE_CFG = FindPackageShare('car_bringup') + '/config/vehicle.yaml'
+VEHICLE_CFG = PathJoinSubstitution([FindPackageShare('car_bringup'), 'config', 'vehicle.yaml'])
 
 
 def car_node(package, executable, name, **kwargs):

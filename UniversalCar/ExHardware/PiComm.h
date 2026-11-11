@@ -95,7 +95,7 @@ typedef struct
     float GimbalExtKp;  //云台 extend 位置环
     float GimbalExtKi;
     float GimbalExtKd;
-    float GimbalYawSpeed;   //云台三轴最大速度 °/s（0 或负 = 用固件默认）
+    float GimbalYawSpeed;   //云台三轴最大速度 °/s（唯一来源；0 或负 = 该轴锁 0，不回退宏）
     float GimbalLiftSpeed;
     float GimbalExtSpeed;
 

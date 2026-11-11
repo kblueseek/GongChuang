@@ -101,11 +101,13 @@ static void Chassis_TuneEchoTick(void)
     s_TuneEchoStep = (s_TuneEchoStep >= 22) ? 0 : (uint8_t)(s_TuneEchoStep + 1);
 }
 
-/* 限幅工具：上限 <= 0 说明 PiTune 还没初始化，回退到宏，避免把车锁死。 */
-static float Chassis_Limit(float value, float limit, float fallback)
+/* 限幅工具：上限**只取上位机值**（PiTune），固件里已经没有对应的速度宏了。
+   PiComm_TuneReset() 里的数字只是树莓派连上前的初值；运行时到这里就只剩这一个限幅。
+   0（或负值/NaN）= 该方向锁 0，这是上位机的明确选择。 */
+static float Chassis_Limit(float value, float limit)
 {
-    if (limit <= 0.0f)
-        limit = fallback;
+    if (!(limit > 0.0f))
+        limit = 0.0f;
     return ConstrainF(value, limit, -limit);
 }
 
@@ -132,13 +134,13 @@ static void Chassis_MecanumCalc(float* rpm)
 static void Chassis_WheelRpmLimit(float* rpm)
 {
     float maxAbs = 0;
-    float limit = PiTune.MaxWheelRpm;
+    float limit = PiTune.MaxWheelRpm;   /* 唯一来源：上位机 0x04 */
     for (int i = 0; i < 4; i++)
         if (fabsf(rpm[i]) > maxAbs)
             maxAbs = fabsf(rpm[i]);
 
-    if (limit <= 0.0f)
-        limit = CHASSIS_MAX_WHEEL_RPM;   /* 调参还没下发时兜底，别把车锁死 */
+    if (!(limit > 0.0f))
+        limit = 0.0f;                   /* 上位机设 0 = 轮子锁 0 */
 
     if (maxAbs > limit) {
         float scale = limit / maxAbs;
@@ -183,7 +185,10 @@ static void Chassis_HeadingPidInit(void)
     Param.CircleResolution = 360.0f;                          /* Yaw 量程 ±180°，过零走劣弧 */
 
     Param.MaxError = 180.0f;
-    Param.MaxOutput = 3.f * 180.0f / PI;    /* rad/s → °/s */
+    /* PID 自身不再卡 3 rad/s（那是旧的固件硬限，会把上位机调到 8 rad/s
+       的设定悄悄压回 3）。这里放到调参合法范围之上，真正的限幅在控制循环里
+       由 Chassis_Limit(..., PiTune.MaxSpeedW) 统一做。 */
+    Param.MaxOutput = 20.0f * 180.0f / PI;  /* rad/s → °/s */
     Param.I_Max = 0.5f * 180.0f / PI;
 
     Param.DeadBand = 0.1f;
@@ -205,7 +210,10 @@ static void Chassis_PosPidInit(void)
 
     Param.CircleResolution = 0;          /* 线性量，不用角度环绕 */
     Param.MaxError = 10.0f;              /* 最大误差 m */
-    Param.MaxOutput = 0.5f;
+    /* 同理：不再用 0.5 m/s 的固件硬限（上位机 max_vx 最大能调到 3 m/s，
+       原来位置模式实际永远到不了 0.5 以上）。限幅统一在 Chassis_PoseControl
+       里用 PiTune.MaxSpeedX/Y 做。 */
+    Param.MaxOutput = 10.0f;
     Param.I_Max = 0.3f;
     Param.DeadBand = 0.0f;
     Param.IntegralBand = 1.0f;
@@ -311,8 +319,8 @@ static void Chassis_PoseControl(float targetX, float targetY)
 
     /* 位置环输出同样受"运动最大速度"限制：上位机把限幅调小后，
        不管是摇杆速度模式还是自动导航的位置模式，都超不过去。 */
-    Chassis.Move.Vx = Chassis_Limit(Chassis.Move.Vx, PiTune.MaxSpeedX, CHASSIS_MAX_SPEED_X);
-    Chassis.Move.Vy = Chassis_Limit(Chassis.Move.Vy, PiTune.MaxSpeedY, CHASSIS_MAX_SPEED_Y);
+    Chassis.Move.Vx = Chassis_Limit(Chassis.Move.Vx, PiTune.MaxSpeedX);
+    Chassis.Move.Vy = Chassis_Limit(Chassis.Move.Vy, PiTune.MaxSpeedY);
 
     /* 蓝牙回零到位判定：距离零点足够近则停车、清请求、清积分 */
     if (PiCommand.ReturnHome &&
@@ -418,8 +426,8 @@ void ChassisTask(void const* argument)
         /* ---- 车体速度：树莓派(PI_CMD_VEL) 或 蓝牙摇杆(BLE_ApplyToCommand) → PiCommand.Vel ----
            上位机调参页的"运动最大速度 / 平移最大速度"在这里统一限幅，
            不管指令来自手柄、树莓派还是动作序列，都绕不过去。 */
-        Chassis.Move.Vx = Chassis_Limit(PiCommand.Vel.Vx, PiTune.MaxSpeedX, CHASSIS_MAX_SPEED_X);
-        Chassis.Move.Vy = Chassis_Limit(PiCommand.Vel.Vy, PiTune.MaxSpeedY, CHASSIS_MAX_SPEED_Y);
+        Chassis.Move.Vx = Chassis_Limit(PiCommand.Vel.Vx, PiTune.MaxSpeedX);
+        Chassis.Move.Vy = Chassis_Limit(PiCommand.Vel.Vy, PiTune.MaxSpeedY);
 
 #if CHASSIS_HEADING_ENABLE
         /* ---- 航向控制：目标航向 + 转向输入积分 ----
@@ -457,7 +465,7 @@ void ChassisTask(void const* argument)
 
             PID_AngleCalc(&Chassis.HeadingPid, Imu.Yaw, s_HeadingTarget);
             Chassis.Move.Wz = CHASSIS_HEADING_YAW_DIR * Chassis.HeadingPid.Output * PI / 180.0f;   /* °/s → rad/s */
-            Chassis.Move.Wz = Chassis_Limit(Chassis.Move.Wz, PiTune.MaxSpeedW, CHASSIS_MAX_SPEED_W);
+            Chassis.Move.Wz = Chassis_Limit(Chassis.Move.Wz, PiTune.MaxSpeedW);
         }
         else
         {
@@ -467,7 +475,7 @@ void ChassisTask(void const* argument)
         }
 #else
         Chassis.Move.Wz = PiCommand.Vel.Wz;   /* 手动自旋指令（原逻辑，宏关闭时生效） */
-        Chassis.Move.Wz = Chassis_Limit(Chassis.Move.Wz, PiTune.MaxSpeedW, CHASSIS_MAX_SPEED_W);
+        Chassis.Move.Wz = Chassis_Limit(Chassis.Move.Wz, PiTune.MaxSpeedW);
 #endif
 
         /* ---- 位置闭环：Pi 位姿目标(PosTarget.Valid) 或 蓝牙回零(ReturnHome) → 覆盖 Vx/Vy ---- */

@@ -8,15 +8,15 @@
 PiCommand_t PiCommand;
 PiTune_t    PiTune;
 
-/* 默认值集中在这里，和 ChassisTask.c 的 PID 初始化保持一致。
-   不写静态初始化列表，是因为 PiComm_Init() 可能在底盘任务启动前/后执行，
-   两个任务都直接读 PiTune；用显式复位函数最稳。 */
+/* 上电初值。**这不是限幅**：上位机一连上（/f407_online False→True）就会把
+   tune_profile.json 里的整份参数重发覆盖，运行时限幅只认 PiTune 里上位机下发的值。
+   这里的数字只决定"树莓派还没连上时"那几秒的手感，改限幅请改上位机调参页。 */
 void PiComm_TuneReset(void)
 {
-    PiTune.MaxSpeedX   = CHASSIS_MAX_SPEED_X;
-    PiTune.MaxSpeedY   = CHASSIS_MAX_SPEED_Y;
-    PiTune.MaxSpeedW   = CHASSIS_MAX_SPEED_W;
-    PiTune.MaxWheelRpm = (float)CHASSIS_MAX_WHEEL_RPM;
+    PiTune.MaxSpeedX   = 1.0f;         /* m/s   ← 调参 0x01 */
+    PiTune.MaxSpeedY   = 1.0f;         /* m/s   ← 调参 0x02 */
+    PiTune.MaxSpeedW   = 3.0f;         /* rad/s ← 调参 0x03 */
+    PiTune.MaxWheelRpm = 300.0f;       /* RPM   ← 调参 0x04 */
 
     PiTune.PosKp = 1.5f;
     PiTune.PosKi = 0.3f;
@@ -35,9 +35,9 @@ void PiComm_TuneReset(void)
     PiTune.GimbalExtKp  = 20.0f;
     PiTune.GimbalExtKi  = 0.0f;
     PiTune.GimbalExtKd  = 0.0f;
-    PiTune.GimbalYawSpeed  = 120.0f;   /* 与 RobotConfig.h 的 GIMBAL_*_SPEED_MAX 一致 */
-    PiTune.GimbalLiftSpeed = 400.0f;
-    PiTune.GimbalExtSpeed  = 300.0f;
+    PiTune.GimbalYawSpeed  = 120.0f;   /* °/s ← 调参 0x14（上位机覆盖） */
+    PiTune.GimbalLiftSpeed = 400.0f;   /* °/s ← 调参 0x15 */
+    PiTune.GimbalExtSpeed  = 300.0f;   /* °/s ← 调参 0x16 */
 
     PiTune.Version = 0;
 }
@@ -280,23 +280,26 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
             memcpy(&v, &raw, sizeof(v));   /* 大端拼成宿主序，再按 float 解释 */
 
             /* 数值合法性检查：树莓派滑杆/输入框可能发出 NaN 或离谱值，
-               写进 PID 会直接把车打飞，这里一律挡掉。 */
+               写进 PID 会直接把车打飞，这里一律挡掉。
+               ⚠ 下面的每个上限都刻意留得比上位机滑杆范围更宽（见 motion_gui.py
+               TUNE_PARAMS），保证"上位机能调出来的值一定收得下"。如果以后
+               扩大滑杆范围，这里的上限要同步放大——不能再出现"拖了没反应"。 */
             if (!(v == v) || fabsf(v) > 1.0e6f)
                 return;
 
             uint8_t applied = 0;
             switch (id) {
             case PI_TUNE_MAX_VX:
-                if (v >= 0.0f && v <= 5.0f)   { PiTune.MaxSpeedX = v;   applied = 1; }
+                if (v >= 0.0f && v <= 10.0f)  { PiTune.MaxSpeedX = v;   applied = 1; }
                 break;
             case PI_TUNE_MAX_VY:
-                if (v >= 0.0f && v <= 5.0f)   { PiTune.MaxSpeedY = v;   applied = 1; }
+                if (v >= 0.0f && v <= 10.0f)  { PiTune.MaxSpeedY = v;   applied = 1; }
                 break;
             case PI_TUNE_MAX_WZ:
-                if (v >= 0.0f && v <= 20.0f)  { PiTune.MaxSpeedW = v;   applied = 1; }
+                if (v >= 0.0f && v <= 50.0f)  { PiTune.MaxSpeedW = v;   applied = 1; }
                 break;
             case PI_TUNE_MAX_RPM:
-                if (v >= 0.0f && v <= 1000.0f){ PiTune.MaxWheelRpm = v; applied = 1; }
+                if (v >= 0.0f && v <= 3000.0f){ PiTune.MaxWheelRpm = v; applied = 1; }
                 break;
             case PI_TUNE_POS_KP:
             case PI_TUNE_POS_KI:
@@ -315,8 +318,18 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
             case PI_TUNE_GIMBAL_EXT_KD:
             case PI_TUNE_GIMBAL_YAW_SPEED:
             case PI_TUNE_GIMBAL_LIFT_SPEED:
-            case PI_TUNE_GIMBAL_EXT_SPEED:
-                if (v >= 0.0f && v <= 100.0f) {
+            case PI_TUNE_GIMBAL_EXT_SPEED: {
+                /* 速度限幅单位是 °/s，不是 PID 增益，不能和增益共用一个上限。
+                   原来共用 v <= 100，导致上位机把 lift 调到 400°/s 以上
+                   （默认就是 400）被静默丢弃、不回显，表现就是"拖了没反应"。
+                   现在：速度 ID 放到 5000，增益 ID 放到 1000，
+                   都远宽于上位机滑杆范围（速度 0~2000 / 增益 0~100），
+                   只用来挡 NaN 和手滑输错数量级。 */
+                float max_v = (id == PI_TUNE_GIMBAL_YAW_SPEED ||
+                               id == PI_TUNE_GIMBAL_LIFT_SPEED ||
+                               id == PI_TUNE_GIMBAL_EXT_SPEED)
+                                  ? 5000.0f : 1000.0f;
+                if (v >= 0.0f && v <= max_v) {
                     if      (id == PI_TUNE_POS_KP)    PiTune.PosKp = v;
                     else if (id == PI_TUNE_POS_KI)    PiTune.PosKi = v;
                     else if (id == PI_TUNE_POS_KD)    PiTune.PosKd = v;
@@ -338,6 +351,7 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
                     applied = 1;
                 }
                 break;
+            }
             default:
                 return;                 /* 未知 id：不刷新版本号，也不回显 */
             }

@@ -21,21 +21,29 @@ enum
     ZDT_MOTOR_EXTEND = 7, /* 云台 X 伸缩轴 */
 };
 
-#define ZDT_ACC_DEFAULT     222    /* 云台位置模式加速度档位（0-255，越大越快，0=无曲线） */
-#define ZDT_POS_SPEED_MAX   100     /* 云台位置模式速度上限，单位 RPM（整数）。
-                                       400=2400°/s 会让位置模式任何一次误目标在 0.2s 内冲出去、
-                                       根本来不及停（"切模式云台失控无法停止"的放大器）。
-                                       降到 100=600°/s，误目标也慢到能看清、能按停。 */
-/* 底盘轮加速度档位（0-255）。Emm 固件曲线加减速公式：
+/* 加速度档位（0-255）。Emm 固件曲线加减速公式：
      每隔 (256-acc)*50us 变化 1 RPM  =>  加速度 = 20000/(256-acc) RPM/s
    加速、减速、反向共用此档位，固件自动走曲线，无法分开设置。
+   注意：急停命令 0xFE 不受此档位影响，永远是立即刹车。
+
+   底盘和云台分开设（ZdtMotor.c 按 CAN 地址 1~4 / 5~7 自动选）：
+     底盘要柔和起步、不顿挫；
+     云台（位置环 + 视觉跟踪）要跟得紧，慢斜坡会变成跟随滞后。 */
+
+/* 底盘轮（地址 1~4）
      0   : 不使用曲线，直接以设定速度启动（最猛）
-     250 : 3333 RPM/s，0→300RPM 用 0.09s（原值，起步/停车顿挫的根源）
-     156 :  200 RPM/s，0→300RPM 用 1.5s（当前值）
-     100 :  128 RPM/s，0→300RPM 用 2.3s
-   注意：急停命令 0xFE 不受此档位影响，永远是立即刹车。 */
+     250 : 3333 RPM/s，0→300RPM 用 0.09s（底盘用会顿挫）
+     222 :  588 RPM/s，0→300RPM 用 0.51s（当前值）
+     156 :  200 RPM/s，0→300RPM 用 1.5s
+     100 :  128 RPM/s，0→300RPM 用 2.3s */
 #define ZDT_WHEEL_ACC       222
-#define ZDT_PULSE_PER_REV   3200   /* Emm 固件：1.8°电机 + 16细分 = 3200 脉冲/圈 */
+
+/* 云台三轴（地址 5~7）
+     250 : 3333 RPM/s，0→500°/s(=83RPM) 用 25ms（当前值）
+     240 : 1250 RPM/s，0→500°/s 用 67ms
+     222 :  588 RPM/s（和底盘共用时的旧值，视觉跟踪会明显滞后）
+     0   : 不使用曲线，瞬时到目标速度（最跟手，但起步/换向有冲击） */
+#define ZDT_GIMBAL_ACC      250
 
 /* 电机失联判定阈值（无任何反馈视为离线） */
 #define ZDT_OFFLINE_MS      200
@@ -65,10 +73,10 @@ enum
 #define CHASSIS_AXIS_GAIN_X     1.00f
 #define CHASSIS_AXIS_GAIN_Y     1.00f
 
-#define CHASSIS_MAX_SPEED_X     1.0f    /* 前进最大速度 m/s（摇杆满量程对应的值） */
-#define CHASSIS_MAX_SPEED_Y     1.0f    /* 平移最大速度 m/s（摇杆满量程对应的值） */
-#define CHASSIS_MAX_SPEED_W     3.0f    /* 自转最大角速度 rad/s（自旋滑杆拨到两端对应的值） */
-#define CHASSIS_MAX_WHEEL_RPM   300     /* 单轮最大转速 RPM（软件限幅） */
+/* 底盘速度/轮速限幅**没有宏**：唯一来源是上位机调参页
+   （PiTune.MaxSpeedX/Y/W / MaxWheelRpm，tune id 0x01~0x04）。
+   PiComm_TuneReset() 里给的上电初值只在树莓派连上之前有效；
+   上位机一上线就会把存档里的值整份重发覆盖。想改限幅请改调参页，别在这里加宏。 */
 
 /* 每轮转向系数（按安装方向标定 ±1）：单轮发正速度时车应"前进"，反向取反 */
 #define WHEEL_FL_DIR    1
@@ -87,8 +95,8 @@ enum
 #define SERVO_PULSE_MAX     2500    /* 180° 脉宽 us */
 
 /* 上电初始角度 */
-#define SERVO_GRIPPER_INIT  45.0f
-#define SERVO_PLATE_INIT    0.0f
+#define SERVO_GRIPPER_INIT  100.0f
+#define SERVO_PLATE_INIT    180.0f
 #define SERVO_CAM_INIT      90.0f
 
 /* ==================== 补光灯（LED PWM 调光） ==================== */
@@ -122,19 +130,16 @@ enum
       这组宏只是"从没下发过限位"时的兜底。
    云台电机本身只有速度模式，位置环在 GimbalTask 里做；限位靠"相对 0 点的位置 + 运动方向"
    在速度指令上掐掉。 */
-#define GIMBAL_YAW_MIN      -1000.0f
-#define GIMBAL_YAW_MAX      1000.0f
-#define GIMBAL_LIFT_MIN      -875.0f
-#define GIMBAL_LIFT_MAX       875.0f
-#define GIMBAL_EXTEND_MIN    -580.0f
-#define GIMBAL_EXTEND_MAX     580.0f
+#define GIMBAL_YAW_MIN      -182.0f
+#define GIMBAL_YAW_MAX      800.0f
+#define GIMBAL_LIFT_MIN      -950.0f
+#define GIMBAL_LIFT_MAX       575.0f
+#define GIMBAL_EXTEND_MIN    -420.0f
+#define GIMBAL_EXTEND_MAX     678.0f
 
-/* 云台位置环输出的速度上限（°/s）和到位死区（°）。
-   三轴机械负载差很多：Yaw 只带相机、Lift 要抗重力、Extend 行程长，
-   所以上限分开给。位置环增益在 PiComm/PiTune 里在线可调。 */
-#define GIMBAL_YAW_SPEED_MAX       120.0f
-#define GIMBAL_LIFT_SPEED_MAX      400.0f
-#define GIMBAL_EXTEND_SPEED_MAX    300.0f
+/* 云台位置环输出速度**没有宏**：唯一来源是上位机调参页
+   （PiTune.GimbalYawSpeed/LiftSpeed/ExtSpeed，tune id 0x14~0x16），
+   运行中改完立即生效（Gimbal_SyncSpeedLimit）。这里的到位死区是行为参数，不是限幅。 */
 #define GIMBAL_POS_DEADBAND_DEG      0.5f
 
 /* 轴指令方向符号（+1 / -1）：把"下发速度的正方向"换算到"编码器位置增大的方向"。
@@ -194,6 +199,5 @@ enum
 #define DEBUG_HEAD          0x55AA55AA
 #define DEBUG_TAIL          0xAA55AA55
 #define DEBUG_VALUE_NUM     12      /* 每帧 float 数量，可改 */
-#define DEBUG_RPT_FREQ_HZ   100
 
 #endif

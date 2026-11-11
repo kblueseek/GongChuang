@@ -223,8 +223,15 @@ void ZdtCan_MultiSend(ZdtMulti_t* ctx)
 
 /* ============ 电机级命令 ============ */
 
+/* 加速度档位按地址分组：1~4 底盘轮、5~7 云台三轴。
+   云台要跟得紧（位置环/视觉跟踪），底盘要柔和起步，两者不能共用。 */
+static uint8_t ZdtMotor_AccFor(uint8_t addr)
+{
+    return (addr >= ZDT_MOTOR_YAW) ? ZDT_GIMBAL_ACC : ZDT_WHEEL_ACC;
+}
+
 /* 速度模式（Emm 固件 F6）：dir + 速度(整数RPM,2B) + 加速度(档位,1B) + 同步标志 */
-static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t* out)
+static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t acc, uint8_t* out)
 {
     uint8_t dir = (rpm >= 0) ? 0 : 1;
     uint16_t mag = (uint16_t)(fabsf(rpm));   /* RPM（整数，0~3000） */
@@ -233,7 +240,7 @@ static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t* out)
     out[1] = dir;
     out[2] = mag >> 8;
     out[3] = mag & 0xFF;
-    out[4] = ZDT_WHEEL_ACC;
+    out[4] = acc;
     out[5] = 0x00;
     return 6;
 }
@@ -241,7 +248,7 @@ static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t* out)
 void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm)
 {
     uint8_t c[6];
-    ZdtMotor_BuildSpeed(rpm, c);
+    ZdtMotor_BuildSpeed(rpm, ZdtMotor_AccFor(motor->Addr), c);
     Zdt_MotorSend(motor->Addr, c, sizeof(c));
 
     motor->Speed.Set = rpm;
@@ -251,51 +258,15 @@ void ZdtMotor_SetSpeed(ZdtMotor_t* motor, float rpm)
 void ZdtMotor_MultiAddSpeed(ZdtMulti_t* ctx, ZdtMotor_t* motor, float rpm)
 {
     uint8_t c[6];
-    ZdtMotor_BuildSpeed(rpm, c);
+    ZdtMotor_BuildSpeed(rpm, ZdtMotor_AccFor(motor->Addr), c);
     ZdtCan_MultiAdd(ctx, motor->Addr, c, sizeof(c));
 
     motor->Speed.Set = rpm;
 }
 
-/* 位置模式（Emm 固件 FD）：dir + 速度(整数RPM,2B) + 加速度(档位,1B) + 脉冲(4B,3200/圈) + 模式 + 同步 */
-static uint8_t ZdtMotor_BuildPosition(float deg, uint8_t mode, uint8_t* out)
-{
-    /* 方向按目标的符号取 */
-    uint8_t dir = (deg < 0.0f) ? 1 : 0;
-    uint32_t pulse = (uint32_t)(fabsf(deg) * ZDT_PULSE_PER_REV / 360.0f);
-
-    out[0]  = 0xFD;
-    out[1]  = dir;
-    out[2]  = ZDT_POS_SPEED_MAX >> 8;                       /* 速度，整数 RPM */
-    out[3]  = ZDT_POS_SPEED_MAX & 0xFF;
-    out[4]  = ZDT_ACC_DEFAULT;                              /* 加速度档位 */
-    out[5]  = pulse >> 24;                                  /* 脉冲 4B */
-    out[6]  = pulse >> 16;
-    out[7]  = pulse >> 8;
-    out[8]  = pulse & 0xFF;
-    out[9]  = mode;
-    out[10] = 0x00;
-    return 11;
-}
-
-void ZdtMotor_SetPosition(ZdtMotor_t* motor, float deg, uint8_t mode)
-{
-    uint8_t c[11];
-    uint8_t n = ZdtMotor_BuildPosition(deg, mode, c);
-    Zdt_MotorSend(motor->Addr, c, n);
-
-    motor->Position.Set = deg;
-}
-
-/* 位置子命令追加到多电机缓冲（配合 ZdtCan_MultiBegin/Send，多轴同时启动） */
-void ZdtMotor_MultiAddPosition(ZdtMulti_t* ctx, ZdtMotor_t* motor, float deg, uint8_t mode)
-{
-    uint8_t c[11];
-    uint8_t n = ZdtMotor_BuildPosition(deg, mode, c);
-    ZdtCan_MultiAdd(ctx, motor->Addr, c, n);
-
-    motor->Position.Set = deg;
-}
+/* 注意：驱动器内部位置模式（0xFD）整个工程都没有调用——云台是"位置环在
+   GimbalTask 里算速度 → 只发速度帧(0xF6)"的架构。原来的 SetPosition /
+   MultiAddPosition / BuildPosition 已删除，不要再加回来绕开上位机限幅。 */
 
 /* ============ 接收解析 ============ */
 
