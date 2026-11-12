@@ -15,10 +15,6 @@
       "delta_deg": 580.0
     },
     {
-      "cmd": "gimbal_ext",
-      "delta_deg": 115.0
-    },
-    {
       "cmd": "gripper",
       "deg": 173.0
     },

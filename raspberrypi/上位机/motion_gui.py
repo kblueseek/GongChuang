@@ -195,9 +195,10 @@ COMMAND_TYPES = {
     # ---- 任务码驱动动作（参数可写任务码占位符 $b1c1$/$b1p1$/$b2c1$/$b2p1$…）----
     'color_pick': {
         'params': 'color',
-        'hint': '云台跟随到指定颜色物料上方：自动开摄像头+实时预览，只跟随不抓取。'
-                '后续抓取/放置用你自己写死的 gimbal/gripper/plate 指令。'
-                'color=1~6 或占位符，例：$b1c1$'
+        'hint': '云台跟随到指定颜色物料上方，只跟随不抓取（阻塞，等到位才走下一句）。'
+                'color=1~6 或占位符，例：$b1c1$；也可写 open / close：'
+                'open=提前把视觉进程和摄像头点起来（不阻塞，车没到工位时先跑），'
+                'close=关闭进程释放摄像头。连着抓多种颜色时 open 一次能省掉每次三四秒启动。'
     },
     'number_put': {
         'params': 'number',
@@ -267,7 +268,12 @@ def cmd_to_text(cmd: dict) -> str:
         return (f"{verb} yaw={cmd.get('yaw_deg', 0)}° lift={cmd.get('lift_deg', 0)}° "
                 f"ext={cmd.get('extend_deg', 0)}° 夹爪{cmd.get('gripper_close', 35)}°")
     if name == 'color_pick':
-        return f"按颜色抓取 颜色={cmd.get('color', '?')}"
+        color = str(cmd.get('color', '?')).strip().lower()
+        if color == 'open':
+            return '打开视觉进程（预热摄像头，不阻塞）'
+        if color == 'close':
+            return '关闭视觉进程（释放摄像头）'
+        return f"云台跟随物料 颜色={cmd.get('color', '?')}"
     if name == 'number_put':
         return f"放到圆环 {cmd.get('number', '?')}"
     if name == 'double_put':

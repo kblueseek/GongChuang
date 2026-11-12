@@ -245,94 +245,12 @@ def _apply_track_config(args, here: Path):
     return args
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description='云台跟随颜色物料（color_pick 视觉端）')
-    parser.add_argument('--color', type=int, required=True, help='颜色编号 1~6')
-    parser.add_argument('--device', default='/dev/video0')
-    parser.add_argument('--width', type=int, default=1280)
-    parser.add_argument('--height', type=int, default=720)
-    parser.add_argument('--fps', type=float, default=30.0)
-    parser.add_argument('--timeout', type=float, default=1000.0, help='跟随总超时 s')
-    parser.add_argument('--tol-px', type=float, default=25.0, help='认为对准的像素容差')
-    parser.add_argument('--stable', type=int, default=8, help='连续多少帧对准才收工')
-    parser.add_argument('--min-area', type=float, default=800.0, help='物料最小像素面积')
-    # —— 形状筛选（移植自旧 gimbal_track 检测节点；0 = 关闭该项，默认全关只查面积）——
-    parser.add_argument('--processing-scale', type=float, default=0.5,
-                        help='半分辨率处理倍率（提速），坐标自动换算回原图')
-    parser.add_argument('--open-kernel-px', type=int, default=5, help='开运算核（全分辨率像素）')
-    parser.add_argument('--close-kernel-px', type=int, default=11, help='闭运算核（填色块内部孔洞）')
-    parser.add_argument('--max-area', type=float, default=0.0, help='最大像素面积（0=不限）')
-    parser.add_argument('--min-dimension-px', type=float, default=10.0,
-                        help='外接框最短边下限（全分辨率像素）')
-    parser.add_argument('--max-dimension-px', type=float, default=0.0,
-                        help='外接框最长边上限（0=不限）')
-    parser.add_argument('--max-aspect', type=float, default=0.0,
-                        help='最长/最短边比上限（0=不查长宽比）')
-    parser.add_argument('--min-solidity', type=float, default=0.0,
-                        help='实心度下限 轮廓面积/凸包面积（0=不查）')
-    parser.add_argument('--min-extent', type=float, default=0.0,
-                        help='占比下限 轮廓面积/外接框面积（0=不查）')
-    # —— 速度环跟随：像素误差 → 角速度 °/s ——
-    parser.add_argument('--kp-yaw', type=float, default=0.2,
-                        help='yaw 环 P（px → °/s），越大跟得越猛')
-    parser.add_argument('--ki-yaw', type=float, default=0.0)
-    parser.add_argument('--kd-yaw', type=float, default=0.0)
-    parser.add_argument('--kp-extend', type=float, default=0.8,
-                        help='extend 环 P（px → °/s）')
-    parser.add_argument('--ki-extend', type=float, default=0.0)
-    parser.add_argument('--kd-extend', type=float, default=0.0)
-    parser.add_argument('--max-yaw-deg-s', type=float, default=120.0,
-                        help='yaw 速度限幅 °/s')
-    parser.add_argument('--max-extend-deg-s', type=float, default=300.0,
-                        help='extend 速度限幅 °/s')
-    parser.add_argument('--deadband-px', type=float, default=10.0,
-                        help='误差小于这个像素数就停（也算对准）')
-    parser.add_argument('--deriv-tau', type=float, default=0.05,
-                        help='微分低通时间常数 s，越大越平滑')
-    parser.add_argument('--ext-offset-deg', type=float, default=0.0,
-                        help='对中后自动前伸补偿 °（相机→夹爪机械偏移，0=不补偿）')
-    parser.add_argument('--yaw-sign', type=float, default=1.0, choices=[1.0, -1.0],
-                        help='yaw 速度方向反了改成 -1')
-    parser.add_argument('--ext-sign', type=float, default=1.0, choices=[1.0, -1.0],
-                        help='extend 速度方向反了改成 -1')
-    # —— 画面约束 ——
-    parser.add_argument('--roi-bottom', type=float, default=0.9,
-                        help='只在画面下半这部分找物料：取值 0~1 = 从底部往上占画面比例'
-                             '（圆盘大、只够得到最近物料时用；1.0 = 全画面）')
-    parser.add_argument('--cam-rotation', type=int, default=180,
-                        choices=[0, 90, 180, 270],
-                        help='摄像头安装旋转角：倒装 180、正装 0、侧装 90/270。'
-                             '旋转在矫正之后做，预览/ROI/误差方向全部基于旋转后的画面')
-    # —— 静止前置：先等物料停住再跟随（转盘场景：物料转到抓取位会停一下）——
-    parser.add_argument('--still-time', type=float, default=0.3,
-                        help='先等物料持续不动这么久，再开始跟随（秒；0 = 不等待'
-                             '直接跟随，即动态抓取模式，转盘不停转时才用）')
-    parser.add_argument('--still-px', type=float, default=8.0,
-                        help='判定"不动"的像素抖动阈值')
-
-    parser.add_argument('--headless', action='store_true', help='不开预览窗口（无显示器环境）')
-    args = parser.parse_args()
-    args = _apply_track_config(args, HERE)   # 上位机可改 config/track_pid.json 调 PID/方向/旋转
-
+def _open_camera(args):
+    """打开摄像头并预热（头几帧常是空帧）。打不开返回 None。"""
     import cv2
-    import numpy as np
-
-    color_doc = load_color_config(HERE / 'config' / 'material_color_thresholds.json')
-    if not any(int(c['color_id']) == args.color for c in color_doc['colors']):
-        print(json.dumps({'ok': False, 'reason': f'颜色 {args.color} 没有标定配置'}),
-              flush=True)
-        return 1
-
-    rclpy.init()
-    node = GimbalTrackPick(args)
-
     camera = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     if not camera.isOpened():
-        print(json.dumps({'ok': False, 'reason': f'打不开摄像头 {args.device}'}),
-              flush=True)
-        node.destroy_node()
-        rclpy.shutdown()
-        return 1
+        return None
     camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
@@ -342,29 +260,40 @@ def main() -> int:
         ok, _f = camera.read()
         if ok:
             break
-    map1, map2 = build_undistort_maps(args.width, args.height)
-    ROTATE = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
-              180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    return camera
 
-    if not args.headless:
-        try:
-            cv2.namedWindow('gimbal_track_pick', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('gimbal_track_pick', 960, 540)
-        except cv2.error as error:
-            # 通过 SSH 跑 run_car 时没有 DISPLAY，开预览窗口会直接抛异常，
-            # 整个脚本没来得及打印 JSON 就退出 → color_pick 看起来"没反应"。
-            # 这种情况自动退回 headless，只识别/跟随，不显示画面。
-            print(f'[gimbal_track_pick] 没有图形界面，自动 headless：{error}',
-                  flush=True)
-            args.headless = True
 
+def _prepare_frame_ctx(args) -> dict:
+    """旋转表 / 畸变映射 / 画面几何量。摄像头开一次算一次，常驻模式复用。"""
+    import cv2
+    rotate = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
+              180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[args.cam_rotation]
     # 画面尺寸经旋转后才知道（90/270 宽高互换）
     if args.cam_rotation in (90, 270):
         frame_w, frame_h = args.height, args.width
     else:
         frame_w, frame_h = args.width, args.height
-    cx_target, cy_target = frame_w / 2.0, frame_h / 2.0
-    roi_y = int(frame_h * (1.0 - max(0.0, min(1.0, args.roi_bottom))))
+    map1, map2 = build_undistort_maps(args.width, args.height)
+    return {
+        'rotate': rotate, 'map1': map1, 'map2': map2,
+        'frame_w': frame_w, 'frame_h': frame_h,
+        'cx': frame_w / 2.0, 'cy': frame_h / 2.0,
+        'roi_y': int(frame_h * (1.0 - max(0.0, min(1.0, args.roi_bottom)))),
+    }
+
+
+def track_color(camera, node, args, color_doc, ctx, color) -> dict:
+    """跟随一种颜色直到对中，返回结果 dict（就是原来 main 里的那套循环）。
+
+    每次调用都用全新的 PID / 静止判定状态，所以常驻模式里连续 pick 多种颜色
+    互不干扰。调用方负责事先设好 args.color（detect_target 和状态行都用它）。
+    """
+    import cv2
+    map1, map2 = ctx['map1'], ctx['map2']
+    ROTATE = ctx['rotate']
+    frame_w, frame_h = ctx['frame_w'], ctx['frame_h']
+    cx_target, cy_target = ctx['cx'], ctx['cy']
+    roi_y = ctx['roi_y']
     roi_y_scaled = roi_y   # detect_target 内部按同尺度缩放，见调用处
 
     # ---- 速度环 PID：像素误差 → 角速度 °/s（平滑跟随，Kp 直接决定跟得有多猛）----
@@ -499,14 +428,197 @@ def main() -> int:
     finally:
         # 收工/异常退出：发一帧零速，云台立刻停住，别带着最后一拍速度漂。
         node.send_gimbal_vel(0.0, 0.0, 0.0)
+
+    return result
+
+
+def _run_server(args, camera, node, color_doc, ctx) -> int:
+    """常驻模式：摄像头只开这一次，之后按 stdin 请求反复跟随。
+
+    协议是一行一个 JSON（stdin 请求，stdout 回复）：
+      请求 {"cmd":"pick","color":1,"timeout_s":30,"still_time":0.3}
+      请求 {"cmd":"close"}
+      回复 {"ready":true}   —— 摄像头开好、可以 pick 了
+           {"ok":true,...} —— 一次 pick 的结果，字段和一次性模式完全一样
+
+    这样 motion_planner 里连着写 color_pick 1、color_pick 2 时，摄像头、
+    ROS 节点、畸变映射全都不用重新初始化，省掉每次三四秒的启动时间。
+    """
+    print(json.dumps({'ready': True, 'device': args.device}), flush=True)
+    while True:
+        line = sys.stdin.readline()
+        if not line:                       # 父进程关管道 / close：正常退出
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except ValueError:
+            print(json.dumps({'ok': False, 'reason': f'请求不是 JSON：{line[:60]}'},
+                             ensure_ascii=False), flush=True)
+            continue
+        action = str(request.get('cmd', 'pick')).strip().lower()
+        if action in ('close', 'quit', 'exit'):
+            print(json.dumps({'ok': True, 'closed': True}), flush=True)
+            return 0
+        if action != 'pick':
+            print(json.dumps({'ok': False, 'reason': f'未知请求：{action}'},
+                             ensure_ascii=False), flush=True)
+            continue
+        try:
+            color = int(request.get('color', 0))
+        except (TypeError, ValueError):
+            color = 0
+        if not any(int(c['color_id']) == color for c in color_doc['colors']):
+            print(json.dumps({'ok': False, 'color': color,
+                              'reason': f'颜色 {color} 没有标定配置'},
+                             ensure_ascii=False), flush=True)
+            continue
+
+        # 本次 pick 可以临时覆盖总超时 / 静止判据（序列里按需给）
+        args.color = color
+        old_timeout, old_still = args.timeout, args.still_time
+        try:
+            args.timeout = float(request.get('timeout_s', old_timeout))
+        except (TypeError, ValueError):
+            pass
+        try:
+            args.still_time = float(request.get('still_time', old_still))
+        except (TypeError, ValueError):
+            pass
+        print(f'[gimbal_track_pick] pick color={color}', flush=True)
+        try:
+            result = track_color(camera, node, args, color_doc, ctx, color)
+        except Exception as error:         # noqa: BLE001 - 一次失败不能带走常驻进程
+            result = {'ok': False, 'color': color, 'reason': f'跟随异常：{error}'}
+        finally:
+            args.timeout, args.still_time = old_timeout, old_still
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='云台跟随颜色物料（color_pick 视觉端）')
+    parser.add_argument('--color', type=int, default=None,
+                        help='颜色编号 1~6（--server 模式下由 stdin 下发，可不填）')
+    parser.add_argument('--server', action='store_true',
+                        help='常驻模式：开一次摄像头，之后从 stdin 反复收 pick/close，'
+                             '省掉每次重新初始化的三四秒')
+    parser.add_argument('--device', default='/dev/video0')
+    parser.add_argument('--width', type=int, default=1280)
+    parser.add_argument('--height', type=int, default=720)
+    parser.add_argument('--fps', type=float, default=30.0)
+    parser.add_argument('--timeout', type=float, default=1000.0, help='跟随总超时 s')
+    parser.add_argument('--tol-px', type=float, default=25.0, help='认为对准的像素容差')
+    parser.add_argument('--stable', type=int, default=8, help='连续多少帧对准才收工')
+    parser.add_argument('--min-area', type=float, default=800.0, help='物料最小像素面积')
+    # —— 形状筛选（移植自旧 gimbal_track 检测节点；0 = 关闭该项，默认全关只查面积）——
+    parser.add_argument('--processing-scale', type=float, default=0.5,
+                        help='半分辨率处理倍率（提速），坐标自动换算回原图')
+    parser.add_argument('--open-kernel-px', type=int, default=5, help='开运算核（全分辨率像素）')
+    parser.add_argument('--close-kernel-px', type=int, default=11, help='闭运算核（填色块内部孔洞）')
+    parser.add_argument('--max-area', type=float, default=0.0, help='最大像素面积（0=不限）')
+    parser.add_argument('--min-dimension-px', type=float, default=10.0,
+                        help='外接框最短边下限（全分辨率像素）')
+    parser.add_argument('--max-dimension-px', type=float, default=0.0,
+                        help='外接框最长边上限（0=不限）')
+    parser.add_argument('--max-aspect', type=float, default=0.0,
+                        help='最长/最短边比上限（0=不查长宽比）')
+    parser.add_argument('--min-solidity', type=float, default=0.0,
+                        help='实心度下限 轮廓面积/凸包面积（0=不查）')
+    parser.add_argument('--min-extent', type=float, default=0.0,
+                        help='占比下限 轮廓面积/外接框面积（0=不查）')
+    # —— 速度环跟随：像素误差 → 角速度 °/s ——
+    parser.add_argument('--kp-yaw', type=float, default=0.2,
+                        help='yaw 环 P（px → °/s），越大跟得越猛')
+    parser.add_argument('--ki-yaw', type=float, default=0.0)
+    parser.add_argument('--kd-yaw', type=float, default=0.0)
+    parser.add_argument('--kp-extend', type=float, default=0.8,
+                        help='extend 环 P（px → °/s）')
+    parser.add_argument('--ki-extend', type=float, default=0.0)
+    parser.add_argument('--kd-extend', type=float, default=0.0)
+    parser.add_argument('--max-yaw-deg-s', type=float, default=120.0,
+                        help='yaw 速度限幅 °/s')
+    parser.add_argument('--max-extend-deg-s', type=float, default=300.0,
+                        help='extend 速度限幅 °/s')
+    parser.add_argument('--deadband-px', type=float, default=10.0,
+                        help='误差小于这个像素数就停（也算对准）')
+    parser.add_argument('--deriv-tau', type=float, default=0.05,
+                        help='微分低通时间常数 s，越大越平滑')
+    parser.add_argument('--ext-offset-deg', type=float, default=0.0,
+                        help='对中后自动前伸补偿 °（相机→夹爪机械偏移，0=不补偿）')
+    parser.add_argument('--yaw-sign', type=float, default=1.0, choices=[1.0, -1.0],
+                        help='yaw 速度方向反了改成 -1')
+    parser.add_argument('--ext-sign', type=float, default=1.0, choices=[1.0, -1.0],
+                        help='extend 速度方向反了改成 -1')
+    # —— 画面约束 ——
+    parser.add_argument('--roi-bottom', type=float, default=0.9,
+                        help='只在画面下半这部分找物料：取值 0~1 = 从底部往上占画面比例'
+                             '（圆盘大、只够得到最近物料时用；1.0 = 全画面）')
+    parser.add_argument('--cam-rotation', type=int, default=180,
+                        choices=[0, 90, 180, 270],
+                        help='摄像头安装旋转角：倒装 180、正装 0、侧装 90/270。'
+                             '旋转在矫正之后做，预览/ROI/误差方向全部基于旋转后的画面')
+    # —— 静止前置：先等物料停住再跟随（转盘场景：物料转到抓取位会停一下）——
+    parser.add_argument('--still-time', type=float, default=0.3,
+                        help='先等物料持续不动这么久，再开始跟随（秒；0 = 不等待'
+                             '直接跟随，即动态抓取模式，转盘不停转时才用）')
+    parser.add_argument('--still-px', type=float, default=8.0,
+                        help='判定"不动"的像素抖动阈值')
+
+    parser.add_argument('--headless', action='store_true', help='不开预览窗口（无显示器环境）')
+    args = parser.parse_args()
+    args = _apply_track_config(args, HERE)   # 上位机可改 config/track_pid.json 调 PID/方向/旋转
+
+    if args.color is None and not args.server:
+        parser.error('--color 必填（--server 模式下由 stdin 下发）')
+
+    import cv2
+
+    color_doc = load_color_config(HERE / 'config' / 'material_color_thresholds.json')
+    if not args.server and not any(int(c['color_id']) == args.color
+                                   for c in color_doc['colors']):
+        print(json.dumps({'ok': False, 'reason': f'颜色 {args.color} 没有标定配置'}),
+              flush=True)
+        return 1
+
+    rclpy.init()
+    node = GimbalTrackPick(args)
+
+    camera = _open_camera(args)
+    if camera is None:
+        print(json.dumps({'ok': False, 'reason': f'打不开摄像头 {args.device}'}),
+              flush=True)
+        node.destroy_node()
+        rclpy.shutdown()
+        return 1
+
+    if not args.headless:
+        try:
+            cv2.namedWindow('gimbal_track_pick', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('gimbal_track_pick', 960, 540)
+        except cv2.error as error:
+            # 通过 SSH 跑 run_car 时没有 DISPLAY，开预览窗口会直接抛异常，
+            # 整个脚本没来得及打印 JSON 就退出 → color_pick 看起来"没反应"。
+            # 这种情况自动退回 headless，只识别/跟随，不显示画面。
+            print(f'[gimbal_track_pick] 没有图形界面，自动 headless：{error}',
+                  flush=True)
+            args.headless = True
+
+    ctx = _prepare_frame_ctx(args)
+    try:
+        if args.server:
+            return _run_server(args, camera, node, color_doc, ctx)
+        result = track_color(camera, node, args, color_doc, ctx, int(args.color))
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0 if result.get('ok') else 1
+    finally:
         camera.release()
         if not args.headless:
             cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
-
-    print(json.dumps(result, ensure_ascii=False), flush=True)
-    return 0 if result.get('ok') else 1
 
 
 if __name__ == '__main__':

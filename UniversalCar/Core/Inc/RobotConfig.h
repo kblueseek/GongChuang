@@ -43,7 +43,7 @@ enum
      240 : 1250 RPM/s，0→500°/s 用 67ms
      222 :  588 RPM/s（和底盘共用时的旧值，视觉跟踪会明显滞后）
      0   : 不使用曲线，瞬时到目标速度（最跟手，但起步/换向有冲击） */
-#define ZDT_GIMBAL_ACC      250
+#define ZDT_GIMBAL_ACC      245
 
 /* 电机失联判定阈值（无任何反馈视为离线） */
 #define ZDT_OFFLINE_MS      200
@@ -132,7 +132,7 @@ enum
    在速度指令上掐掉。 */
 #define GIMBAL_YAW_MIN      -182.0f
 #define GIMBAL_YAW_MAX      800.0f
-#define GIMBAL_LIFT_MIN      -950.0f
+#define GIMBAL_LIFT_MIN      -990.0f
 #define GIMBAL_LIFT_MAX       575.0f
 #define GIMBAL_EXTEND_MIN    -420.0f
 #define GIMBAL_EXTEND_MAX     678.0f

@@ -68,6 +68,9 @@
            的同名项，上位机跟踪页可调），自动把 extend 再前伸这个角度并等到位——
            序列里不用再手写 gimbal_ext；摄像头改装后只改那个参数。
            lift 仍按物料高度自己在序列里补（高度不固定，视觉不做）。
+           color 也可以写 "open" / "close"：视觉程序改成常驻进程（--server），
+           open 只点火预热（不阻塞，车没到工位时先跑），N 只发一行请求，
+           close 释放摄像头。连抓多种颜色只付一次启动时间。
   pick     {"cmd":"pick", "yaw_deg":0, "lift_deg":-40, "safe_lift_deg":0,
             "extend_deg":150, "gripper_open":120, "gripper_close":35, "settle_ms":800}
            抓取宏：张开夹爪 → 云台到安全位 → 降到抓取位 → 等稳定 → 夹紧 → 抬起。
@@ -306,6 +309,17 @@ class MotionPlannerNode(Node):
         self._proc_result = None       # 从 stdout / result_file 解析出的 JSON
         self._proc_thread = None       # stdout 读取线程
 
+        # ---- 常驻视觉进程（color_pick open / close / N）----
+        # 每次 color_pick 都新起一个进程的话，摄像头打开 + 预热 + 畸变映射要
+        # 三四秒，连着抓两种颜色就白等两次。这里让视觉程序用 --server 常驻，
+        # open 时预热点火（不阻塞），N 时只往它 stdin 写一行请求，close 才收掉。
+        self._vision = None            # subprocess.Popen（常驻视觉进程）
+        self._vision_in = None         # 它的 stdin（一行一个 JSON 请求）
+        self._vision_lines = None      # 后台线程读 stdout 塞进队列
+        self._vision_thread = None
+        self._vision_deadline = 0.0    # 当前这次 pick 的等待截止
+        self._vision_color = None      # 正在等的颜色（只用于提示）
+
         # 若有启动参数指定的序列文件，先加载（不自动开始，等上位机下发 start）
         if sequence_file:
             self._load_file(sequence_file)
@@ -365,6 +379,7 @@ class MotionPlannerNode(Node):
         """
         if bool(msg.data) and self.phase != 'idle':
             self._kill_proc()                            # 停止时把视觉/脚本子进程也收掉
+            self._vision_stop()                          # 常驻视觉进程（摄像头）一并释放
             self._fix_result = None                      # 挂起的圆环矫正结果一并作废
             self.phase = 'idle'
             self.index = -1
@@ -472,6 +487,9 @@ class MotionPlannerNode(Node):
             self.get_logger().error('无里程计，无法开始')
             return
         self._kill_proc()                           # 上一条序列残留的脚本先收掉
+        # 上一条序列留下的常驻视觉进程也收掉：它可能在跟一个已经没人要的颜色，
+        # 结果行还压在 stdout 队列里，会让新序列的第一条 color_pick 读到旧结果。
+        self._vision_stop()
         self._fix_result = None                     # 挂起的圆环矫正结果一并作废
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
         self.yaw_stable_since = 0.0
@@ -500,7 +518,7 @@ class MotionPlannerNode(Node):
         color_pick 等子程序（proc/fixing）是用 /cmd_gimbal_vel 自己驱动云台的，
         必须跳过，否则位置模式会抢走速度模式。
         """
-        if self.phase in ('proc', 'fixing') or self.gimbal_target is None:
+        if self.phase in ('proc', 'fixing', 'vision') or self.gimbal_target is None:
             return
         if self._gimbal_keepalive_deadline <= 0.0:
             return
@@ -661,6 +679,29 @@ class MotionPlannerNode(Node):
                         return
                 else:
                     self.phase = 'stepping'
+        elif self.phase == 'vision':
+            # 等常驻视觉进程回一条带 ok 字段的结果。中途的 {"ready": true} 只是
+            # 通知"摄像头开好了"，跳过继续等。
+            message = self._vision_take_message()
+            while message is not None and 'ok' not in message:
+                message = self._vision_take_message()
+            if message is None:
+                if self._vision is None or self._vision.poll() is not None:
+                    self._vision_stop()
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 视觉进程意外退出，'
+                        'color_pick 跳过——继续执行后续指令')
+                elif self._now() > self._vision_deadline:
+                    self._vision_stop()
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] color_pick 等待超时，'
+                        '已关闭视觉进程——继续执行后续指令')
+                else:
+                    return
+                self.phase = 'stepping'
+            else:
+                self._vision_color = None
+                self._apply_vision_result(message)
 
         # 连续执行：不阻塞的指令（舵机/云台/注释…）一条接一条，遇到阻塞的（走/转/延时）就停下等
         while self.phase == 'stepping':
@@ -856,9 +897,32 @@ class MotionPlannerNode(Node):
                 f'[{self.index+1}/{len(self.commands)}] 圆环视觉矫正 → '
                 f'({rx:+.3f},{ry:+.3f})m，识别对位中…')
             self.phase = 'fixing'
-        elif name == 'color_pick':     # 按颜色抓物料：vision_pick 封装
+        elif name == 'color_pick':     # 按颜色跟随物料：open / close / 1~6
+            raw = cmd.get('color')
+            token = str(raw).strip().lower() if raw is not None else ''
+            if token in ('open', 'close'):
+                if token == 'open':
+                    # 不阻塞：只是把进程和摄像头点起来。车还没到工位时先跑这一条，
+                    # 后面第一条 color_pick N 就不用再等三四秒的启动时间。
+                    if self._vision_start():
+                        self._publish_state(
+                            f'[{self.index+1}/{len(self.commands)}] 视觉进程已启动，'
+                            '摄像头预热中（不阻塞，后续 color_pick N 直接用）')
+                    else:
+                        self._publish_state(
+                            f'[{self.index+1}/{len(self.commands)}] 视觉进程没启动起来，'
+                            '检查 vision_program / vision_args')
+                elif self._vision is None:
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 视觉进程没开，无需关闭')
+                else:
+                    self._vision_stop()
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 视觉进程已关闭（摄像头已释放）')
+                return
+
             try:
-                color = self._resolve_token(cmd.get('color'), 'color')
+                color = self._resolve_token(raw, 'color')
                 if isinstance(color, str) and color.isdigit():
                     color = int(color)
                 if isinstance(color, int) and not 1 <= color <= 6:
@@ -867,18 +931,33 @@ class MotionPlannerNode(Node):
                 self._publish_state(
                     f'[{self.index+1}/{len(self.commands)}] color_pick：{error}，跳过')
                 return
-            # 复用 vision_pick 全链路：跑视觉程序（带 --color），JSON 回来插 pick 宏
-            # no_pick：color_pick 只要求云台跟随到物料上方，不自动抓——
-            # 抓取/放载物盘等后续动作由序列里写死的 gimbal/gripper/plate 指令完成。
-            vp = {'cmd': 'vision_pick',
-                  'program': cmd.get('program')
-                             or self.get_parameter('vision_program').value or '',
-                  'args': (str(cmd.get('args')
-                               or self.get_parameter('vision_args').value or '')
-                           + f' --color {color}').strip(),
-                  'timeout_s': cmd.get('timeout_s', 60.0),
-                  'no_pick': True}
-            self._execute(vp)
+
+            if not self._vision_start():
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] color_pick：视觉进程启动失败，跳过')
+                return
+            try:
+                timeout = float(cmd.get('timeout_s', 60.0))
+            except (TypeError, ValueError):
+                timeout = 60.0
+            request = {'cmd': 'pick', 'color': int(color), 'timeout_s': timeout}
+            try:
+                request['still_time'] = float(cmd['still_time'])
+            except (KeyError, TypeError, ValueError):
+                pass
+            if not self._vision_send(request):
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] color_pick：'
+                    '给视觉进程发请求失败，跳过')
+                return
+            self._vision_color = color
+            # 冷启动（open 没写、这一条才把进程点起来）要多等摄像头和畸变映射，
+            # 所以截止时间给 15s 余量；正常 open 过之后只等 timeout。
+            self._vision_deadline = self._now() + timeout + 15.0
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] color_pick {color}：'
+                '等待云台跟随对中…')
+            self.phase = 'vision'
         elif name in ('number_put', 'double_put'):   # 按环号放置 / 叠放
             try:
                 number = int(self._resolve_token(cmd.get('number'), 'number'))
@@ -1181,56 +1260,8 @@ class MotionPlannerNode(Node):
         加 pick_*_offset（机械标定修正，不改视觉程序就能整体平移抓取点）。
         """
         if (self._proc_cmd or {}).get('no_pick'):
-            # color_pick 语义：云台已跟随到目标上方，继续执行后续指令即可。
-            # 但不能只看"进程结束"就报成功——视觉超时/没找到物料/打不开摄像头
-            # 时 JSON 里是 ok:false，必须原样报到界面上，否则后续夹爪指令
-            # 会在云台还停在原地的情况下"抓空"，看起来却一切正常。
-            data = self._proc_result or {}
-            if not data:
-                self._publish_state(
-                    'color_pick 视觉程序没有返回 JSON（看程序输出：摄像头/路径/'
-                    'DISPLAY 问题）——继续执行后续指令')
-            elif not data.get('ok', True):
-                self._publish_state(
-                    f'color_pick 失败：{data.get("reason", "未知原因")}'
-                    '——继续执行后续指令')
-            else:
-                self._publish_state(
-                    f'云台已跟随到物料上方（color_pick，不自动抓取）：'
-                    f'yaw={data.get("yaw_deg", 0):+.1f}° '
-                    f'lift={data.get("lift_deg", 0):+.1f}° '
-                    f'ext={data.get("extend_deg", 0):+.1f}°')
-                # 相机装在夹爪后面，画面里"对中"≠夹爪已经够到物料。
-                # 这个补偿量随摄像头安装位置变化，存在 track_pid.json 的
-                # ext_offset_deg，由视觉程序随结果 JSON 回传；这里自动前伸，
-                # 序列里就不用再手写一条 gimbal_ext。
-                try:
-                    ext_off = float(data.get('ext_offset_deg', 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    ext_off = 0.0
-                if abs(ext_off) > 1e-3:
-                    target = [float(data.get('yaw_deg', self.gimbal_actual[0])),
-                              float(data.get('lift_deg', self.gimbal_actual[1])),
-                              float(data.get('extend_deg', self.gimbal_actual[2]))
-                              + ext_off]
-                    a = Float32MultiArray()
-                    a.data = list(target)
-                    self._pub_gimbal.publish(a)
-                    self.gimbal_target = list(target)
-                    self._gimbal_keepalive_deadline = (
-                        self._now() + self.gimbal_keepalive_s)
-                    # 只等 ext 轴到位；yaw/lift 的目标就是实测值，不会动。
-                    self._gimbal_wait_all = False
-                    self._gimbal_wait_axis = 2
-                    self._gimbal_wait_deg = target[2]
-                    self._gimbal_wait_tol = self.gimbal_tol_deg
-                    self.gimbal_deadline = self._now() + self.gimbal_timeout_s
-                    self._publish_state(
-                        f'对中后自动前伸 ext {ext_off:+.1f}° → '
-                        f'{target[2]:+.1f}°，等到位（±{self.gimbal_tol_deg:.1f}°）')
-                    self.phase = 'gimbal'
-                    return
-            self.phase = 'stepping'
+            # 一次性子程序模式的兼容路径（color_pick 现在走常驻视觉进程，见 _tick 'vision'）
+            self._apply_vision_result(self._proc_result or {})
             return
         data = self._proc_result or {}
         gp = self.get_parameter
@@ -1264,6 +1295,167 @@ class MotionPlannerNode(Node):
         expanded = self._macro_pick(pick, 'pick')
         self.commands[self.index + 1:self.index + 1] = expanded
         self.phase = 'stepping'
+
+    def _apply_vision_result(self, data: dict):
+        """color_pick 的结果：只报告 + 可选的对中后前伸，不自动抓取。
+
+        但不能只看"有没有结果"就报成功——视觉超时/没找到物料/打不开摄像头时
+        JSON 里是 ok:false，必须原样报到界面上，否则后续夹爪指令会在云台还停在
+        原地的情况下"抓空"，看起来却一切正常。
+        """
+        if not data:
+            self._publish_state(
+                'color_pick 视觉程序没有返回 JSON（看程序输出：摄像头/路径/'
+                'DISPLAY 问题）——继续执行后续指令')
+            self.phase = 'stepping'
+            return
+        if not data.get('ok', True):
+            self._publish_state(
+                f'color_pick 失败：{data.get("reason", "未知原因")}'
+                '——继续执行后续指令')
+            self.phase = 'stepping'
+            return
+
+        # 视觉程序是自己在速度环上动云台的，状态机的目标镜像已经对不上了。
+        # 重置成 None，后面 gimbal_yaw/lift/ext 这类相对指令改用实测角重新起算。
+        self.gimbal_target = None
+        self._publish_state(
+            f'云台已跟随到物料上方（color_pick，不自动抓取）：'
+            f'yaw={data.get("yaw_deg", 0):+.1f}° '
+            f'lift={data.get("lift_deg", 0):+.1f}° '
+            f'ext={data.get("extend_deg", 0):+.1f}°')
+        # 相机装在夹爪后面，画面里"对中"≠夹爪已经够到物料。
+        # 这个补偿量随摄像头安装位置变化，存在 track_pid.json 的 ext_offset_deg，
+        # 由视觉程序随结果 JSON 回传；这里自动前伸，序列里就不用再手写一条 gimbal_ext。
+        try:
+            ext_off = float(data.get('ext_offset_deg', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ext_off = 0.0
+        if abs(ext_off) > 1e-3:
+            target = [float(data.get('yaw_deg', self.gimbal_actual[0])),
+                      float(data.get('lift_deg', self.gimbal_actual[1])),
+                      float(data.get('extend_deg', self.gimbal_actual[2]))
+                      + ext_off]
+            a = Float32MultiArray()
+            a.data = list(target)
+            self._pub_gimbal.publish(a)
+            self.gimbal_target = list(target)
+            self._gimbal_keepalive_deadline = (
+                self._now() + self.gimbal_keepalive_s)
+            # 只等 ext 轴到位；yaw/lift 的目标就是实测值，不会动。
+            self._gimbal_wait_all = False
+            self._gimbal_wait_axis = 2
+            self._gimbal_wait_deg = target[2]
+            self._gimbal_wait_tol = self.gimbal_tol_deg
+            self.gimbal_deadline = self._now() + self.gimbal_timeout_s
+            self._publish_state(
+                f'对中后自动前伸 ext {ext_off:+.1f}° → '
+                f'{target[2]:+.1f}°，等到位（±{self.gimbal_tol_deg:.1f}°）')
+            self.phase = 'gimbal'
+            return
+        self.phase = 'stepping'
+
+    # ---------------- 常驻视觉进程（color_pick open / N / close） ----------------
+
+    def _vision_start(self) -> bool:
+        """启动（或复用）常驻视觉进程。返回 False = 没起来。"""
+        if self._vision is not None and self._vision.poll() is None:
+            return True
+
+        program = str(self.get_parameter('vision_program').value or '').strip()
+        if not program:
+            self.get_logger().warning('color_pick: 没配置 vision_program')
+            return False
+        argv = shlex.split(str(self.get_parameter('vision_args').value or ''))
+        if argv:                       # 第一个参数是脚本路径，允许写 ~ / $HOME
+            argv[0] = os.path.expandvars(os.path.expanduser(argv[0]))
+        if '--server' not in argv:
+            argv.append('--server')
+
+        env = os.environ.copy()
+        env.setdefault('PYTHONUNBUFFERED', '1')
+        try:
+            proc = subprocess.Popen(
+                [program, *argv], env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+        except Exception as error:  # noqa: BLE001 - 路径错/没权限不该拖垮状态机
+            self.get_logger().error(f'color_pick: 启动视觉进程失败：{error}')
+            return False
+
+        self._vision = proc
+        self._vision_in = proc.stdin
+        self._vision_lines = queue.Queue()
+        self._vision_thread = threading.Thread(
+            target=self._read_proc, args=(proc, self._vision_lines),
+            daemon=True, name='vision-server-reader')
+        self._vision_thread.start()
+        self.get_logger().info(f'视觉进程已启动：{program} {" ".join(argv)}')
+        return True
+
+    def _vision_stop(self, wait_s: float = 3.0):
+        """给常驻视觉进程发 close 并等它退出（关摄像头）。幂等。"""
+        proc, self._vision = self._vision, None
+        stream, self._vision_in = self._vision_in, None
+        if proc is None:
+            return
+        try:
+            if stream is not None:
+                stream.write(json.dumps({'cmd': 'close'}) + '\n')
+                stream.flush()
+        except Exception:  # noqa: BLE001 - 管道已经断了就直接杀
+            pass
+        try:
+            proc.wait(timeout=max(0.1, wait_s))
+        except Exception:  # noqa: BLE001
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        thread, self._vision_thread = self._vision_thread, None
+        self._vision_lines = None
+        if thread is not None:
+            thread.join(timeout=1.0)
+        self.get_logger().info('视觉进程已关闭')
+
+    def _vision_send(self, request: dict) -> bool:
+        """往视觉进程 stdin 写一行 JSON 请求。"""
+        if self._vision is None or self._vision.poll() is not None:
+            return False
+        try:
+            self._vision_in.write(json.dumps(request, ensure_ascii=False) + '\n')
+            self._vision_in.flush()
+            return True
+        except Exception as error:  # noqa: BLE001
+            self.get_logger().warning(f'视觉进程写请求失败：{error}')
+            return False
+
+    def _vision_take_message(self):
+        """非阻塞取一条 JSON 消息；普通日志行转去 ROS 日志。没有就返回 None。"""
+        if self._vision_lines is None:
+            return None
+        while True:
+            try:
+                line = self._vision_lines.get_nowait()
+            except queue.Empty:
+                return None
+            text = line.strip()
+            if not text:
+                continue
+            if not text.startswith('{'):
+                self.get_logger().info(f'vision: {text}')
+                continue
+            try:
+                data = json.loads(text)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(data, dict):
+                return data
 
     def _kill_proc(self):
         """立即结束正在跑的子程序（停止 / 超时 / 任务结束）。"""
