@@ -71,6 +71,15 @@
            color 也可以写 "open" / "close"：视觉程序改成常驻进程（--server），
            open 只点火预热（不阻塞，车没到工位时先跑），N 只发一行请求，
            close 释放摄像头。连抓多种颜色只付一次启动时间。
+           可写 "still_time":0 覆盖 vision_still_time_s（先等物料静止多久再跟随）。
+  track_debug {"cmd":"track_debug", "color":"1"}
+           纯调参（阻塞）：一直跟随该颜色，永远不判"对中完成"，直到点■停止 /
+           超时 timeout_s（默认 600s）。视觉端每秒重读 config/track_pid.json，
+           上位机 PID 页拖动滑块后 1 秒内生效，画面左上角实时显示 STEP/TRACK。
+  place_tray {"cmd":"place_tray", "yaw_deg":650, "lift_deg":-980, "extend_deg":248}
+           放到载物盘：yaw/lift 开始转的同时把 ext 收到 place_tray_retract_extend_deg
+           （ext 行程短、可调得快，几百毫秒收完，剩下的转动全程力臂都短 → 带料
+           不抖），yaw 到位后再把 ext 伸出去。两条都是阻塞指令，抓完料停在哪都能跑。
   pick     {"cmd":"pick", "yaw_deg":0, "lift_deg":-40, "safe_lift_deg":0,
             "extend_deg":150, "gripper_open":120, "gripper_close":35, "settle_ms":800}
            抓取宏：张开夹爪 → 云台到安全位 → 降到抓取位 → 等稳定 → 夹紧 → 抬起。
@@ -152,6 +161,9 @@ class MotionPlannerNode(Node):
         self.declare_parameter('vision_program', '')
         self.declare_parameter('vision_args', '')
         self.declare_parameter('vision_cwd', '')
+        # color_pick 开始跟随前先等物料静止多久（秒）。转盘会停一下 → 0.3 够用；
+        # 物料一直在动、或者想尽快出第一条云台指令 → 设 0（检测到就追）。
+        self.declare_parameter('vision_still_time_s', 0.3)
         self.declare_parameter('script_timeout_s', 60.0)
         # 圆环视觉矫正（calibrate 指令）最多等多久：要覆盖摄像头打开、识别
         # 稳定、小步对位的全部时间，给足余量。
@@ -171,6 +183,9 @@ class MotionPlannerNode(Node):
         self.declare_parameter('place_gripper_open_deg', 120.0)
         self.declare_parameter('place_settle_ms', 800)
         # ---- 载物盘三个料位角度（tray_slot 指令查表；实测填入 vehicle.yaml）----
+        # place_tray 转 yaw 前先把 ext 收到这个角度（力臂最短、转动惯量最小）。
+        # 放在机构完全收回的位置；序列里单条指令写 retract_deg 可覆盖。
+        self.declare_parameter('place_tray_retract_extend_deg', 0.0)
         self.declare_parameter('tray_slot1_deg', 0.0)
         self.declare_parameter('tray_slot2_deg', 60.0)
         self.declare_parameter('tray_slot3_deg', 120.0)
@@ -319,6 +334,7 @@ class MotionPlannerNode(Node):
         self._vision_thread = None
         self._vision_deadline = 0.0    # 当前这次 pick 的等待截止
         self._vision_color = None      # 正在等的颜色（只用于提示）
+        self._vision_debug = False     # 当前是 track_debug（纯调参）而不是 color_pick
 
         # 若有启动参数指定的序列文件，先加载（不自动开始，等上位机下发 start）
         if sequence_file:
@@ -490,6 +506,7 @@ class MotionPlannerNode(Node):
         # 上一条序列留下的常驻视觉进程也收掉：它可能在跟一个已经没人要的颜色，
         # 结果行还压在 stdout 队列里，会让新序列的第一条 color_pick 读到旧结果。
         self._vision_stop()
+        self._vision_debug = False
         self._fix_result = None                     # 挂起的圆环矫正结果一并作废
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
         self.yaw_stable_since = 0.0
@@ -546,6 +563,11 @@ class MotionPlannerNode(Node):
 
         if self.phase == 'idle':
             return
+        # 常驻视觉进程在 open 之后、第一次 pick 之前会输出 ready / 打不开摄像头，
+        # 这些行放在队列里没人看，趁不在等 pick 的时候转成 ROS 日志（phase
+        # == 'vision' 时由 _tick 的 vision 分支自己消费，别抢先取走）。
+        if self._vision_lines is not None and self.phase != 'vision':
+            self._vision_report_last('')
         if self.phase == 'proc':
             # 等子程序跑完。完成时 _poll_proc 会把 phase 改成 stepping（继续）
             # 或 moving（视觉校准后重新下发目标，等车到位）。
@@ -687,10 +709,12 @@ class MotionPlannerNode(Node):
                 message = self._vision_take_message()
             if message is None:
                 if self._vision is None or self._vision.poll() is not None:
+                    last = self._vision_drain_last()
                     self._vision_stop()
+                    reason = f'（{last}）' if last else ''
                     self._publish_state(
-                        f'[{self.index+1}/{len(self.commands)}] 视觉进程意外退出，'
-                        'color_pick 跳过——继续执行后续指令')
+                        f'[{self.index+1}/{len(self.commands)}] 视觉进程意外退出'
+                        f'{reason}，color_pick 跳过——继续执行后续指令')
                 elif self._now() > self._vision_deadline:
                     self._vision_stop()
                     self._publish_state(
@@ -700,8 +724,18 @@ class MotionPlannerNode(Node):
                     return
                 self.phase = 'stepping'
             else:
+                debug = self._vision_debug
                 self._vision_color = None
-                self._apply_vision_result(message)
+                self._vision_debug = False
+                if debug:
+                    # track_debug 只在超时/被停止时才有结果，没有"对中完成"这回事，
+                    # 不能走 color_pick 的对中后自动前伸逻辑。
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 跟踪调试结束'
+                        f'（{message.get("reason", "ok")}）')
+                    self.phase = 'stepping'
+                else:
+                    self._apply_vision_result(message)
 
         # 连续执行：不阻塞的指令（舵机/云台/注释…）一条接一条，遇到阻塞的（走/转/延时）就停下等
         while self.phase == 'stepping':
@@ -845,6 +879,21 @@ class MotionPlannerNode(Node):
                 f'[{self.index+1}/{len(self.commands)}] 云台 {label} '
                 f'{delta:+.1f}° → {target[axis]:+.1f}°，等到位（±{tol:.1f}°）')
             self.phase = 'gimbal'
+        elif name == 'place_tray':    # 放到载物盘：先收 ext → 转 yaw/lift → 再伸出
+            # 抓完料时云台可能停在任意姿态（视觉跟随把三轴都带走了），所以在这里
+            # 按实测姿态展开成基本指令，从哪儿开始都能跑。
+            # 为什么串行而不是三轴齐动：ext 伸到最外时力臂最长，yaw 转大角度的
+            # 转动惯量最大，带料就会抖；而且 ext 没走完时还会拖慢 yaw。
+            try:
+                steps = self._macro_place_tray(cmd)
+            except (KeyError, ValueError) as error:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] place_tray：{error}，跳过')
+                return
+            self.commands[self.index + 1:self.index + 1] = steps
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 放到载物盘：转 '
+                f'yaw={float(steps[-1]["yaw_deg"]):+.0f}°（同时收 ext，到位后再伸出）')
         elif name == 'tray_slot':    # 载物盘转到第 N 个料位（角度查 vehicle.yaml）
             try:
                 n = int(self._resolve_token(cmd.get('number'), 'number'))
@@ -907,7 +956,8 @@ class MotionPlannerNode(Node):
                     if self._vision_start():
                         self._publish_state(
                             f'[{self.index+1}/{len(self.commands)}] 视觉进程已启动，'
-                            '摄像头预热中（不阻塞，后续 color_pick N 直接用）')
+                            '摄像头预热中（不阻塞；约 2~3 秒后预览窗口出画面，'
+                            '后续 color_pick N 直接用）')
                     else:
                         self._publish_state(
                             f'[{self.index+1}/{len(self.commands)}] 视觉进程没启动起来，'
@@ -941,22 +991,69 @@ class MotionPlannerNode(Node):
             except (TypeError, ValueError):
                 timeout = 60.0
             request = {'cmd': 'pick', 'color': int(color), 'timeout_s': timeout}
+            # 静止前置时间：默认取 vision_still_time_s，序列里写 still_time 可覆盖。
+            # 转盘不停时设 0 → 检测到就开始跟，省掉 0.3s 的等待。
             try:
                 request['still_time'] = float(cmd['still_time'])
             except (KeyError, TypeError, ValueError):
-                pass
+                try:
+                    request['still_time'] = float(
+                        self.get_parameter('vision_still_time_s').value)
+                except Exception:  # noqa: BLE001 - 参数缺失就用视觉端默认值
+                    pass
             if not self._vision_send(request):
                 self._publish_state(
                     f'[{self.index+1}/{len(self.commands)}] color_pick：'
                     '给视觉进程发请求失败，跳过')
                 return
             self._vision_color = color
+            self._vision_debug = False
             # 冷启动（open 没写、这一条才把进程点起来）要多等摄像头和畸变映射，
             # 所以截止时间给 15s 余量；正常 open 过之后只等 timeout。
             self._vision_deadline = self._now() + timeout + 15.0
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] color_pick {color}：'
                 '等待云台跟随对中…')
+            self.phase = 'vision'
+        elif name == 'track_debug':
+            # 纯调参：一直跟随该颜色，不判"对准完成"，直到点■停止 / 超时。
+            # 视觉端每秒重读 config/track_pid.json，上位机 PID 页拖滑块即时生效。
+            raw = cmd.get('color')
+            try:
+                color = self._resolve_token(raw, 'color')
+                if isinstance(color, str) and color.isdigit():
+                    color = int(color)
+                if not isinstance(color, int) or not 1 <= color <= 6:
+                    raise ValueError(f'颜色编号 {color} 越界（只能 1~6）')
+            except (KeyError, ValueError) as error:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] track_debug：{error}，跳过')
+                return
+            if not self._vision_start():
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] track_debug：视觉进程启动失败，跳过')
+                return
+            try:
+                timeout = float(cmd.get('timeout_s', 600.0))
+            except (TypeError, ValueError):
+                timeout = 600.0
+            request = {'cmd': 'debug', 'color': int(color), 'timeout_s': timeout}
+            try:
+                request['still_time'] = float(cmd['still_time'])
+            except (KeyError, TypeError, ValueError):
+                pass
+            if not self._vision_send(request):
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] track_debug：'
+                    '给视觉进程发请求失败，跳过')
+                return
+            self._vision_color = color
+            self._vision_debug = True
+            self._vision_deadline = self._now() + timeout + 15.0
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 跟踪调试：颜色 {color}，'
+                f'一直跟随（最长 {timeout:.0f}s）——上位机 PID 页拖滑块实时调参，'
+                '点■停止结束')
             self.phase = 'vision'
         elif name in ('number_put', 'double_put'):   # 按环号放置 / 叠放
             try:
@@ -1004,6 +1101,12 @@ class MotionPlannerNode(Node):
         elif name == 'comment':       # 注释，跳过
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 注释: {cmd.get("text", "")}')
         else:
+            # 只写 ROS 日志的话，上位机状态栏一片正常，看起来像"这条指令执行了
+            # 但没动静"（比如新加的宏在旧节点上跑）。推到 /motion_state 让人一眼
+            # 看见是"节点不认识这条指令"，多半是 motion_planner 没重启。
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] 未知指令 {name!r}，跳过'
+                '（motion_planner 是不是还没重启？）')
             self.get_logger().warning(f'未知指令被跳过: {cmd}')
 
     # ---------------- 抓取 / 放置宏 ----------------
@@ -1024,6 +1127,40 @@ class MotionPlannerNode(Node):
             else:
                 out.append(cmd)
         return out
+
+    def _macro_place_tray(self, cmd: dict) -> list:
+        """放到载物盘（**执行时**展开；yaw 与 ext 收回同时开始）。
+
+        yaw_deg / lift_deg / extend_deg   最终放置位姿（可写 $b1p1$ 占位符）
+        retract_deg                       转 yaw 期间 ext 先收到哪个角度
+                                          （默认取参数 place_tray_retract_extend_deg）
+
+        1. 一条 gimbal 指令同时下发 yaw/lift 目标和 ext=retract：
+           yaw 开始转的同时 ext 就往回收。ext 行程短、速度上限高（调参 0x16），
+           通常 0.3~0.5s 就收完，而 yaw 要转好几百度要好几十秒/几秒，所以
+           绝大部分转动时间里力臂都是短的 —— 既不像齐动那样一直吊着长臂抖，
+           也不用像"先收完再转"那样多等一个 ext 行程。
+        2. yaw/lift 到位后再把 ext 伸到 extend_deg（这一步不能提前：
+           还没到载物盘上空就伸出去会拖慢 yaw，也可能撞到东西）。
+
+        两条都是阻塞的 gimbal 指令（等三轴 ±tol 到位才走下一段）；第一条是绝对
+        角度，所以从视觉跟随停在任意姿态都能直接跑。
+        """
+        yaw = float(self._resolve_token(cmd.get('yaw_deg', 0.0), 'yaw_deg'))
+        lift = float(self._resolve_token(cmd.get('lift_deg', 0.0), 'lift_deg'))
+        ext = float(self._resolve_token(cmd.get('extend_deg', 0.0), 'extend_deg'))
+        try:
+            retract = float(cmd['retract_deg'])
+        except (KeyError, TypeError, ValueError):
+            retract = float(
+                self.get_parameter('place_tray_retract_extend_deg').value)
+
+        steps = [{'cmd': 'gimbal', 'yaw_deg': yaw, 'lift_deg': lift,
+                  'extend_deg': retract}]
+        if abs(ext - retract) > self.gimbal_tol_deg:
+            steps.append({'cmd': 'gimbal', 'yaw_deg': yaw, 'lift_deg': lift,
+                          'extend_deg': ext})
+        return steps
 
     @staticmethod
     def _macro_pick(cmd: dict, kind: str) -> list:
@@ -1310,6 +1447,8 @@ class MotionPlannerNode(Node):
             self.phase = 'stepping'
             return
         if not data.get('ok', True):
+            self.get_logger().warning(
+                f'color_pick 失败：{data.get("reason", "未知原因")}')
             self._publish_state(
                 f'color_pick 失败：{data.get("reason", "未知原因")}'
                 '——继续执行后续指令')
@@ -1319,6 +1458,12 @@ class MotionPlannerNode(Node):
         # 视觉程序是自己在速度环上动云台的，状态机的目标镜像已经对不上了。
         # 重置成 None，后面 gimbal_yaw/lift/ext 这类相对指令改用实测角重新起算。
         self.gimbal_target = None
+        self.get_logger().info(
+            f'color_pick {data.get("color", "?")} 完成：'
+            f'yaw={data.get("yaw_deg", 0):+.1f}° '
+            f'lift={data.get("lift_deg", 0):+.1f}° '
+            f'ext={data.get("extend_deg", 0):+.1f}° '
+            f'补偿={data.get("ext_offset_deg", 0):+.1f}°')
         self._publish_state(
             f'云台已跟随到物料上方（color_pick，不自动抓取）：'
             f'yaw={data.get("yaw_deg", 0):+.1f}° '
@@ -1361,6 +1506,13 @@ class MotionPlannerNode(Node):
         """启动（或复用）常驻视觉进程。返回 False = 没起来。"""
         if self._vision is not None and self._vision.poll() is None:
             return True
+        if self._vision is not None:
+            # 上一个常驻进程已经死了，把它的临终遗言打出来。
+            # 摄像头被占用时服务端会回 {"ok":false,"reason":"打不开摄像头"}，
+            # 不在这里报出去，用户只会看到后面的 color_pick "莫名跳过"。
+            self._vision_report_last('已退出')
+            self._vision = None
+            self._vision_in = None
 
         program = str(self.get_parameter('vision_program').value or '').strip()
         if not program:
@@ -1396,10 +1548,16 @@ class MotionPlannerNode(Node):
 
     def _vision_stop(self, wait_s: float = 3.0):
         """给常驻视觉进程发 close 并等它退出（关摄像头）。幂等。"""
+        if self._vision is None:
+            return
+        # 关之前把还没来得及读的输出报出来：camera 打不开、预览取帧失败之类
+        # 都在这里面，否则用户只看到 color_pick "莫名其妙跳过"。
+        self._vision_report_last('')
         proc, self._vision = self._vision, None
         stream, self._vision_in = self._vision_in, None
         if proc is None:
             return
+        self._vision_debug = False
         try:
             if stream is not None:
                 stream.write(json.dumps({'cmd': 'close'}) + '\n')
@@ -1456,6 +1614,48 @@ class MotionPlannerNode(Node):
                 continue
             if isinstance(data, dict):
                 return data
+
+    def _vision_drain_last(self):
+        """把常驻视觉进程队列里剩下的行全部取出来，返回最后一条非空输出。
+
+        进程已经退出时用它说明死因（打不开摄像头 / 没有图形界面 …），
+        否则这些行会随着队列被新进程替换而丢掉。
+        """
+        lines = self._vision_lines
+        if lines is None:
+            return None
+        last = None
+        while True:
+            try:
+                line = lines.get_nowait()
+            except queue.Empty:
+                break
+            text = str(line).strip()
+            if text:
+                last = text
+        return last
+
+    def _vision_report_last(self, tag: str):
+        """把视觉进程最后一条输出翻译成 ROS 日志（ok:false 报警告）。"""
+        last = self._vision_drain_last()
+        if not last:
+            return
+        if last.startswith('{'):
+            try:
+                data = json.loads(last)
+            except Exception:  # noqa: BLE001
+                data = None
+            if isinstance(data, dict):
+                if data.get('ok') is False:
+                    self.get_logger().warning(
+                        f'视觉进程{tag}：{data.get("reason", "ok=false")}')
+                    return
+                if data.get('ready'):
+                    self.get_logger().info(f'视觉进程{tag}：摄像头已就绪')
+                    return
+                if data.get('closed'):
+                    return
+        self.get_logger().info(f'视觉进程{tag}：{last}')
 
     def _kill_proc(self):
         """立即结束正在跑的子程序（停止 / 超时 / 任务结束）。"""
@@ -1536,6 +1736,10 @@ class MotionPlannerNode(Node):
 
     def _finish(self):
         self._kill_proc()
+        # 序列结束就把摄像头放掉：常驻进程留着也不会被下一条序列复用
+        # （_start 第一件事就是 _vision_stop），只会一直占着 /dev/video0，
+        # 让下次 open 打不开摄像头。
+        self._vision_stop()
         self.phase = 'idle'
         self._pub_active.publish(Bool(data=False))       # 交还控制权给手柄
         self._publish_state('全部完成')

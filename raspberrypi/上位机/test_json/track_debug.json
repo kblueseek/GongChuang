@@ -1,0 +1,26 @@
+{
+  "commands": [
+    {
+      "cmd": "color_pick",
+      "color": "open"
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": -900.0,
+      "extend_deg": 0.0
+    },
+    {
+      "cmd": "comment",
+      "text": "纯调参：一直跟随颜色 1（红），永远不判对中。去 PID 页拖 kp_yaw / kp_extend 等滑块，1 秒内生效。改 color 换别的颜色。"
+    },
+    {
+      "cmd": "track_debug",
+      "color": "1"
+    },
+    {
+      "cmd": "color_pick",
+      "color": "close"
+    }
+  ]
+}

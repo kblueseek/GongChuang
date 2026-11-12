@@ -1,0 +1,112 @@
+{
+  "commands": [
+    {
+      "cmd": "color_pick",
+      "color": "open"
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": -900.0,
+      "extend_deg": 0.0
+    },
+    {
+      "cmd": "color_pick",
+      "color": "1"
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 580.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 173.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 300
+    },
+    {
+      "cmd": "tray_slot",
+      "number": "1"
+    },
+    {
+      "cmd": "place_tray",
+      "yaw_deg": 650.0,
+      "lift_deg": -980.0,
+      "extend_deg": 248.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 100.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": -100.0
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": -900.0,
+      "extend_deg": 0.0
+    },
+    {
+      "cmd": "tray_slot",
+      "number": "2"
+    },
+    {
+      "cmd": "comment",
+      "text": "黄色物料：对中后 ext 前伸由 track_pid.json 的 ext_offset_deg 自动完成，这里不要再写 gimbal_ext"
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": -900.0,
+      "extend_deg": 0.0
+    },
+    {
+      "cmd": "color_pick",
+      "color": "2"
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 580.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 173.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 300
+    },
+    {
+      "cmd": "place_tray",
+      "yaw_deg": 650.0,
+      "lift_deg": -980.0,
+      "extend_deg": 248.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 100.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": -100.0
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": -900.0,
+      "extend_deg": 0.0
+    }
+  ]
+}

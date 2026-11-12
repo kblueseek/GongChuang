@@ -200,6 +200,11 @@ COMMAND_TYPES = {
                 'open=提前把视觉进程和摄像头点起来（不阻塞，车没到工位时先跑），'
                 'close=关闭进程释放摄像头。连着抓多种颜色时 open 一次能省掉每次三四秒启动。'
     },
+    'track_debug': {
+        'params': 'color',
+        'hint': '纯调参：一直跟随该颜色（1~6），不判“对中完成”；到 PID 页拖滑块，'
+                '1 秒内生效，点■停止结束。可写第 2 个参数覆盖超时秒数（默认 600）'
+    },
     'number_put': {
         'params': 'number',
         'hint': '放到指定编号圆环（1/2/3 从左到右，不识别、按几何解算）。'
@@ -208,6 +213,13 @@ COMMAND_TYPES = {
     'double_put': {
         'params': 'number',
         'hint': '叠放到第一批上方（环上已有物料，层+1）。同 number_put，例：$b2p1$'
+    },
+    'place_tray': {
+        'params': 'yaw_deg,lift_deg,extend_deg[,retract_deg]',
+        'hint': '放到载物盘（阻塞）：yaw/lift 开始转的同时把 ext 收到 '
+                'place_tray_retract_extend_deg（ext 调得快就几百毫秒收完，转动全程'
+                '力臂短、带料不抖），yaw 到位后再伸出 ext。抓完料停在哪都能用。'
+                '例：650,-980,248'
     },
     'tray_slot': {
         'params': 'number',
@@ -274,10 +286,22 @@ def cmd_to_text(cmd: dict) -> str:
         if color == 'close':
             return '关闭视觉进程（释放摄像头）'
         return f"云台跟随物料 颜色={cmd.get('color', '?')}"
+    if name == 'track_debug':
+        text = f"跟踪调试 颜色={cmd.get('color', '?')}（一直跟，■停止）"
+        if 'timeout_s' in cmd:
+            text += f" 最长 {cmd['timeout_s']:.0f}s"
+        return text
     if name == 'number_put':
         return f"放到圆环 {cmd.get('number', '?')}"
     if name == 'double_put':
         return f"叠放到圆环 {cmd.get('number', '?')}"
+    if name == 'place_tray':
+        text = (f"放到载物盘 yaw={cmd.get('yaw_deg', 0)}° "
+                f"lift={cmd.get('lift_deg', 0)}° ext={cmd.get('extend_deg', 0)}°"
+                "（转的同时收 ext，到位后伸出）")
+        if 'retract_deg' in cmd:
+            text += f" 收至 {cmd['retract_deg']}°"
+        return text
     if name == 'tray_slot':
         return f"载物盘转到料位 {cmd.get('number', '?')}"
     return str(cmd)
@@ -348,6 +372,31 @@ def build_cmd(name: str, params_str: str) -> dict:
         # 参数可以是数字，也可以是 $b1c1$ 这类占位符（原样存，不动 motion_planner 执行时替换）
         key = 'color' if name == 'color_pick' else 'number'
         return {'cmd': name, key: parts[0] if parts else ''}
+
+    if name == 'track_debug':
+        # 参数：颜色（1~6 / 占位符），可选第 2 个 = 最长跟随秒数
+        cmd = {'cmd': name, 'color': parts[0] if parts else ''}
+        if len(parts) > 1:
+            try:
+                cmd['timeout_s'] = float(parts[1])
+            except ValueError:
+                pass
+        return cmd
+
+    if name == 'place_tray':
+        # yaw,lift,extend[,retract]；retract 不填就用 vehicle.yaml 的参数。
+        # 允许 $b1p1$ 这类占位符：原样存，motion_planner 展开时再解析。
+        cmd = {'cmd': name}
+        for i, key in enumerate(('yaw_deg', 'lift_deg', 'extend_deg', 'retract_deg')):
+            if i >= len(parts):
+                if key != 'retract_deg':
+                    cmd[key] = 0.0
+                continue
+            try:
+                cmd[key] = float(parts[i])
+            except ValueError:
+                cmd[key] = parts[i]
+        return cmd
 
     if name == 'tray_slot':
         return {'cmd': name, 'number': parts[0] if parts else ''}
@@ -1005,8 +1054,21 @@ class App:
         ttk.Button(btns, text='取消', command=win.destroy).pack(side=tk.LEFT, padx=4)
         win.bind('<Return>', ok)
         win.bind('<Escape>', lambda e: win.destroy())
-        win.grab_set()
-        win.focus_force()
+
+        # Wayland 下 Toplevel 还没 map 出来就 grab_set 会抛
+        # "grab failed: window not viewable"，把整个双击回调带崩。
+        # 等窗口真正显示后再抢焦点；抢不到也不影响编辑，只是不模态。
+        def _grab():
+            try:
+                win.grab_set()
+            except tk.TclError:
+                pass
+
+        win.after(80, _grab)
+        try:
+            win.focus_force()
+        except tk.TclError:
+            pass
 
     def _reload_actions(self, listbox, cmds):
         listbox.delete(0, tk.END)
@@ -1230,7 +1292,8 @@ class App:
         ttk.Label(track_box, foreground='#666', wraplength=310,
                   text='云台"跟物料"的速度环 PID，存在树莓派 '
                        'vision/config/track_pid.json，不走 407 调参通道。'
-                       '拖动即保存，下次执行 color_pick 生效。').pack(anchor='w')
+                       '执行 track_debug 时拖动即生效（1 秒内），别的指令拖完下次生效。'
+                  ).pack(anchor='w')
 
         self._track_applying = True
         for title, keys in TRACK_GROUPS:
@@ -1572,7 +1635,9 @@ class App:
             os.makedirs(os.path.dirname(TRACK_PID_PATH), exist_ok=True)
             with open(TRACK_PID_PATH, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self.track_status.set('已保存到 vision/config/track_pid.json（下次 color_pick 生效）')
+            self.track_status.set(
+                '已保存到 vision/config/track_pid.json'
+                '（track_debug 运行中 1 秒内生效，否则下次 color_pick 生效）')
         except Exception as e:  # noqa: BLE001
             self.track_status.set(f'保存失败：{e}')
 

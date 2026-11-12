@@ -30,6 +30,9 @@ motion_planner:
     # 状态栏只报"视觉程序没有返回 JSON"。
     vision_program: 'python3'
     vision_args: '$HOME/GongChuang/raspberrypi/vision/gimbal_track_pick.py'
+    # color_pick 开始跟随前先等物料静止多久（秒）。转盘转到抓取位会停一下 → 0.3；
+    # 物料一直在动、或者想尽快出第一条云台指令就设 0（检测到就追，会跟着转）。
+    vision_still_time_s: 0.3
     # ---- number_put / double_put 放置位姿（三环独立查表）----
     # 标定方法：车开到位 → calibrate 对位 → 用"夹爪微动+暂停"逐环试放：
     #   每次放到环 N 成功时，读 /gimbal_state（或 PID 页"当前"）的 yaw/lift/extend
@@ -49,9 +52,13 @@ motion_planner:
     # ---- 载物盘三个料位角度（tray_slot 指令用）。实测法：手柄按住 L1 步进转盘到
     #      "能接住物料"的位置，ros2 topic echo /cmd_servo --once 读目标角填入。
     #      0/60/120 是示例分布，必须按你的机构实测 ----
+    # place_tray（放到载物盘）转 yaw 期间 ext 先收到的角度：力臂最短、转动
+    # 惯量最小，带料转大角度不抖。和 yaw 同时开始，靠 ext 速度上限（调参 0x16）
+    # 让它几百毫秒就收完。填机构完全收回的位置；单条指令写 retract_deg 可覆盖。
+    place_tray_retract_extend_deg: -100.0
     tray_slot1_deg: 180.0
-    tray_slot2_deg: 90.0
-    tray_slot3_deg: 0.0
+    tray_slot2_deg: 92.0
+    tray_slot3_deg: 7.0
     # ---- vision_pick/color_pick 抓取位姿兜底与整体偏移（视觉 JSON 缺字段时用；
     #      offset 加在视觉输出上，机械标定修正不用改视觉程序）----
     pick_default_yaw_deg: 0.0

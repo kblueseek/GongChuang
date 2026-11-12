@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import select
 import sys
 import time
 from pathlib import Path
@@ -245,6 +246,28 @@ def _apply_track_config(args, here: Path):
     return args
 
 
+# 调试模式里允许运行中热更新的参数（PID / 限幅 / 死区 / 方向 / 补偿）。
+# 相机几何（cam_rotation / width / height / 畸变映射）不能热改：ctx 已经算好了。
+_LIVE_TUNABLE = (
+    'kp_yaw', 'ki_yaw', 'kd_yaw', 'kp_extend', 'ki_extend', 'kd_extend',
+    'max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau',
+    'yaw_sign', 'ext_sign', 'ext_offset_deg', 'stable', 'still_px',
+)
+
+
+def _reload_live_config(args, here: Path):
+    """调试模式用：只刷新能运行中改的参数，上位机拖滑块 1 秒内生效。"""
+    path = here / 'config' / 'track_pid.json'
+    try:
+        doc = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:  # noqa: BLE001 - 改了一半/文件不存在就沿用上一版
+        return args
+    for key in _LIVE_TUNABLE:
+        if key in doc and hasattr(args, key):
+            setattr(args, key, doc[key])
+    return args
+
+
 def _open_camera(args):
     """打开摄像头并预热（头几帧常是空帧）。打不开返回 None。"""
     import cv2
@@ -255,7 +278,9 @@ def _open_camera(args):
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     camera.set(cv2.CAP_PROP_FPS, args.fps)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+    # 只留 1 帧缓冲：默认排队 4 帧，read() 拿到的可能是 130ms 前的旧画面，
+    # 跟随环等于白白多了一段纯延迟。空闲循环会持续取帧，这里不会读不到。
+    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     for _ in range(10):                      # 预热
         ok, _f = camera.read()
         if ok:
@@ -282,11 +307,17 @@ def _prepare_frame_ctx(args) -> dict:
     }
 
 
-def track_color(camera, node, args, color_doc, ctx, color) -> dict:
+def track_color(camera, node, args, color_doc, ctx, color,
+                debug: bool = False, should_stop=None) -> dict:
     """跟随一种颜色直到对中，返回结果 dict（就是原来 main 里的那套循环）。
 
     每次调用都用全新的 PID / 静止判定状态，所以常驻模式里连续 pick 多种颜色
     互不干扰。调用方负责事先设好 args.color（detect_target 和状态行都用它）。
+
+    debug=True 是"纯调参"模式（track_debug 动作）：
+      · 不等静止、进死区不判成功，一直跟到超时或被停；
+      · 每秒重读 config/track_pid.json，上位机拖 PID 滑块 1 秒内生效；
+      · 每帧调 should_stop()，返回 True 就收工（节点发 close 时用）。
     """
     import cv2
     map1, map2 = ctx['map1'], ctx['map2']
@@ -304,10 +335,12 @@ def track_color(camera, node, args, color_doc, ctx, color) -> dict:
 
     stable = 0
     # wait = 等物料静止（不跟随，不动云台）；track = 静止确认后跟随对中
-    phase = 'track' if args.still_time <= 0.0 else 'wait'
+    phase = 'track' if (debug or args.still_time <= 0.0) else 'wait'
     hist = []                     # (t, cx, cy) 静止判定窗口（wait 阶段积累）
     started = time.monotonic()
     last_t = time.monotonic()     # PID 差分时间戳
+    next_cfg = time.monotonic() + 1.0    # 调试模式：下次重读 track_pid.json 的时刻
+    next_log = time.monotonic() + 1.0    # 调试模式：下次往日志打状态的时刻
     result = {'ok': False, 'reason': 'timeout'}
 
     def _is_still(now):
@@ -325,13 +358,30 @@ def track_color(camera, node, args, color_doc, ctx, color) -> dict:
     try:
         while time.monotonic() - started < args.timeout:
             rclpy.spin_once(node, timeout_sec=0.0)
+            if debug:
+                if should_stop is not None and should_stop():
+                    result = {'ok': True, 'color': args.color,
+                              'debug': True, 'reason': 'stopped'}
+                    break
+                if time.monotonic() >= next_cfg:
+                    # 上位机拖完滑块后 1 秒内生效，不用重跑序列
+                    next_cfg = time.monotonic() + 1.0
+                    _reload_live_config(args, HERE)
+                    pid_yaw.kp, pid_yaw.ki, pid_yaw.kd = (
+                        args.kp_yaw, args.ki_yaw, args.kd_yaw)
+                    pid_yaw.limit = args.max_yaw_deg_s
+                    pid_yaw.deriv_tau = max(0.0, args.deriv_tau)
+                    pid_extend.kp, pid_extend.ki, pid_extend.kd = (
+                        args.kp_extend, args.ki_extend, args.kd_extend)
+                    pid_extend.limit = args.max_extend_deg_s
+                    pid_extend.deriv_tau = max(0.0, args.deriv_tau)
             ok, frame = camera.read()
             if not ok or frame is None:
                 continue
             if map1 is not None:
                 frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-            if ROTATE[args.cam_rotation] is not None:
-                frame = cv2.rotate(frame, ROTATE[args.cam_rotation])
+            if ROTATE is not None:
+                frame = cv2.rotate(frame, ROTATE)
 
             # ROI 在 detect_target 的缩放坐标系里：detect 内部 scale=processing_scale
             target = detect_target(frame, args.color, color_doc, args,
@@ -385,7 +435,7 @@ def track_color(camera, node, args, color_doc, ctx, color) -> dict:
                     status = (f'TRACK ex={ex:+.0f} ey={ey:+.0f} '
                               f'yaw={yaw_vel:+.0f}°/s ext={ext_vel:+.0f}°/s '
                               f'stable={stable}/{args.stable}')
-                    if stable >= args.stable and node._gimbal_ok:
+                    if (not debug) and stable >= args.stable and node._gimbal_ok:
                         result = {'ok': True, 'color': args.color,
                                   'yaw_deg': round(node._gimbal[0], 2),
                                   'lift_deg': round(node._gimbal[1], 2),
@@ -404,6 +454,14 @@ def track_color(camera, node, args, color_doc, ctx, color) -> dict:
             # 既保证 F407 速度环 300ms 超时不会停得一顿一顿，也保证收工瞬间立即停住。
             node.send_gimbal_vel(yaw_vel, 0.0, ext_vel)
 
+            if debug and time.monotonic() >= next_log:
+                # 每秒往 ROS 日志打一行，方便不开窗口也能看出参数有没有生效
+                next_log = time.monotonic() + 1.0
+                print(f'[gimbal_track_pick] DEBUG {status} '
+                      f'kp={args.kp_yaw}/{args.kp_extend} '
+                      f'max={args.max_yaw_deg_s:.0f}/{args.max_extend_deg_s:.0f}',
+                      flush=True)
+
             if not args.headless:
                 cv2.drawMarker(frame, (int(cx_target), int(cy_target)),
                                (255, 255, 255), cv2.MARKER_CROSS, 30, 1)
@@ -411,7 +469,8 @@ def track_color(camera, node, args, color_doc, ctx, color) -> dict:
                 cv2.putText(frame, f'ROI>{args.roi_bottom}', (frame_w - 130, roi_y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 120, 255), 1,
                             cv2.LINE_AA)
-                cv2.putText(frame, status, (16, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                cv2.putText(frame, ('DEBUG ' + status) if debug else status,
+                            (16, 34), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (0, 255, 0) if found else (0, 165, 255), 2,
                             cv2.LINE_AA)
                 if node._gimbal_ok:
@@ -432,20 +491,110 @@ def track_color(camera, node, args, color_doc, ctx, color) -> dict:
     return result
 
 
+def _pump_preview(camera, args, ctx, text: str):
+    """抓一帧贴到预览窗口上（常驻模式用）。
+
+    常驻模式在两次 pick 之间没有 imshow，窗口只是一块灰色，看起来就像
+    "摄像头没启动"。启动时和每次 pick 结束后各贴一帧，open 一执行就能
+    看到实时画面，也顺便证明摄像头真的开了。
+    """
+    if args.headless:
+        return
+    import cv2
+    ok, frame = camera.read()
+    if not ok or frame is None:
+        print('[gimbal_track_pick] 预览取帧失败（摄像头可能被别的程序占用）',
+              flush=True)
+        return
+    if ctx['map1'] is not None:
+        frame = cv2.remap(frame, ctx['map1'], ctx['map2'], cv2.INTER_LINEAR)
+    if ctx['rotate'] is not None:
+        frame = cv2.rotate(frame, ctx['rotate'])
+    cv2.putText(frame, text, (16, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.imshow('gimbal_track_pick', frame)
+    cv2.waitKey(1)
+
+
+def _stdin_ready(timeout_s: float = 0.0) -> bool:
+    """stdin 上有没有一整行可读（非阻塞轮询，空闲时用来刷预览）。"""
+    try:
+        return bool(select.select([sys.stdin], [], [], max(0.0, timeout_s))[0])
+    except (OSError, ValueError):
+        return False
+
+
+def _idle_preview(camera, args, ctx):
+    """两次请求之间一直取帧刷预览，画面就不会"追完就冻住"。
+
+    顺带把摄像头缓冲排空 —— pick 开始时读到的才是当前画面，而不是几百毫秒
+    前压在 V4L2 队列里的旧帧。这里不做畸变矫正（预览不需要精度），省 CPU。
+    """
+    if args.headless:
+        camera.grab()                    # 不看窗口也要排空队列
+        time.sleep(0.03)
+        return
+    import cv2
+    ok, frame = camera.read()
+    if not ok or frame is None:
+        time.sleep(0.01)
+        return
+    if ctx['rotate'] is not None:
+        frame = cv2.rotate(frame, ctx['rotate'])
+    cv2.putText(frame, '等待 color_pick（画面实时）', (16, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.imshow('gimbal_track_pick', frame)
+    cv2.waitKey(1)
+    time.sleep(0.03)                     # 降到 ~15fps，别一直烧满一个核
+
+
 def _run_server(args, camera, node, color_doc, ctx) -> int:
     """常驻模式：摄像头只开这一次，之后按 stdin 请求反复跟随。
 
     协议是一行一个 JSON（stdin 请求，stdout 回复）：
-      请求 {"cmd":"pick","color":1,"timeout_s":30,"still_time":0.3}
+      请求 {"cmd":"pick","color":1,"timeout_s":30,"still_time":0}
+      请求 {"cmd":"debug","color":1,"timeout_s":600}   纯调参：一直跟到 close/超时
       请求 {"cmd":"close"}
       回复 {"ready":true}   —— 摄像头开好、可以 pick 了
            {"ok":true,...} —— 一次 pick 的结果，字段和一次性模式完全一样
 
     这样 motion_planner 里连着写 color_pick 1、color_pick 2 时，摄像头、
     ROS 节点、畸变映射全都不用重新初始化，省掉每次三四秒的启动时间。
+
+    没有请求时也不闲着：持续取帧刷预览 + 排空摄像头缓冲，画面实时，pick
+    第一帧就是新画面（少了历史缓冲的延迟）。
     """
+    # 先贴一帧再报 ready：open 这条指令执行完，预览窗口里就应该有画面了
+    _pump_preview(camera, args, ctx, '预热完成，等待 color_pick')
     print(json.dumps({'ready': True, 'device': args.device}), flush=True)
+
+    stop = {'requested': False}
+
+    def _stop_requested():
+        """调试跟踪每帧调用：stdin 来了 close 就吃掉并返回 True。"""
+        while _stdin_ready(0.0):
+            line = sys.stdin.readline()
+            if not line:                     # EOF：父进程没了
+                stop['requested'] = True
+                return True
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                req = json.loads(text)
+            except ValueError:
+                continue
+            if str(req.get('cmd', '')).lower() in ('close', 'quit', 'exit'):
+                stop['requested'] = True
+                return True
+        return stop['requested']
+
     while True:
+        if not _stdin_ready(0.0):
+            rclpy.spin_once(node, timeout_sec=0.0)   # 保持 /gimbal_state 新鲜
+            _idle_preview(camera, args, ctx)
+            continue
+
         line = sys.stdin.readline()
         if not line:                       # 父进程关管道 / close：正常退出
             break
@@ -462,7 +611,7 @@ def _run_server(args, camera, node, color_doc, ctx) -> int:
         if action in ('close', 'quit', 'exit'):
             print(json.dumps({'ok': True, 'closed': True}), flush=True)
             return 0
-        if action != 'pick':
+        if action not in ('pick', 'debug'):
             print(json.dumps({'ok': False, 'reason': f'未知请求：{action}'},
                              ensure_ascii=False), flush=True)
             continue
@@ -476,7 +625,7 @@ def _run_server(args, camera, node, color_doc, ctx) -> int:
                              ensure_ascii=False), flush=True)
             continue
 
-        # 本次 pick 可以临时覆盖总超时 / 静止判据（序列里按需给）
+        # 本次请求可以临时覆盖总超时 / 静止判据（序列里按需给）
         args.color = color
         old_timeout, old_still = args.timeout, args.still_time
         try:
@@ -487,14 +636,25 @@ def _run_server(args, camera, node, color_doc, ctx) -> int:
             args.still_time = float(request.get('still_time', old_still))
         except (TypeError, ValueError):
             pass
-        print(f'[gimbal_track_pick] pick color={color}', flush=True)
+        debug = action == 'debug'
+        print(f'[gimbal_track_pick] {"debug" if debug else "pick"} color={color}',
+              flush=True)
         try:
-            result = track_color(camera, node, args, color_doc, ctx, color)
+            result = track_color(camera, node, args, color_doc, ctx, color,
+                                 debug=debug, should_stop=_stop_requested)
         except Exception as error:         # noqa: BLE001 - 一次失败不能带走常驻进程
+            # 打印完整堆栈：只有 error 字符串的话，日志里看不出是代码哪一行崩的
+            import traceback
+            traceback.print_exc()
             result = {'ok': False, 'color': color, 'reason': f'跟随异常：{error}'}
         finally:
             args.timeout, args.still_time = old_timeout, old_still
         print(json.dumps(result, ensure_ascii=False), flush=True)
+        if stop['requested']:
+            print(json.dumps({'ok': True, 'closed': True}), flush=True)
+            return 0
+        # 贴一帧"待机"画面（之后空闲循环会继续实时刷新）
+        _pump_preview(camera, args, ctx, '等待下一条 color_pick')
     return 0
 
 

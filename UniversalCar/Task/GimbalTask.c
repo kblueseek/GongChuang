@@ -7,10 +7,12 @@
  *              挤掉——多包广播丢一包就整帧作废（底盘"卡住"），单机帧丢一帧就是
  *              某个轴没反应。全总线只留一个发送者，这两个问题就都不存在。
  *
- *              两种控制源，位置优先：
+ *              两种控制源：
  *                · PI_CMD_GIMBAL_TARGET（角度）→ 位置环 PID → 速度；收到后保持
- *                  GIMBAL_POS_HOLD_MS，期间手柄速度指令让位，过期后速度重新接管。
+ *                  GIMBAL_POS_HOLD_MS，期间速度指令让位，过期后速度重新接管。
  *                · PI_CMD_GIMBAL_VEL（°/s）→ 线性比例，回中/超时 → 0。
+ *                  收到**非零**速度帧立即夺回控制权、作废位置目标：视觉跟随是
+ *                  纯速度环，不能等位置保持那 3s 过期（否则"看到物料却不动"）。
  *
  *              0 点：电机掉电不保存位置。每轴第一次收到反馈时先锁存一个临时 0 点；
  *              人工把三个轴摆到固定位后，树莓派/上位机发 PI_CMD_GIMBAL_ZERO，
@@ -497,6 +499,24 @@ void GimbalTask(void const* argument)
                     GimbalTx.Rpm[i] = 0.0f;
                     PiCommand.GimbalVel[i].Tick = 0;
                     continue;
+                }
+
+                /* 速度指令夺回控制权（只认非零速度）。
+                   视觉跟踪（color_pick / track_debug）是纯速度环：它每秒发 30 帧
+                   /cmd_gimbal_vel。如果还让位置保持压着，最近一条 gimbal 目标会让
+                   这一轴继续按位置环跑满 GIMBAL_POS_HOLD_MS（3s），期间视觉发的速度
+                   全被丢掉——表现就是"画面里明明已经看到物料，云台却停三四秒才动"。
+                   零速不算：视觉收工会补一帧 0，手柄松手每拍也在发 0，这些不能把
+                   后面紧跟的 ext 前伸 / 序列里的 gimbal 目标作废。 */
+                {
+                    uint32_t vt = PiCommand.GimbalVel[i].Tick;
+                    if (vt && (uint32_t)(now - vt) < GIMBAL_VEL_TIMEOUT_MS &&
+                        fabsf(PiCommand.GimbalVel[i].DegPerSec) > 0.5f &&
+                        s_TargetValid[i]) {
+                        s_TargetValid[i] = 0;
+                        s_TargetTick[i]  = 0;
+                        PID_Clear(&s_PosPid[i]);
+                    }
                 }
 
                 /* 位置目标有效期内：位置环接管，手柄速度让位 */
