@@ -21,15 +21,17 @@ motion_planner:
     # 绝对 gimbal 指令默认阻塞等三轴到位再执行下一条（大角度移动要留足时间）。
     # 超时只报警继续；确认要"发了就走"时在该条指令里写 "wait": false。
     gimbal_abs_arrive_timeout_s: 20.0
-    # 状态机推进频率。10Hz 时"到位后最多多等 100ms"，20Hz → 50ms。
-    # 云台位置回传是 20Hz，再往上吃不到新数据，只多占上行位姿帧。
-    tick_hz: 20.0
+    # 状态机推进频率。到位判定只在 tick 里做，所以"到位 → 发下一条"的延迟约等于
+    # 一个 tick（10Hz=100ms / 20Hz=50ms / 50Hz=20ms）。
+    # 50Hz 要和 F407 的云台位置回传同频（RobotConfig.h 的 PI_GIMBAL_RPT_FREQ_HZ
+    # 已改成 50）：比回传更快只会重复看到同一个角度，白占 CPU。
+    tick_hz: 50.0
     # ---- color_pick 的视觉端（云台跟随抓取跟踪器）----
     # 路径支持 $HOME 变量（motion_planner 启动子程序前会展开），
     # 这样仓库放在哪个用户名下都不用改。脚本不存在时 color_pick 会静默失败，
     # 状态栏只报"视觉程序没有返回 JSON"。
     vision_program: 'python3'
-    vision_args: '$HOME/GongChuang/raspberrypi/vision/gimbal_track_pick.py'
+    vision_args: '$HOME/GongChuang/raspberrypi/vision/gimbal_track_pick.py --roi-bottom 1.0'
     # color_pick 开始跟随前先等物料静止多久（秒）。转盘转到抓取位会停一下 → 0.3；
     # 物料一直在动、或者想尽快出第一条云台指令就设 0（检测到就追，会跟着转）。
     vision_still_time_s: 0.3
@@ -55,7 +57,20 @@ motion_planner:
     # place_tray（放到载物盘）转 yaw 期间 ext 先收到的角度：力臂最短、转动
     # 惯量最小，带料转大角度不抖。和 yaw 同时开始，靠 ext 速度上限（调参 0x16）
     # 让它几百毫秒就收完。填机构完全收回的位置；单条指令写 retract_deg 可覆盖。
-    place_tray_retract_extend_deg: -100.0
+    # ⚠ 必须落在当前示教的 ext 限位内（现在下限 75°，F407 还会在离限位 5° 处
+    #   强制停）——填到限位外的角度，云台永远到不了，状态机会白等满
+    #   gimbal_abs_arrive_timeout_s（20s）才往下走。80 = 贴住收回极限。
+    place_tray_retract_extend_deg: 80.0
+    # place_tray 第二段（伸 ext）提前多久开始：yaw 预计还剩这么多秒时就发 ext
+    # 伸出，两者叠起来、差不多同时收工，省掉"转完再干等一个 ext 行程"。
+    # 按秒不按度：yaw 跑满 1180°/s 时 50° 只有 40ms，写死角度等于没提前。
+    # 填 ext 从 retract 走到 extend_deg 大概几秒（略小于它）；0 = 关掉提前放行，
+    # 退回"三轴都到位才伸"。单条指令写 lead_s / lead_deg 可覆盖。
+    # ⚠ 提前放行还要求 lift/ext 已经到位，不会出现 ext 收一半就掉头。
+    place_tray_extend_lead_s: 0.6
+    # 老的角度写法：yaw 进到这么多度内也放行（和 lead_s 任一满足即可）。
+    # 0 = 不用角度条件（默认）。
+    place_tray_extend_lead_deg: 0.0
     tray_slot1_deg: 180.0
     tray_slot2_deg: 92.0
     tray_slot3_deg: 7.0
@@ -87,11 +102,20 @@ ring_fix:
 
 qr_scanner:
   ros__parameters:
-    # 扫码模块：树莓派 UART3（TX=GPIO4 / RX=GPIO5）。
-    # Pi5 需 /boot/firmware/config.txt 加 dtoverlay=uart3-pi5 重启；
-    # USB 转接模块把 device 改成 /dev/ttyUSB0
-    device: '/dev/ttyAMA3'
-    baudrate: 115200
+    # 扫码模块串口。⚠ Pi5 的编号容易搞错，对照表（/boot/firmware/current/overlays/README）：
+    #   dtoverlay=uart2-pi5 → GPIO 4/5  → /dev/ttyAMA2   ← 现在用的是这个
+    #   dtoverlay=uart3-pi5 → GPIO 8/9  → /dev/ttyAMA3   （要另加 overlay 并重启）
+    #   dtoverlay=uart4-pi5 → GPIO 12/13→ /dev/ttyAMA4
+    # GPIO 14/15（/dev/ttyAMA0）是 F407 那条线，不能占用。
+    # ⚠ /dev/ttyAMA2 也留着给 LoRa 下行用（f407_bridge 的 lora_device）：
+    #    现在 downlink=wire 没冲突；以后开 LoRa 时二维码要挪到 ttyAMA3/4。
+    # USB 转接的扫码模块直接改成 /dev/ttyUSB0。
+    device: '/dev/ttyAMA2'
+    # 实测：填 115200 收到的是一串 0x00（把 9600 的数据按 115200 采，起始位
+    # 会被切成一个个零字节），所以先按 9600 试。不确定就跑
+    # python3 scripts/qr_baud_probe.py —— 它会把常见波特率/校验位挨个试一遍，
+    # 直接告诉你哪种能收到可读 ASCII。
+    baudrate: 9600
     # 模块没接时节点每 2s 重试一次，但同样的错误最多每 60s 报一次，不刷屏。
     retry_interval_s: 2.0
     warn_repeat_s: 60.0

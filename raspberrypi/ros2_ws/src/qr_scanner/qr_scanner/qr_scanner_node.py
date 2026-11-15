@@ -28,13 +28,20 @@
 
 ================ 接线 / 参数 ================
 
-默认串口 /dev/ttyAMA3（树莓派 UART3：TX=GPIO4 / RX=GPIO5）。
-Pi5 需要在 /boot/firmware/config.txt 加 dtoverlay=uart3-pi5 后重启才有这个口；
-模块如果是 USB 转的，把 device 参数改成 /dev/ttyUSB0 即可。波特率默认 115200，
-模块若是 9600 就用启动参数覆盖：
+默认串口 /dev/ttyAMA2。⚠ Pi5 的 UART 编号和 GPIO 不是直觉对应，容易接错：
+
+    dtoverlay=uart2-pi5 → GPIO 4/5   → /dev/ttyAMA2   ← 本节点默认
+    dtoverlay=uart3-pi5 → GPIO 8/9   → /dev/ttyAMA3   （config.txt 要另加这行）
+    dtoverlay=uart4-pi5 → GPIO 12/13 → /dev/ttyAMA4
+    GPIO 14/15          → /dev/ttyAMA0（F407 上行/下行，不能占用）
+
+改之前先看 `ls /dev/ttyAMA*`，只有存在的那几个才能用；插着模块但设备不存在
+= overlay 没开，按上表加一行再重启。模块若是 USB 转接，改成 /dev/ttyUSB0。
+
+波特率默认 115200；模块说明书默认 9600 的就覆盖掉：
 
     ros2 run qr_scanner qr_scanner_node --ros-args \
-        -p device:=/dev/ttyAMA3 -p baudrate:=9600
+        -p device:=/dev/ttyAMA2 -p baudrate:=9600
 
 发布话题：
   /task_code          （String）原始任务码，如 "452+321+254+312"
@@ -97,7 +104,7 @@ class QrScannerNode(Node):
     def __init__(self):
         super().__init__('qr_scanner')
 
-        self.declare_parameter('device', '/dev/ttyAMA3')
+        self.declare_parameter('device', '/dev/ttyAMA2')
         self.declare_parameter('baudrate', 115200)
         self.declare_parameter('retry_interval_s', 2.0)
         self.declare_parameter('warn_repeat_s', 60.0)  # 同一错误最短多久再报一次（防刷屏）
@@ -187,7 +194,9 @@ class QrScannerNode(Node):
         except Exception:  # noqa: BLE001
             self._buf.clear()
             return
+        matched = False
         for m in _TASK_CODE_RE.finditer(text):
+            matched = True
             decoded = decode_task_code(m.group(0))
             if decoded is None:
                 self.get_logger().warning(
@@ -203,6 +212,28 @@ class QrScannerNode(Node):
                     f'放{decoded["batch1_places"]} / '
                     f'二批颜色{decoded["batch2_color_names"]} '
                     f'放{decoded["batch2_places"]}')
+        if not matched and text:
+            # 有数据但不是任务码形态：说明串口通了、模块在发东西，只是内容不对。
+            # 排查时这行很关键——完全没有这行才是"线路/没扫到"的问题。
+            # ⚠ 波特率不对时典型表现就是一串 0x00（把 9600 的数据按 115200 采，
+            # 起始位+低电平被切成一个个 0 字节），会刷屏，所以这类纯二进制噪声
+            # 只按时间节流报，不按内容。
+            now = time.monotonic()
+            printable = sum(1 for c in text if 32 <= ord(c) < 127)
+            if printable == 0:
+                msg = (f'收到 {len(text)} 字节二进制/零字节数据（没有可读字符）'
+                       '——通常是波特率不对，先换成 9600 试试')
+                # 波特率不对时这会是持续的噪声流，固定 10s 报一次，别刷屏
+                if now - self._last_warn_t >= 10.0:
+                    self.get_logger().warning(msg)
+                    self._last_warn_t = now
+                    self._last_warn_msg = msg
+            elif (msg := f'收到非任务码数据：{text.strip()[:40]!r}') and (
+                    msg != self._last_warn_msg
+                    or now - self._last_warn_t >= self._warn_repeat_s):
+                self.get_logger().warning(msg)
+                self._last_warn_t = now
+                self._last_warn_msg = msg
         # 抠完候选就清缓冲（任务码短，残留在缓冲里没意义）
         self._buf.clear()
 

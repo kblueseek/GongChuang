@@ -1,0 +1,13 @@
+待办：
+1.color_pick指令仍有改进空间，ryg.json 还能完善，视觉修正存在bug，有时候不会执行修正程序
+2.calibrate 还没调试
+3.number_put比较简单，前提是calibrate要绝对准确
+4.double_put与number_put类似
+5.激光雷达旋转扫描坐标系未实现
+6.激光测距实测线性度较高，后续融合到color_pick 和 number_put中
+7.完整跑图
+
+已完成：
+1.color_pick 初步实现 三物料抓取
+2.扫码模块打通链路
+

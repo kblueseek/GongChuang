@@ -54,7 +54,8 @@ from f407_bridge.pi_comm import (
     parse_gimbal_limit,  # 解析云台限位的函数
 )
 
-# F407 超过这么久没有任何回传，就认为它掉线了（状态 5Hz + 里程计 20Hz，1.5s 足够宽容）
+# F407 超过这么久没有任何回传，就认为它掉线了（状态 5Hz + 里程计/云台各 50Hz，
+# 1.5s 足够宽容：正常应该每 20ms 就有一帧）
 F407_OFFLINE_TIMEOUT_S = 1.5
 
 
@@ -116,10 +117,11 @@ class F407BridgeNode(Node):
         # ================= 定时器 =================
         # 心跳 5Hz：F407 侧 500ms 收不到任何指令就会自主失能，必须比它快。
         self._heartbeat_timer = self.create_timer(0.2, self._on_heartbeat)
-        # 收下行数据 50Hz：F407 侧里程计 50Hz、云台位置 20Hz、状态 5Hz。
-        # 一次 poll 会把串口里积压的字节全读完，50Hz 只是把"到达延迟"压到 20ms 以内，
-        # 不会丢帧；频率再低就会把 50Hz 里程计攒成一串突发帧发出去。
-        self._poll_timer = self.create_timer(0.02, self._on_poll)
+        # 收下行数据 100Hz：F407 侧里程计 50Hz、云台位置 50Hz、状态 5Hz。
+        # 一次 poll 会把串口里积压的字节全读完（不丢帧），轮询频率只决定"帧到了
+        # 多久才被取走"：50Hz 轮询给 50Hz 云台位置平均再加 10ms、最坏 20ms 的延迟，
+        # 100Hz 砍一半。空转时只是一次非阻塞 read，CPU 代价可以忽略。
+        self._poll_timer = self.create_timer(0.01, self._on_poll)
         # 链路状态 2Hz：发布"F407 是否在线 / 上行链路是否连着"，给状态屏和别的节点用。
         self._link_timer = self.create_timer(0.5, self._on_link_status)
 

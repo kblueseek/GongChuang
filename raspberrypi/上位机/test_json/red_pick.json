@@ -1,18 +1,26 @@
 {
   "commands": [
     {
+      "cmd": "color_pick",
+      "color": "open"
+    },
+    {
       "cmd": "gimbal",
       "yaw_deg": 0.0,
-      "lift_deg": -900.0,
-      "extend_deg": 0.0
+      "lift_deg": 800.0,
+      "extend_deg": 200.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
     },
     {
       "cmd": "color_pick",
       "color": "1"
     },
     {
-      "cmd": "gimbal_lift",
-      "delta_deg": 580.0
+      "cmd": "tray_slot",
+      "number": "1"
     },
     {
       "cmd": "gripper",
@@ -20,39 +28,33 @@
     },
     {
       "cmd": "delay",
-      "ms": 500
+      "ms": 250
     },
     {
-      "cmd": "tray_slot",
-      "number": "1"
-    },
-    {
-      "cmd": "gimbal",
-      "yaw_deg": 637.0,
-      "lift_deg": -980.0,
-      "extend_deg": 248.0
+      "cmd": "place_tray",
+      "yaw_deg": 647.0,
+      "lift_deg": 100.0,
+      "extend_deg": 800.0,
+      "retract_deg": 100.0,
+      "lead_deg": 30.0
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": 100.0
+      "delta_deg": 240.0
     },
     {
       "cmd": "gripper",
       "deg": 100.0
     },
     {
-      "cmd": "delay",
-      "ms": 100
-    },
-    {
       "cmd": "gimbal_lift",
-      "delta_deg": -100.0
+      "delta_deg": -240.0
     },
     {
       "cmd": "gimbal",
       "yaw_deg": 0.0,
-      "lift_deg": -900.0,
-      "extend_deg": 0.0
+      "lift_deg": 800.0,
+      "extend_deg": 200.0
     }
   ]
 }

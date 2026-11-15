@@ -38,11 +38,18 @@ void MX_CAN1_Init(void)
   /* USER CODE BEGIN CAN1_Init 1 */
 
   /* USER CODE END CAN1_Init 1 */
+  /* 位时序：APB1 = 42MHz（HCLK 168 / 4）
+       42MHz / 3 / (1 + 11 + 2) = 1 Mbps，采样点 (1+11)/14 = 85.7%
+     原来是 42/7/12 = 500K、采样点 83.3%。
+     ⚠ 7 个 ZDT 电机的 CAN 速率也必须改成 1M（参数码 09），否则一个节点
+       波特率不对就会持续发错误帧，把整条总线拖垮。
+     顺带：800K 在 42MHz 上除不尽（42/(5*800k)=10.5 个 TQ），别试那个档；
+     收发器 VP230 的规格上限就是 1 Mbps，没有余量，线要短、两端 120Ω。 */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 7;
+  hcan1.Init.Prescaler = 3;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_9TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
   hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = ENABLE;

@@ -23,8 +23,15 @@
   --max-yaw-deg-s / --max-extend-deg-s  速度限幅
   --cam-rotation                  摄像头安装旋转角（180=倒装）
   --ext-offset-deg                对中后再前伸多少度（相机→夹爪的机械偏移）。
-                                  只随结果 JSON 回传，由 motion_planner 在 color_pick
-                                  结束后自动执行；摄像头改装后只改这个数即可。
+  --yaw-offset-deg                对中后再转 yaw 多少度（相机装在夹爪侧面的横向
+                                  偏移；主臂在正上方时为 0）。
+                                  两个补偿都只随结果 JSON 回传，由 motion_planner 在
+                                  color_pick 结束后一起执行；摄像头改装后只改这两个数。
+
+平面映射标定（--calib N，独立运行，不走 motion_planner）：
+    python3 vision/gimbal_track_pick.py --calib 100 --color 1
+  固定 HOME 姿态采集"N 组 像素 → 收工 (yaw, ext)"，拟合后写
+  config/plane_mapping.json，供后续"查表直发 gimbal 绝对目标"（不用 PID）使用。
 """
 
 from __future__ import annotations
@@ -33,12 +40,13 @@ import argparse
 import json
 import select
 import sys
+import threading
 import time
 from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))          # 颜色标定 等同目录模块
@@ -125,10 +133,25 @@ class GimbalTrackPick(Node):
         # 上位机序列里的 gimbal 指令走 /cmd_gimbal（位置环），F407 端"位置优先"，
         # 两条通道互不冲突。
         self._pub_vel = self.create_publisher(Float32MultiArray, '/cmd_gimbal_vel', 10)
+        # 位置模式：只有 --calib（平面映射标定）用，让云台回到固定的起始姿态。
+        # 序列里的 gimbal 指令走的也是这条通道，两边语义一致。
+        self._pub_pos = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
         self.create_subscription(Float32MultiArray, '/gimbal_state',
                                  self._cb_gimbal_state, 10)
         self._gimbal = [0.0, 0.0, 0.0]
         self._gimbal_ok = False
+        # 控制权标志：motion_planner 跑序列时用它让手柄让位，--calib 独立运行时
+        # 也必须自己占住，否则手柄节点会以 100Hz 补 [0,0,0]，把跟随速度冲散。
+        self._pub_active = self.create_publisher(Bool, '/motion_active', 10)
+        self._pub_tune = self.create_publisher(Float32MultiArray, '/cmd_tune', 10)
+
+    def publish_active(self, active: bool):
+        self._pub_active.publish(Bool(data=bool(active)))
+
+    def send_tune(self, param_id: int, value: float):
+        """下发一项 F407 调参（[参数号, 值]），和上位机调参页同一条通道。"""
+        self._pub_tune.publish(Float32MultiArray(
+            data=[float(param_id), float(value)]))
 
     def _cb_gimbal_state(self, msg: Float32MultiArray):
         if len(msg.data) >= 3:
@@ -137,6 +160,49 @@ class GimbalTrackPick(Node):
 
     def send_gimbal_vel(self, yaw: float, lift: float, extend: float):
         self._pub_vel.publish(Float32MultiArray(data=[yaw, lift, extend]))
+
+    def send_gimbal_target(self, yaw: float, lift: float, extend: float):
+        """绝对角目标（°/cmd_gimbal）。和上位机序列里的 gimbal 指令同一条通道。"""
+        self._pub_pos.publish(Float32MultiArray(data=[float(yaw), float(lift), float(extend)]))
+
+
+class ControlHold:
+    """10Hz 发 /motion_active=True，让 joy_control 让出云台。
+
+    为什么必须有：joy_control 在天上没人的时候每 10ms 发一帧 [0,0,0] 到
+    /cmd_gimbal_vel 压住云台。标定脚本 20~30Hz 发的跟随速度会被这些 0 帧
+    冲掉，F407 每两帧真正指令之间都收到 0 → 电机走走停停，表现就是
+    "一顿一顿"。motion_planner 跑序列时也是发同样的心跳（10Hz），手柄收到
+    就不发云台速度了；标定独立运行，只能自己发。
+
+    手柄侧有 0.6s 掉线恢复，本进程崩了控制权也会自己还给手柄。
+    """
+
+    def __init__(self, node, period_s: float = 0.1):
+        self._node = node
+        self._period = float(period_s)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name='motion_active_hb')
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._node.publish_active(True)
+            self._stop.wait(self._period)
+
+    def __enter__(self):
+        self._node.publish_active(True)     # 立刻占住，不等第一拍
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._node.publish_active(False)    # 交还手柄
+        return False
+
+
+_DETECT_DIAG: dict = {}
 
 
 def detect_target(bgr, color_id: int, document: dict, args,
@@ -183,10 +249,17 @@ def detect_target(bgr, color_id: int, document: dict, args,
     scale_area = scale * scale
     img_w, img_h = working.shape[1], working.shape[0]
     best = None
+    # 诊断用：记下本轮最大的那个色块（不管有没有通过筛选），没找到目标时
+    # 打日志能直接看出是"太靠上被 ROI 裁了"还是"太小/太远"。
+    _DETECT_DIAG.clear()
     for contour in contours:
         m0 = cv2.moments(contour)
         if abs(m0['m00']) < 1e-6:
             continue
+        _area = float(cv2.contourArea(contour)) / scale_area
+        if _area > _DETECT_DIAG.get('area', 0.0):
+            _DETECT_DIAG['area'] = _area
+            _DETECT_DIAG['cy'] = (m0['m01'] / m0['m00']) / scale
         # ROI：只认质心在画面下部的色块（圆盘大，只够得到最近的物料）。
         # 质心y在缩放坐标里比，和 min_cy（同为缩放坐标）直接比。
         if min_cy is not None and (m0['m01'] / m0['m00']) < min_cy:
@@ -251,7 +324,8 @@ def _apply_track_config(args, here: Path):
 _LIVE_TUNABLE = (
     'kp_yaw', 'ki_yaw', 'kd_yaw', 'kp_extend', 'ki_extend', 'kd_extend',
     'max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau',
-    'yaw_sign', 'ext_sign', 'ext_offset_deg', 'stable', 'still_px',
+    'yaw_sign', 'ext_sign', 'ext_offset_deg', 'yaw_offset_deg', 'stable',
+    'still_px',
 )
 
 
@@ -440,7 +514,11 @@ def track_color(camera, node, args, color_doc, ctx, color,
                                   'yaw_deg': round(node._gimbal[0], 2),
                                   'lift_deg': round(node._gimbal[1], 2),
                                   'extend_deg': round(node._gimbal[2], 2),
-                                  'ext_offset_deg': round(float(args.ext_offset_deg), 2)}
+                                  'ext_offset_deg': round(float(args.ext_offset_deg), 2),
+                                  'yaw_offset_deg': round(float(args.yaw_offset_deg), 2),
+                                  # 收工瞬间的残余像素误差：标定用它判断这一组
+                                  # 是"真的对中"还是"卡在死区边上"。
+                                  'ex_px': round(ex, 2), 'ey_px': round(ey, 2)}
                         print(f'[gimbal_track_pick] 对准收工：{status}', flush=True)
                         break
             else:
@@ -449,6 +527,26 @@ def track_color(camera, node, args, color_doc, ctx, color,
                 pid_yaw.reset()
                 pid_extend.reset()
                 status = f'SEARCH color={args.color}({COLOR_NAMES[args.color]}) area={area:.0f}'
+                # 连续 1 秒没找到就打一行（每秒最多一次）：排查"物料靠画面上方
+                # 就抓不到"这类问题时，能直接看出是没检测到、还是检测到了没跟上。
+                # 质心在 ROI 线以上的色块会被直接丢掉（见 detect_target 的 min_cy）。
+                if time.monotonic() >= next_log:
+                    next_log = time.monotonic() + 1.0
+                    diag = dict(_DETECT_DIAG)
+                    if not diag:
+                        why = '画面里没有这个颜色的色块'
+                    elif diag.get('cy', 0.0) < roi_y:
+                        why = (f'最大色块质心 y={diag["cy"]:.0f} 在 ROI 线 y={roi_y} '
+                               f'上方被裁掉（画面上方 {frame_h - roi_y}px 不认）')
+                    elif diag.get('area', 0.0) < args.min_area:
+                        why = (f'最大色块面积 {diag["area"]:.0f}px < min_area '
+                               f'{args.min_area:.0f}（太远/太小）')
+                    else:
+                        why = (f'最大色块 {diag.get("area", 0):.0f}px2 '
+                               f'y={diag.get("cy", 0):.0f} 被形状筛选排除')
+                    print(f'[gimbal_track_pick] 没检测到目标：{why}；'
+                          f'画面 {frame_w}x{frame_h}，已搜 '
+                          f'{time.monotonic() - started:.1f}s', flush=True)
 
             # 每帧都发速度：跟踪时发 PID 输出，等停/丢目标/死区时发 0，
             # 既保证 F407 速度环 300ms 超时不会停得一顿一顿，也保证收工瞬间立即停住。
@@ -548,6 +646,686 @@ def _idle_preview(camera, args, ctx):
     time.sleep(0.03)                     # 降到 ~15fps，别一直烧满一个核
 
 
+# ---------------- 平面映射标定（--calib）：像素 → 云台角 ----------------
+#
+# 目标：在「云台回到固定起始姿态（HOME）」这个前提下，测出
+#     物料在画面 (u, v)  →  要让夹爪到它上方的 (Δyaw, Δext)
+# 的映射。测出来以后跟踪就不用 PID 了：拍一帧 → 查表 → 一条绝对 gimbal 指令。
+#
+# 每组样本的流程（--calib N 重复 N 次）：
+#   1. 绝对位置指令回 HOME（yaw/lift/ext 三个角，程序启动时读当前姿态当 HOME）；
+#   2. 在 HOME 姿态等物料静止（不是"画面里随便静止"，必须从同一个视角看，
+#      否则同一个像素在不同 ext 下对应完全不同的世界点，映射就不是单值的了）；
+#   3. 记录此刻像素 (u, v)；
+#   4. 用现有 PID 跟随对中，记录收工时的 (yaw, lift, ext) 和残余像素；
+#   5. 再回 HOME 复核一次像素：和 (u, v) 差太多 = 跟随期间物料被挪过，这组作废；
+#   6. 弹窗确认（弹窗期间可以挪物料），点了"是"继续；没桌面环境时退回
+#      "自动盯画面等物料挪走"（像素离开 (u, v) 超过 --calib-move-px）。
+#      物料还停在上一组的点上会提示再挪一次 —— 原地重复采对拟合没用。
+#
+# 全程以 10Hz 发 /motion_active=True 占住云台（motion_planner 跑序列同样的
+# 协议）：不占的话 joy_control 会 100Hz 往 /cmd_gimbal_vel 补 [0,0,0]，
+# 把我们的跟随速度冲散，云台就"一顿一顿"。退出时（含 Ctrl-C）自动交还。
+#
+# 注意：画面上是 6×4 的格子，每格记数字 = 该格采了几组。**覆盖比数量重要**：
+# 100 组全堆在画面中央，拟合出来只在那一个很小区域准。尽量让每格都有样本。
+
+def _read_frame(camera, ctx):
+    """取一帧并做和跟踪器完全一样的预处理（畸变矫正 + 旋转）。"""
+    ok, frame = camera.read()
+    if not ok or frame is None:
+        return None
+    if ctx['map1'] is not None:
+        import cv2
+        frame = cv2.remap(frame, ctx['map1'], ctx['map2'], cv2.INTER_LINEAR)
+    if ctx['rotate'] is not None:
+        import cv2
+        frame = cv2.rotate(frame, ctx['rotate'])
+    return frame
+
+
+def _detect_in_frame(frame, args, color_doc, ctx):
+    """和 track_color 用同一个检测函数、同一个 ROI。"""
+    return detect_target(frame, args.color, color_doc, args,
+                         min_cy=ctx['roi_y'] * args.processing_scale)
+
+
+def _read_gimbal(node, timeout_s: float = 2.0):
+    """等 /gimbal_state 来一帧，返回当前三轴角；超时返回 None。"""
+    t0 = time.monotonic()
+    while not node._gimbal_ok and time.monotonic() - t0 < timeout_s:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    return list(node._gimbal) if node._gimbal_ok else None
+
+
+def _move_home(node, home, tol_deg: float = 1.0, timeout_s: float = 15.0) -> bool:
+    """发绝对位置目标回 HOME，等三轴实测进容差。每 0.5s 重发一次续命。
+
+    容差比原来的 2° 收紧到 1°：每组样本的起始视角必须和拟合用的 HOME 一致，
+    差 2° 在 yaw 上就是图像里 6~7px 的偏差，直接变成样本噪声 —— 34 组数据里
+    yaw 残差 ~3°（≈10px）有一大半是这个来的。
+
+    再紧就没意义了：F407 位置环的速度帧是整数 RPM（最小 1 RPM = 6°/s），
+    P 输出小于 6°/s 就停住，所以 lift（kp 7.5）最后总留 ±0.8°、ext（kp 12）
+    留 ±0.5° 的量化误差。1° 是"能稳定达到"和"再紧就是假精度"之间的值。
+    """
+    t0 = time.monotonic()
+    next_pub = 0.0
+    while time.monotonic() - t0 < timeout_s:
+        now = time.monotonic()
+        if now >= next_pub:
+            node.send_gimbal_target(*home)
+            next_pub = now + 0.5
+        rclpy.spin_once(node, timeout_sec=0.02)
+        if all(abs(a - h) <= tol_deg for a, h in zip(node._gimbal, home)):
+            return True
+    return False
+
+
+def _key_stop(args) -> bool:
+    """预览窗口里按 q / Esc = 提前收工（已采的样本照样保存并拟合）。"""
+    if args.headless:
+        return False
+    import cv2
+    try:
+        key = cv2.waitKey(1) & 0xFF
+    except cv2.error:
+        return False
+    return key in (ord('q'), ord('Q'), 27)
+
+
+def _calib_cell(ctx, u, v, cols, rows):
+    w, h = ctx['frame_w'], ctx['frame_h']
+    c = min(cols - 1, max(0, int(u / w * cols)))
+    r = min(rows - 1, max(0, int(v / h * rows)))
+    return r, c
+
+
+def _draw_calib(frame, args, ctx, cover, done, status, target=None):
+    """预览叠加：采样网格 + 每格计数 + 当前状态（cv2 只认 ASCII，别写中文）。"""
+    import cv2
+    w, h = ctx['frame_w'], ctx['frame_h']
+    cols, rows = args.calib_grid_cols, args.calib_grid_rows
+    for c in range(1, cols):
+        x = int(w * c / cols)
+        cv2.line(frame, (x, 0), (x, h), (70, 70, 70), 1)
+    for r in range(1, rows):
+        y = int(h * r / rows)
+        cv2.line(frame, (0, y), (w, y), (70, 70, 70), 1)
+    for (r, c), n in cover.items():
+        x, y = int(w * c / cols + 10), int(h * r / rows + 30)
+        cv2.putText(frame, str(n), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f'CALIB {done}/{args.calib}  {status}', (16, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, f'yaw={ctx["home"][0]:+.1f} lift={ctx["home"][1]:+.1f} '
+                       f'ext={ctx["home"][2]:+.1f}', (16, 64),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+    if target is not None:
+        cv2.drawContours(frame, [target['contour']], -1, (0, 255, 0), 2)
+        cv2.drawMarker(frame, (int(target['cx']), int(target['cy'])),
+                       (0, 255, 255), cv2.MARKER_CROSS, 26, 2)
+
+
+def _show(args, frame):
+    """只 imshow，不 waitKey —— 按键统一由 _key_stop 读，读两遍会丢按键。"""
+    if args.headless:
+        return
+    import cv2
+    cv2.imshow('gimbal_track_pick', frame)
+
+
+def _show_hint(camera, args, color_doc, ctx, cover, done):
+    """贴一帧带网格计数的画面，用来提示"该挪物料了"。"""
+    frame = _read_frame(camera, ctx)
+    if frame is None:
+        return
+    target = _detect_in_frame(frame, args, color_doc, ctx)
+    _draw_calib(frame, args, ctx, cover, done, 'MOVE MATERIAL', target)
+    _show(args, frame)
+
+
+def _dist(a, b) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def _ask_next_group(done: int, total: int, cols: int = 6, rows: int = 4):
+    """每组结束后弹窗确认，顺便给用户时间把物料挪到新位置。
+
+    返回 True=继续、False=结束采集、None=没有图形界面（调用方退回自动模式）。
+    """
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = getattr(_ask_next_group, '_root', None)
+        if root is None:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            _ask_next_group._root = root
+        return bool(messagebox.askyesno(
+            '云台标定',
+            f'已完成 {done}/{total} 组。\n\n'
+            '请把物料挪到一个新的位置 —— 尽量换到预览窗口里\n'
+            f'还没打勾的格子（{cols}×{rows} 网格上有计数）。\n\n'
+            '挪好、手离开物料后点【是】继续下一组；\n'
+            '点【否】结束采集并拟合保存。\n\n'
+            '（弹窗期间预览画面是停住的，点【是】之后恢复实时）',
+            parent=root))
+    except Exception:  # noqa: BLE001 - 没有 DISPLAY / tkinter 不可用
+        return None
+
+
+def _wait_still_at_home(camera, args, color_doc, ctx, cover, done,
+                        still_s: float, timeout_s: float):
+    """在 HOME 姿态等物料静止，返回 (u, v)；超时/中止返回 None。
+
+    只认画面里的同一个目标（面积最大那块），且要求没贴边 —— 贴边时轮廓被
+    裁掉，质心会偏，这种样本进了拟合就是脏数据。
+    """
+    hist = []
+    last = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        if _key_stop(args):
+            return None
+        t = time.monotonic()
+        frame = _read_frame(camera, ctx)
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        target = _detect_in_frame(frame, args, color_doc, ctx)
+        if target is not None and not target['border']:
+            last = target
+            hist.append((t, target['cx'], target['cy']))
+        else:
+            last = None
+            hist.clear()
+        hist = [p for p in hist if t - p[0] <= still_s]
+        still = False
+        if len(hist) >= 3 and hist[-1][0] - hist[0][0] >= still_s * 0.8:
+            xs = [p[1] for p in hist]
+            ys = [p[2] for p in hist]
+            still = (max(xs) - min(xs) <= args.calib_still_px
+                     and max(ys) - min(ys) <= args.calib_still_px)
+        status = 'STILL' if still else (
+            'NO TARGET' if last is None else 'WAIT STILL')
+        _draw_calib(frame, args, ctx, cover, done, status, last)
+        _show(args, frame)
+        if still:
+            return (last['cx'], last['cy'])
+        time.sleep(0.005)
+    return None
+
+
+def _track_to_center(camera, node, args, color_doc, ctx):
+    """用现有 PID 跟随对中，返回 track_color 的结果（含收工姿态和残余像素）。"""
+    saved = (args.still_time, args.deadband_px, args.stable, args.timeout)
+    # 标定要求比平时准：默认死区 8px 的收工姿态，等价于 ±1° 的采样误差。
+    args.still_time = 0.0                 # 静止判定上面已经做过了
+    args.deadband_px = float(args.calib_deadband_px)
+    args.stable = int(args.calib_stable)
+    args.timeout = float(args.calib_track_timeout_s)
+    try:
+        return track_color(camera, node, args, color_doc, ctx, int(args.color))
+    finally:
+        (args.still_time, args.deadband_px, args.stable, args.timeout) = saved
+
+
+def _wait_material_moved(camera, args, color_doc, ctx, cover, done,
+                         ref_uv, timeout_s: float) -> bool:
+    """等用户把物料挪走（相对 ref_uv 移动超过 --calib-move-px，或目标丢失）。"""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        if _key_stop(args):
+            return False
+        frame = _read_frame(camera, ctx)
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        target = _detect_in_frame(frame, args, color_doc, ctx)
+        if target is None:
+            moved = True
+        else:
+            d = ((target['cx'] - ref_uv[0]) ** 2
+                 + (target['cy'] - ref_uv[1]) ** 2) ** 0.5
+            moved = d > args.calib_move_px
+        _draw_calib(frame, args, ctx, cover, done,
+                    'MOVED' if moved else 'MOVE MATERIAL', target)
+        _show(args, frame)
+        if moved:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _poly_cols(du, dv, degree: int) -> list:
+    """多项式基：1, du, dv[, du², du·dv, dv²][, du³, du²·dv, du·dv²]。
+
+    三次项只给 u 方向（yaw 需要，见 `_fit_plane_mapping` 的说明），v 方向
+    三次项实测只会过拟合，所以不做 dv³。
+    """
+    import numpy as np
+    cols = [np.ones_like(du), du, dv]
+    if degree >= 2:
+        cols += [du * du, du * dv, dv * dv]
+    if degree >= 3:
+        cols += [du ** 3, du * du * dv, du * dv * dv]
+    return cols
+
+
+def _poly_deriv(co, du, dv, degree: int):
+    """基函数对 du / dv 的偏导（归一化坐标，未除以半宽半高）。"""
+    import numpy as np
+    d_du = np.full_like(du, co[1])
+    d_dv = np.full_like(du, co[2])
+    if degree >= 2:
+        d_du = d_du + 2 * co[3] * du + co[4] * dv
+        d_dv = d_dv + co[4] * du + 2 * co[5] * dv
+    if degree >= 3:
+        d_du = d_du + 3 * co[6] * du * du + 2 * co[7] * du * dv + co[8] * dv * dv
+        d_dv = d_dv + co[7] * du * du + 2 * co[8] * du * dv
+    return d_du, d_dv
+
+
+def _axis_degree(fit: dict, axis: str) -> int:
+    """取某一轴的多项式阶数；老文件只有 `degree` 时按它的值。"""
+    key = 'yaw_degree' if axis == 'yaw' else 'ext_degree'
+    return int(fit.get(key, fit.get('degree', 2)))
+
+
+def _lstsq_fit(samples: list, ctx, degree: int = 2, key_y='d_yaw',
+               key_e='d_ext', degree_e: int | None = None) -> dict:
+    """最小二乘拟合 像素 → (Δyaw, Δext)，并把残差换算成像素报告。
+
+    坐标先归一化到 [-1, 1]（u 除以半宽、v 除以半高），否则 u² 项的量级会
+    把矩阵条件数拉爆，linalg 给的解就不可信了。
+
+    yaw 和 ext 可以**分别取阶数**（`degree` / `degree_e`）。实测两轴的最优
+    阶数不一样：yaw 要三次（CV 中位误差 1.9° → 1.0°），ext 三次反而变差
+    （25° → 28°），所以默认 ext 用二次。
+    """
+    import numpy as np
+    w, h = ctx['frame_w'], ctx['frame_h']
+    cx, cy = ctx['cx'], ctx['cy']
+    if degree_e is None:
+        degree_e = degree
+    uv = np.array([[s['u'], s['v']] for s in samples], float)
+    dy = np.array([s[key_y] for s in samples], float)
+    de = np.array([s[key_e] for s in samples], float)
+
+    du = (uv[:, 0] - cx) / (w / 2.0)
+    dv = (uv[:, 1] - cy) / (h / 2.0)
+    mat_y = np.stack(_poly_cols(du, dv, degree), axis=1)
+    mat_e = np.stack(_poly_cols(du, dv, degree_e), axis=1)
+
+    cy_coe, *_ = np.linalg.lstsq(mat_y, dy, rcond=None)
+    ce_coe, *_ = np.linalg.lstsq(mat_e, de, rcond=None)
+    res_y = mat_y @ cy_coe - dy
+    res_e = mat_e @ ce_coe - de
+
+    # 角度残差 → 像素残差：用拟合映射的局部雅可比 J = d(Δ角)/d(像素)
+    dy_u, dy_v = _poly_deriv(cy_coe, du, dv, degree)
+    de_u, de_v = _poly_deriv(ce_coe, du, dv, degree_e)
+    jy_u, jy_v = dy_u / (w / 2.0), dy_v / (h / 2.0)   # 对角/像素
+    je_u, je_v = de_u / (w / 2.0), de_v / (h / 2.0)
+    err_px = []
+    for i in range(len(samples)):
+        a, b, c, d = jy_u[i], jy_v[i], je_u[i], je_v[i]
+        det = a * d - b * c
+        if abs(det) < 1e-12:
+            continue
+        # J⁻¹ · [res_y, res_e]
+        pu = (d * res_y[i] - b * res_e[i]) / det
+        pv = (-c * res_y[i] + a * res_e[i]) / det
+        err_px.append((pu * pu + pv * pv) ** 0.5)
+    err_px.sort()
+    # 中位数比 RMS 更能说明问题：个别点落在雅可比很病态的位置（画面极边缘）
+    # 会把 RMS 拉得很难看，但那些点本来就不该拿来采样。
+    def _pct(q):
+        if not err_px:
+            return None
+        k = min(len(err_px) - 1, max(0, int(round(q * (len(err_px) - 1)))))
+        return round(float(err_px[k]), 2)
+    return {
+        'degree': degree,
+        'ext_degree': degree_e,
+        'yaw_coeff': [round(float(v), 8) for v in cy_coe],
+        'ext_coeff': [round(float(v), 8) for v in ce_coe],
+        'residual_deg': {
+            'yaw_rms': round(float(np.sqrt(np.mean(res_y ** 2))), 3),
+            'ext_rms': round(float(np.sqrt(np.mean(res_e ** 2))), 3),
+            'yaw_max': round(float(np.max(np.abs(res_y))), 3),
+            'ext_max': round(float(np.max(np.abs(res_e))), 3),
+        },
+        'residual_px': {
+            'median': _pct(0.50),
+            'p90': _pct(0.90),
+            'rms': round(float(np.sqrt(np.mean(np.square(err_px)))), 2)
+            if err_px else None,
+            'max': round(float(np.max(err_px)), 2) if err_px else None,
+        },
+        'samples_used': int(len(samples)),
+        'samples_size': int(mat_y.shape[1]),
+        'samples_size_ext': int(mat_e.shape[1]),
+    }
+
+
+def _jacobian_deg_per_px(fit: dict, u: float, v: float, ctx) -> tuple:
+    """拟合映射在 (u, v) 处的局部雅可比：[[∂yaw/∂u, ∂yaw/∂v], [∂ext/∂u, ∂ext/∂v]]。"""
+    w, h = ctx['frame_w'], ctx['frame_h']
+    du = (u - ctx['cx']) / (w / 2.0)
+    dv = (v - ctx['cy']) / (h / 2.0)
+
+    def per_axis(co, deg):
+        d_du, d_dv = _poly_deriv(co, du, dv, deg)
+        return d_du / (w / 2.0), d_dv / (h / 2.0)
+
+    ay, by = per_axis(fit['yaw_coeff'], _axis_degree(fit, 'yaw'))
+    ae, be = per_axis(fit['ext_coeff'], _axis_degree(fit, 'ext'))
+    return ay, by, ae, be
+
+
+def _predict(fit: dict, u: float, v: float, ctx) -> tuple:
+    """按拟合系数算 (Δyaw, Δext)——运行时查表也走这里。"""
+    w, h = ctx['frame_w'], ctx['frame_h']
+    du = (u - ctx['cx']) / (w / 2.0)
+    dv = (v - ctx['cy']) / (h / 2.0)
+    phi_y = _poly_cols(du, dv, _axis_degree(fit, 'yaw'))
+    phi_e = _poly_cols(du, dv, _axis_degree(fit, 'ext'))
+    yaw = sum(c * float(p) for c, p in zip(fit['yaw_coeff'], phi_y))
+    ext = sum(c * float(p) for c, p in zip(fit['ext_coeff'], phi_e))
+    return float(yaw), float(ext)
+
+
+def _fit_plane_mapping(samples: list, ctx, degree: int = 2,
+                       degree_e: int | None = None) -> dict:
+    """拟合 + 用每组记录的残余像素把收工姿态回正，然后再拟合一次。
+
+    为什么要回正：F407 的云台速度帧是**整数 RPM**（1 RPM = 6°/s），yaw 环
+    kp≈1.4 时误差小于 ~4.4px 的指令会被截断成 0 RPM —— 云台只能停在离中心
+    4~5px 的地方，永远进不了 2px 死区（这正是标定一开始一直 timeout 的原因）。
+    所以标定死区按 5px 设，收工姿态天生带 4~5px 偏差；好在偏差就是收工那一帧
+    实测的 (ex, ey)，用拟合出的雅可比反推一下就能把姿态补正。
+
+    补正方向是 **d + J·(ex, ey)**（实测用 34 组数据验证过：加号把 ext 残差从
+    11.9° 降到 10.0°；减号反而升到 14.2°）。直观理解：J = ∂Δ角/∂像素 是
+    "物料在画面里更靠右 → 收工姿态要更大"的**全局**映射，不是"姿态增加→画面
+    往哪走"的局部运动方向，两者差一个负号，所以这里要加。
+
+    阶数：yaw 用三次、ext 用二次。55 组数据上做 6 折交叉验证，yaw 三次把
+    留出点的中位误差从 1.9° 压到 1.0°（p90 6.0°→4.5°），是真实增益；ext
+    加三次反而从 25° 涨到 28°，它的误差是被**收工死区**（±5px × 局部 2°/px）
+    限住的，不是模型不够。样本少于 24 组时三次项欠定，自动退回二次。
+    """
+    if degree >= 3 and len(samples) < 24:
+        degree = 2
+    if degree_e is None:
+        degree_e = 2 if degree >= 2 else degree
+    raw = _lstsq_fit(samples, ctx, degree, degree_e=degree_e)
+    corrected = []
+    for s in samples:
+        ex, ey = s.get('ex_px'), s.get('ey_px')
+        if ex is None or ey is None:
+            return raw                    # 老数据没记残余，不回正
+        ex, ey = float(ex), float(ey)
+        ay, by, ae, be = _jacobian_deg_per_px(raw, s['u'], s['v'], ctx)
+        c = dict(s)
+        # 收工还差 (ex, ey) 像素没走到：按局部雅可比折成角度补回去
+        c['d_yaw_c'] = s['d_yaw'] + (ay * ex + by * ey)
+        c['d_ext_c'] = s['d_ext'] + (ae * ex + be * ey)
+        corrected.append(c)
+    fit = _lstsq_fit(corrected, ctx, degree, key_y='d_yaw_c', key_e='d_ext_c',
+                     degree_e=degree_e)
+    # 离群剔除：手抖、HOME 没停稳、检测偶尔跳一下，都会让个别组差出十几度
+    # （55 组里有 5~6 组 ext 差 30~90°，全是明显采坏的）。多项式项数一多，
+    # 一个坏点能拉走一整片，所以按 3σ 剔三轮。
+    #
+    # 阈值取 max(下限, 3σ)：下限 3°/15° 是**采样本身的精度**（收工死区 ±5px ×
+    # 局部 1.6°/10° 每像素，再加 HOME 重复性 1°）。没有下限的话，模型越准 σ
+    # 越小、阈值跟着收紧，最后把画面边缘那些"只是噪声大"的点也当成坏点扔掉——
+    # 那些点恰恰是运行时最需要映射准的位置。
+    kept_idx = list(range(len(corrected)))
+    lim_y = lim_e = 0.0
+    for _ in range(3):
+        rows = [corrected[i] for i in kept_idx]
+        ry, re = [], []
+        for s in rows:
+            py, pe = _predict(fit, s['u'], s['v'], ctx)
+            ry.append(py - s['d_yaw_c'])
+            re.append(pe - s['d_ext_c'])
+        sy = (sum(v * v for v in ry) / len(ry)) ** 0.5
+        se = (sum(v * v for v in re) / len(re)) ** 0.5
+        lim_y, lim_e = max(3.0, 3.0 * sy), max(15.0, 3.0 * se)
+        new_idx = [i for i, a, b in zip(kept_idx, ry, re)
+                   if abs(a) <= lim_y and abs(b) <= lim_e]
+        if len(new_idx) == len(kept_idx) or len(new_idx) < 0.6 * len(corrected):
+            break
+        kept_idx = new_idx
+        fit = _lstsq_fit([corrected[i] for i in kept_idx], ctx, degree,
+                         key_y='d_yaw_c', key_e='d_ext_c', degree_e=degree_e)
+    dropped = [corrected[i] for i in range(len(corrected)) if i not in kept_idx]
+
+    fit['refine'] = {'applied': True,
+                     'before_residual_deg': raw['residual_deg'],
+                     'before_residual_px': raw['residual_px']}
+    if dropped:
+        fit['trimmed'] = {
+            'dropped': [[round(s['u'], 1), round(s['v'], 1)] for s in dropped],
+            'kept': len(corrected) - len(dropped),
+            'total': len(corrected),
+            'limits_deg': [round(lim_y, 2), round(lim_e, 2)],
+        }
+    return fit
+
+
+def _save_calibration(path: Path, args, ctx, home: list, samples: list,
+                      fit: dict | None, cover: dict):
+    doc = {
+        'format_version': 1,
+        'note': '像素 → 云台角 标定结果。运行时先回 HOME，再按 pixel 查表直接发 '
+                'gimbal 绝对目标；Δ 是相对 HOME 的增量。',
+        'color': int(args.color),
+        'home': {'yaw_deg': round(home[0], 2),
+                 'lift_deg': round(home[1], 2),
+                 'extend_deg': round(home[2], 2)},
+        'image': {'width': int(ctx['frame_w']), 'height': int(ctx['frame_h']),
+                  'cam_rotation': int(args.cam_rotation),
+                  'processing_scale': float(args.processing_scale)},
+        'centering': {'deadband_px': float(args.calib_deadband_px),
+                      'stable': int(args.calib_stable)},
+        'grid': {'cols': int(args.calib_grid_cols),
+                 'rows': int(args.calib_grid_rows),
+                 'cover': {f'{r},{c}': int(n) for (r, c), n in sorted(cover.items())}},
+        'samples': samples,
+        'fit': fit,
+    }
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding='utf-8')
+
+
+def run_calibration(args, camera, node, color_doc, ctx) -> int:
+    """--calib 模式入口：先占住云台控制权（手柄让位），再跑采集主循环。
+
+    不占的话 joy_control 会 100Hz 补零速，把跟随速度冲成"一顿一顿"。
+    """
+    with ControlHold(node):
+        return _calibration_loop(args, camera, node, color_doc, ctx)
+
+
+def _calibration_loop(args, camera, node, color_doc, ctx) -> int:
+    """--calib 模式主循环：采 N 组样本 → 拟合 → 存 config/plane_mapping.json。"""
+    import cv2
+    home = _read_gimbal(node, timeout_s=3.0)
+    if home is None:
+        print('[calib] 收不到 /gimbal_state，云台没上电或 f407_bridge 没跑', flush=True)
+        return 1
+    if args.calib_home_yaw is not None:
+        home[0] = float(args.calib_home_yaw)
+    if args.calib_home_lift is not None:
+        home[1] = float(args.calib_home_lift)
+    if args.calib_home_ext is not None:
+        home[2] = float(args.calib_home_ext)
+    ctx['home'] = home
+
+    out = Path(args.calib_out)
+    print(f'[calib] HOME（检测视角）= yaw {home[0]:+.1f}  lift {home[1]:+.1f}  '
+          f'ext {home[2]:+.1f}', flush=True)
+    print('[calib] 先用这个姿态把相机对准工作区；采样期间不要用手柄碰云台。',
+          flush=True)
+    print('[calib] 已占住云台控制权（/motion_active 心跳 10Hz），手柄不会干扰。',
+          flush=True)
+    print(f'[calib] 物料颜色 {args.color}（{COLOR_NAMES.get(args.color, "?")}），'
+          f'目标 {args.calib} 组，按 q/Esc 提前结束。', flush=True)
+    print(f'[calib] 跟随沿用 track_pid.json：kp_yaw={args.kp_yaw:.2f} '
+          f'kp_extend={args.kp_extend:.2f} '
+          f'max={args.max_yaw_deg_s:.0f}/{args.max_extend_deg_s:.0f}°/s '
+          f'sign={args.yaw_sign:+.0f}/{args.ext_sign:+.0f}；'
+          f'标定死区 {args.calib_deadband_px:.1f}px × {args.calib_stable} 帧',
+          flush=True)
+
+    samples, cover = [], {}
+    last_uv = None
+    attempts = 0
+    max_attempts = max(args.calib * 3, args.calib + 10)
+
+    while len(samples) < args.calib and attempts < max_attempts:
+        attempts += 1
+        if not _move_home(node, home):
+            print(f'[calib] 回 HOME 超时（当前 yaw={node._gimbal[0]:+.1f} '
+                  f'lift={node._gimbal[1]:+.1f} ext={node._gimbal[2]:+.1f}），继续',
+                  flush=True)
+        time.sleep(max(0.0, args.calib_home_hold_s))
+        if _key_stop(args):
+            break
+
+        done = len(samples)
+        print(f'[calib] 第 {done + 1}/{args.calib} 组：请把物料放到画面里并保持静止'
+              '（从 HOME 视角能看到）…', flush=True)
+        uv0 = _wait_still_at_home(camera, args, color_doc, ctx, cover, done,
+                                  args.calib_still_s, args.calib_wait_s)
+        # 物料还停在上一组的采样点：提示用户挪开，别在原地重复采（拟合用不上）
+        while (uv0 is not None and last_uv is not None
+               and _dist(uv0, last_uv) < args.calib_move_px):
+            print('[calib]   物料还停在上一组的采样点，请挪到画面里别的格子…',
+                  flush=True)
+            if not _wait_material_moved(camera, args, color_doc, ctx, cover, done,
+                                        uv0, args.calib_move_timeout_s):
+                uv0 = None
+                break
+            uv0 = _wait_still_at_home(camera, args, color_doc, ctx, cover, done,
+                                      args.calib_still_s, args.calib_wait_s)
+        if uv0 is None:
+            if _key_stop(args):
+                break
+            print('[calib] 等不到静止的物料（或超出等待上限），本组跳过', flush=True)
+            continue
+        print(f'[calib]   像素 ({uv0[0]:.0f}, {uv0[1]:.0f})，开始跟随对中…',
+              flush=True)
+
+        result = _track_to_center(camera, node, args, color_doc, ctx)
+        if not result.get('ok'):
+            print(f'[calib]   跟随失败（{result.get("reason", "?")}），本组作废',
+                  flush=True)
+            continue
+
+        # 复核：回 HOME 再看一眼，像素应该还在原处（物料在跟随期间没被挪动）
+        _move_home(node, home)
+        time.sleep(max(0.0, args.calib_home_hold_s))
+        uv1 = _wait_still_at_home(camera, args, color_doc, ctx, cover, done,
+                                  args.calib_still_s, args.calib_wait_s)
+        if uv1 is None:
+            print('[calib]   复核时看不到物料（超出 HOME 视野？），本组作废',
+                  flush=True)
+            continue
+        drift = ((uv1[0] - uv0[0]) ** 2 + (uv1[1] - uv0[1]) ** 2) ** 0.5
+        if drift > args.calib_verify_px:
+            print(f'[calib]   物料在跟随期间移动了 {drift:.0f}px，本组作废'
+                  '（跟随过程里别碰物料；把它挪个位置继续）', flush=True)
+            _wait_material_moved(camera, args, color_doc, ctx, cover, done,
+                                 uv1, args.calib_move_timeout_s)
+            continue
+
+        pose = [float(result['yaw_deg']), float(result['lift_deg']),
+                float(result['extend_deg'])]
+        s = {
+            'u': round(uv0[0], 2), 'v': round(uv0[1], 2),
+            'd_yaw': round(pose[0] - home[0], 3),
+            'd_ext': round(pose[2] - home[2], 3),
+            'yaw_deg': round(pose[0], 2),
+            'lift_deg': round(pose[1], 2),
+            'extend_deg': round(pose[2], 2),
+            'ex_px': result.get('ex_px'), 'ey_px': result.get('ey_px'),
+        }
+        samples.append(s)
+        cell = _calib_cell(ctx, uv0[0], uv0[1],
+                           args.calib_grid_cols, args.calib_grid_rows)
+        cover[cell] = cover.get(cell, 0) + 1
+        print(f'[calib]   ✓ 第 {len(samples)} 组：像素 ({s["u"]:.0f},{s["v"]:.0f}) '
+              f'→ Δyaw {s["d_yaw"]:+.2f}°  Δext {s["d_ext"]:+.2f}°  '
+              f'（残余 {s["ex_px"]:+.1f},{s["ey_px"]:+.1f}px）'
+              f'  格 R{cell[0] + 1}C{cell[1] + 1}', flush=True)
+        _save_calibration(out, args, ctx, home, samples, None, cover)
+        last_uv = uv0
+
+        if len(samples) >= args.calib:
+            break
+        # 现在人在 HOME 视角、物料就在 uv0：下一组得先把它挪走。
+        # 默认弹窗问一句，顺便告诉用户还剩几组；--calib-no-dialog 时退回
+        # 自动盯画面等物料移动。
+        go_on = None
+        if not args.calib_no_dialog:
+            _show_hint(camera, args, color_doc, ctx, cover, len(samples))
+            go_on = _ask_next_group(len(samples), args.calib,
+                                    args.calib_grid_cols, args.calib_grid_rows)
+        if go_on is False:
+            print('[calib] 用户结束采集，开始拟合保存', flush=True)
+            break
+        if go_on is None:
+            # 没有桌面环境（或 --calib-no-dialog）：自动等物料挪走
+            if not args.calib_no_dialog and not getattr(args, '_dlg_warned', False):
+                args._dlg_warned = True
+                print('[calib] 弹窗用不了（没有 DISPLAY 或 tkinter 不可用），'
+                      '改成自动盯画面等物料挪走', flush=True)
+            if not _wait_material_moved(camera, args, color_doc, ctx, cover,
+                                        len(samples), uv0,
+                                        args.calib_move_timeout_s):
+                if _key_stop(args):
+                    break
+                print('[calib] 物料一直没挪动，结束采集', flush=True)
+                break
+
+    if not samples:
+        print('[calib] 一组都没采到，不写文件', flush=True)
+        return 1
+
+    fit = (_fit_plane_mapping(samples, ctx, degree=3, degree_e=2)
+           if len(samples) >= 6 else None)
+    _save_calibration(out, args, ctx, home, samples, fit, cover)
+    print(f'[calib] 已保存 {len(samples)} 组到 {out}', flush=True)
+    if fit is None:
+        print(f'[calib] 样本太少（{len(samples)} < 6），没拟合，先看 samples。',
+              flush=True)
+        return 0
+    print(f'[calib] 拟合阶数：yaw {fit["degree"]} 次 / ext {fit["ext_degree"]} 次',
+          flush=True)
+    print(f'[calib] 拟合残差：yaw {fit["residual_deg"]["yaw_rms"]:.2f}° '
+          f'(max {fit["residual_deg"]["yaw_max"]:.2f}°)，'
+          f'ext {fit["residual_deg"]["ext_rms"]:.2f}° '
+          f'(max {fit["residual_deg"]["ext_max"]:.2f}°)，'
+          f'≈ {fit["residual_px"]["median"]}px 中位 / '
+          f'{fit["residual_px"]["p90"]}px P90', flush=True)
+    ref = fit.get('refine') or {}
+    if ref.get('applied'):
+        # 每组收工时还差那几像素（死区 + 整数 RPM 截断），用记录下来的残余
+        # 把采样姿态回正后再拟合，这一遍才是"一步到位"的映射
+        print(f'[calib] 已做残余回正拟合：回正前 ≈ '
+              f'{ref["before_residual_px"]["median"]}px 中位 → 现在 '
+              f'{fit["residual_px"]["median"]}px 中位', flush=True)
+    print(f'[calib] 网格覆盖 {len(cover)}/{args.calib_grid_cols * args.calib_grid_rows} 格',
+          flush=True)
+    return 0
+
+
 def _run_server(args, camera, node, color_doc, ctx) -> int:
     """常驻模式：摄像头只开这一次，之后按 stdin 请求反复跟随。
 
@@ -615,6 +1393,11 @@ def _run_server(args, camera, node, color_doc, ctx) -> int:
             print(json.dumps({'ok': False, 'reason': f'未知请求：{action}'},
                              ensure_ascii=False), flush=True)
             continue
+        # 每次请求前重读 track_pid.json 的可热改项：常驻进程只在启动时读一次，
+        # 如果进程是 open 过一直复用的，上位机改完补偿量/PID 不重读就会"改了没
+        # 生效"，看起来像修正动作时有时无。只刷 _LIVE_TUNABLE（不含 cam_rotation
+        # 这类影响畸变映射的几何量，ctx 已经算好了）。
+        _reload_live_config(args, HERE)
         try:
             color = int(request.get('color', 0))
         except (TypeError, ValueError):
@@ -708,6 +1491,9 @@ def main() -> int:
                         help='微分低通时间常数 s，越大越平滑')
     parser.add_argument('--ext-offset-deg', type=float, default=0.0,
                         help='对中后自动前伸补偿 °（相机→夹爪机械偏移，0=不补偿）')
+    parser.add_argument('--yaw-offset-deg', type=float, default=0.0,
+                        help='对中后自动转 yaw 补偿 °（相机装在夹爪侧面时的'
+                             '横向偏移，0=不补偿）')
     parser.add_argument('--yaw-sign', type=float, default=1.0, choices=[1.0, -1.0],
                         help='yaw 速度方向反了改成 -1')
     parser.add_argument('--ext-sign', type=float, default=1.0, choices=[1.0, -1.0],
@@ -728,11 +1514,50 @@ def main() -> int:
                         help='判定"不动"的像素抖动阈值')
 
     parser.add_argument('--headless', action='store_true', help='不开预览窗口（无显示器环境）')
+
+    # —— 平面映射标定（--calib）：像素 → (Δyaw, Δext)，标好之后跟踪不用 PID ——
+    parser.add_argument('--calib', type=int, default=0,
+                        help='标定模式：采 N 组样本后拟合并存 plane_mapping.json（0=不标定）')
+    parser.add_argument('--calib-out', default=str(HERE / 'config' / 'plane_mapping.json'),
+                        help='标定结果输出路径')
+    parser.add_argument('--calib-home-yaw', type=float, default=None,
+                        help='覆盖 HOME 的 yaw（默认=程序启动时云台所在的角）')
+    parser.add_argument('--calib-home-lift', type=float, default=None,
+                        help='覆盖 HOME 的 lift（默认=启动时的角）')
+    parser.add_argument('--calib-home-ext', type=float, default=None,
+                        help='覆盖 HOME 的 ext（默认=启动时的角）')
+    parser.add_argument('--calib-home-hold-s', type=float, default=0.8,
+                        help='回 HOME 到位后再等多久让画面稳定（秒）')
+    parser.add_argument('--calib-still-s', type=float, default=0.6,
+                        help='判定物料静止的窗口（秒）')
+    parser.add_argument('--calib-still-px', type=float, default=4.0,
+                        help='静止窗口内质心抖动上限（像素）')
+    parser.add_argument('--calib-wait-s', type=float, default=120.0,
+                        help='单次等物料静止/出现的上限（秒）')
+    parser.add_argument('--calib-move-px', type=float, default=40.0,
+                        help='物料离开采样点多少像素算"用户挪动了"')
+    parser.add_argument('--calib-move-timeout-s', type=float, default=180.0,
+                        help='等用户挪动物料的上限（秒），超时也继续下一组')
+    parser.add_argument('--calib-verify-px', type=float, default=8.0,
+                        help='回 HOME 复核时像素漂移超过这个值 → 本组作废')
+    parser.add_argument('--calib-deadband-px', type=float, default=5.0,
+                        help='标定时对中的像素死区。别设小于 5：F407 速度是整数 RPM'
+                             '（1 RPM=6°/s），yaw 环 kp≈1.4 时 <4.4px 的误差指令会被'
+                             '截断成 0，云台根本停不进更小的死区（表现为一直 timeout）')
+    parser.add_argument('--calib-stable', type=int, default=6,
+                        help='标定时连续多少帧进死区才收工')
+    parser.add_argument('--calib-track-timeout-s', type=float, default=25.0,
+                        help='单组跟随的超时（秒）')
+    parser.add_argument('--calib-grid-cols', type=int, default=6)
+    parser.add_argument('--calib-grid-rows', type=int, default=4)
+    parser.add_argument('--calib-no-dialog', action='store_true',
+                        help='每组结束不弹确认框（改成等画面里物料被挪走再自动继续）')
+
     args = parser.parse_args()
     args = _apply_track_config(args, HERE)   # 上位机可改 config/track_pid.json 调 PID/方向/旋转
 
-    if args.color is None and not args.server:
-        parser.error('--color 必填（--server 模式下由 stdin 下发）')
+    if args.color is None and not args.server and args.calib <= 0:
+        parser.error('--color 必填（--server 模式下由 stdin 下发，--calib 标定必填）')
 
     import cv2
 
@@ -768,6 +1593,8 @@ def main() -> int:
 
     ctx = _prepare_frame_ctx(args)
     try:
+        if args.calib > 0:
+            return run_calibration(args, camera, node, color_doc, ctx)
         if args.server:
             return _run_server(args, camera, node, color_doc, ctx)
         result = track_color(camera, node, args, color_doc, ctx, int(args.color))

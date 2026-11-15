@@ -8,10 +8,11 @@
 这个节点用一块 I2C 小屏把这些信息实时画出来，同时用板载的 4 个按键完成云台限位的
 示教（把三个轴用手拨到想要的位置，按键记下来）。
 
-  ── 显示（三页，按键 3 / GPIO23 翻页）──
+  ── 显示（四页，按键 3 / GPIO23 翻页）──
     第 1 页 状态：F407/LINK/PAD、X/Y/朝向、整车状态、错误码
     第 2 页 云台：三轴当前位置（相对 0 点，单位 °）
     第 3 页 限位：三轴当前的软限位（来自示教结果）
+    第 4 页 任务码：扫码模块解析出的原始码 + 两批颜色/放置位
 
   ── 开机限位示教（文件顶部 TEACHING_ENABLED 可整体关闭；默认已关）──
     1. 节点先让 F407 把云台三个电机"松轴"（电机控制板失能），并保持整车失能；
@@ -78,7 +79,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Joy
-from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray, String
 
 # luma.oled 是树莓派上常用的 OLED 驱动库。没装也不让它把节点搞崩——只打日志、不显示。
 try:
@@ -118,7 +119,7 @@ _STATE_TEXT = {0: "DISABLED", 1: "READY", 2: "FAULT"}
 
 # 示教顺序：先 Yaw，再 Z 升降，最后 X 伸缩（下标和 F407 的轴编号一致）
 _AXES = (("YAW", 0), ("LIFT", 1), ("EXT", 2))
-_PAGE_COUNT = 3
+_PAGE_COUNT = 4        # 1 状态 / 2 云台 / 3 限位 / 4 任务码
 
 # ==================== 条件编译开关：限位示教功能 ====================
 # False = 取消示教（当前默认）：开机不进入示教流程，示教按键（1 跳过 / 2 重来 /
@@ -235,6 +236,10 @@ class StatusDisplayNode(Node):
         self._limits_report_s = 0.0        # 最近一次收到 /gimbal_limits 的时间
         self._limits_report_valid = [False, False, False]  # 407 侧该轴是否已有有效限位
         self._last_msg = ''                # 屏幕底部临时提示
+        # 任务码（第 4 页）：原始字符串 + 解析结果 + 最近一次更新时间
+        self._task_code = ''
+        self._task_decoded = None
+        self._task_s = 0.0
 
         # ================= 订阅（只读 + 云台位置） =================
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
@@ -247,6 +252,10 @@ class StatusDisplayNode(Node):
         self.create_subscription(Bool, '/motion_active', self._cb_motion_active, 10)
         # 407 当前生效的限位（上位机改过也会从这里同步回来，两边始终是同一套）
         self.create_subscription(Float32MultiArray, '/gimbal_limits', self._cb_limits, 10)
+        # 扫码任务码（第 4 页显示）：qr_scanner 1Hz 重发，晚启动也能拿到
+        self.create_subscription(String, '/task_code', self._cb_task_code, 10)
+        self.create_subscription(String, '/task_code_decoded',
+                                 self._cb_task_decoded, 10)
 
         # ================= 发布（示教用） =================
         self._pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
@@ -580,6 +589,24 @@ class StatusDisplayNode(Node):
             self._limits[axis] = (lo, hi)
             self._save_limits()
 
+    def _cb_task_code(self, msg: String):
+        """扫码模块的原始任务码，如 "452+321+254+312"。第 4 页显示它。"""
+        text = str(msg.data).strip()
+        if text and text != self._task_code:
+            self._task_code = text
+            self._task_s = time.monotonic()
+            self.get_logger().info(f'屏幕：收到任务码 {text}')
+
+    def _cb_task_decoded(self, msg: String):
+        """解析后的任务码 JSON（颜色/放置位数组），第 4 页分两行显示。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(data, dict):
+            self._task_decoded = data
+            self._task_s = time.monotonic()
+
     # ---------------- 绘制 ----------------
 
     def _tick(self):
@@ -603,8 +630,10 @@ class StatusDisplayNode(Node):
             self._draw_status(draw, lh)
         elif self._page == 1:
             self._draw_gimbal(draw, lh)
-        else:
+        elif self._page == 2:
             self._draw_limits(draw, lh)
+        else:
+            self._draw_task(draw, lh)
 
         # 右下角页码
         draw.text((self._width - 26, self._height - lh), f'{self._page + 1}/{_PAGE_COUNT}',
@@ -666,6 +695,42 @@ class StatusDisplayNode(Node):
                   fill='white', font=self._small)
         draw.text((0, 5 * lh), self._last_msg or 'P23 = next page',
                   fill='white', font=self._small)
+
+    def _draw_task(self, draw, lh):
+        """第 4 页：扫码任务码。
+
+        4 组三位数，`颜色颜色颜色+位置位置位置+颜色…+位置…`：
+          第 1 组 第一批颜色顺序（1红 2黄 3蓝 4绿 5黑 6浅蓝）
+          第 2 组 第一批放置圆环（1~3）
+          第 3/4 组 第二批同样两项
+        只显示、只解析，不做任何动作。
+        """
+        draw.text((0, 0), 'TASK CODE', fill='white', font=self._small)
+        if not self._task_code:
+            draw.text((0, lh), 'waiting scanner...', fill='white', font=self._font)
+            draw.text((0, 3 * lh), 'scan a code', fill='white', font=self._small)
+            draw.text((0, 5 * lh), 'P23 = next page', fill='white', font=self._small)
+            return
+
+        draw.text((0, lh), self._task_code, fill='white', font=self._font)
+        data = self._task_decoded or {}
+        b1c = data.get('batch1_colors')
+        b1p = data.get('batch1_places')
+        b2c = data.get('batch2_colors')
+        b2p = data.get('batch2_places')
+        if b1c and b1p:
+            draw.text((0, 2 * lh),
+                      'B1 C' + ''.join(str(c) for c in b1c)
+                      + '  R' + ''.join(str(p) for p in b1p),
+                      fill='white', font=self._small)
+        if b2c and b2p:
+            draw.text((0, 3 * lh),
+                      'B2 C' + ''.join(str(c) for c in b2c)
+                      + '  R' + ''.join(str(p) for p in b2p),
+                      fill='white', font=self._small)
+        age = time.monotonic() - self._task_s
+        draw.text((0, 4 * lh), f'age {age:4.0f}s  ok', fill='white', font=self._small)
+        draw.text((0, 5 * lh), 'P23 = next page', fill='white', font=self._small)
 
     def _draw_setup(self, image):
         draw = ImageDraw.Draw(image)

@@ -79,7 +79,8 @@
   place_tray {"cmd":"place_tray", "yaw_deg":650, "lift_deg":-980, "extend_deg":248}
            放到载物盘：yaw/lift 开始转的同时把 ext 收到 place_tray_retract_extend_deg
            （ext 行程短、可调得快，几百毫秒收完，剩下的转动全程力臂都短 → 带料
-           不抖），yaw 到位后再把 ext 伸出去。两条都是阻塞指令，抓完料停在哪都能跑。
+           不抖）；yaw 预计只剩 place_tray_extend_lead_s 秒时就提前把 ext 伸出去，
+           两者差不多同时收工。抓完料停在哪都能跑。
   pick     {"cmd":"pick", "yaw_deg":0, "lift_deg":-40, "safe_lift_deg":0,
             "extend_deg":150, "gripper_open":120, "gripper_close":35, "settle_ms":800}
            抓取宏：张开夹爪 → 云台到安全位 → 降到抓取位 → 等稳定 → 夹紧 → 抬起。
@@ -152,7 +153,8 @@ class MotionPlannerNode(Node):
         self.declare_parameter('gimbal_keepalive_s', 30.0)
         self.declare_parameter('gimbal_keepalive_tol_deg', 2.0)
         # 状态机推进频率（Hz）。位姿重发、到位判断、指令切换都在这个节拍上。
-        # /gimbal_state 是 20Hz，所以 20 已经吃满；再高只会多占上行（位姿帧）。
+        # 和 F407 的云台位置回传同频即可（RobotConfig.h: PI_GIMBAL_RPT_FREQ_HZ=50），
+        # 比回传更快只会重复看到同一个角度。vehicle.yaml 里设成 50。
         self.declare_parameter('tick_hz', 10.0)
         # 启动时自动加载的序列文件路径（空 = 不加载，等上位机下发）
         self.declare_parameter('sequence_file', '')
@@ -186,6 +188,13 @@ class MotionPlannerNode(Node):
         # place_tray 转 yaw 前先把 ext 收到这个角度（力臂最短、转动惯量最小）。
         # 放在机构完全收回的位置；序列里单条指令写 retract_deg 可覆盖。
         self.declare_parameter('place_tray_retract_extend_deg', 0.0)
+        # yaw 还剩多久开始伸 ext（两条动作叠起来，差不多同时收工）。
+        # 按秒而不是按度：50° 在 1180°/s 的 yaw 上只有 40ms，等于没提前。
+        # 填 ext 从 retract 走到 extend_deg 大概要几秒即可（略小于它就行）。
+        self.declare_parameter('place_tray_extend_lead_s', 0.6)
+        # 兼容老写法：按角度提前多少度放行（和 lead_s 同时存在时任一满足即放行）。
+        # 0 = 不用角度条件。
+        self.declare_parameter('place_tray_extend_lead_deg', 0.0)
         self.declare_parameter('tray_slot1_deg', 0.0)
         self.declare_parameter('tray_slot2_deg', 60.0)
         self.declare_parameter('tray_slot3_deg', 120.0)
@@ -308,6 +317,18 @@ class MotionPlannerNode(Node):
         # 绝对 gimbal 指令等到位：True 时等三轴全部进容差（_gimbal_wait_targets）
         self._gimbal_wait_all = False
         self._gimbal_wait_targets = [0.0, 0.0, 0.0]
+        # True = 这次不是"等它到位"，而是提前放行。
+        # 只有 place_tray 的第一段用：yaw 快到位时提前开始伸 ext，两者同时收工。
+        #   放行条件 = 另两轴已到位 且（yaw 进 lead 度内 或 yaw 剩余时间 ≤ lead_s）
+        self._gimbal_wait_lead = False
+        self._gimbal_wait_lead_s = None     # 秒；None = 不按时间放行
+        # 三轴实测转速（°/s，EMA）。yaw 那个用来把"剩余角度"换成"剩余时间"
+        # ——光按角度算提前量，yaw 跑到 1180°/s 时 50° 只有 40ms，等于没提前；
+        # 另两轴用来判断"是不是已经停了"（目标不可达时 F407 会把速度压 0）。
+        self._gimbal_rates = [0.0, 0.0, 0.0]
+        self._gimbal_rate_prev = None
+        self._gimbal_rate_t = 0.0
+        self._gimbal_wait_t0 = 0.0         # 当前这条 gimbal 指令下发时刻
         self.gimbal_deadline = 0.0
         # 上一次重发 /cmd_gimbal 续命的时间（F407 位置目标只保持 3s，见 _tick）
         self._gimbal_repub_t = 0.0
@@ -335,16 +356,20 @@ class MotionPlannerNode(Node):
         self._vision_deadline = 0.0    # 当前这次 pick 的等待截止
         self._vision_color = None      # 正在等的颜色（只用于提示）
         self._vision_debug = False     # 当前是 track_debug（纯调参）而不是 color_pick
+        # 每条指令的动作探针（见 _probe_start/_probe_sample/_probe_finish）：
+        # 记录该指令耗时、各轴行程和"反向次数"，用于排查某轴来回震荡。
+        self._probe = None
 
         # 若有启动参数指定的序列文件，先加载（不自动开始，等上位机下发 start）
         if sequence_file:
             self._load_file(sequence_file)
 
-        # 执行器推进频率。/gimbal_state 只有 20Hz，所以超过 20Hz 意义不大；
-        # 提频的收益是"到位判断更跟手"（10Hz = 最多多等 100ms）。
+        # 执行器推进频率。/gimbal_state 和 F407 回传同频（50Hz），tick 也设 50Hz：
+        # "到位 → 下一条"的延迟从 20Hz 时的 ±50ms 降到 ±20ms。
         tick_hz = max(1.0, float(self.get_parameter('tick_hz').value))
         self._timer = self.create_timer(1.0 / tick_hz, self._tick)
-        self.get_logger().info('状态机就绪，等待 /motion_load 下发指令序列')
+        self.get_logger().info(
+            f'状态机就绪（tick {tick_hz:.0f}Hz），等待 /motion_load 下发指令序列')
 
     # ---------------- 订阅回调 ----------------
 
@@ -397,6 +422,7 @@ class MotionPlannerNode(Node):
             self._kill_proc()                            # 停止时把视觉/脚本子进程也收掉
             self._vision_stop()                          # 常驻视觉进程（摄像头）一并释放
             self._fix_result = None                      # 挂起的圆环矫正结果一并作废
+            self._probe_finish()                         # 被叫停也结算一下当前指令
             self.phase = 'idle'
             self.index = -1
             self._pub_active.publish(Bool(data=False))   # 交还控制权给手柄
@@ -510,6 +536,7 @@ class MotionPlannerNode(Node):
         self._fix_result = None                     # 挂起的圆环矫正结果一并作废
         self.tx, self.ty, self.tyaw = self.odom   # 从当前真实位置出发
         self.yaw_stable_since = 0.0
+        self._probe = None                          # 上一条序列的探针作废
         self.index = -1
         self.phase = 'stepping'                     # 进入执行循环
         self._pub_active.publish(Bool(data=True))   # 立刻占控制权，别等到第一个 _tick
@@ -518,7 +545,7 @@ class MotionPlannerNode(Node):
     # ---------------- 状态机主循环 ----------------
 
     def _gimbal_arrived(self) -> bool:
-        """三轴实测角是否都进入续命容差（/gimbal_state 20Hz）。"""
+        """三轴实测角是否都进入续命容差（/gimbal_state 50Hz）。"""
         if self.gimbal_target is None:
             return True
         return all(abs(float(a) - float(t)) <= self.gimbal_keepalive_tol_deg
@@ -553,8 +580,100 @@ class MotionPlannerNode(Node):
             self._pub_gimbal.publish(
                 Float32MultiArray(data=list(self.gimbal_target)))
 
+    # ---------------- 每条指令的动作探针（排查"某轴来回震荡"） ----------------
+
+    def _update_gimbal_rate(self):
+        """用 /gimbal_state 采样估三轴转速（EMA，约 60ms 时间常数）。
+
+        "yaw 还要多久转完" = 剩余角度 ÷ 这个转速，place_tray 的提前放行靠它。
+        """
+        now = self._now()
+        prev = self._gimbal_rate_prev
+        if prev is not None:
+            dt = now - self._gimbal_rate_t
+            if dt > 1e-4:
+                for i in range(3):
+                    inst = (self.gimbal_actual[i] - prev[i]) / dt
+                    self._gimbal_rates[i] = (0.35 * inst
+                                             + 0.65 * self._gimbal_rates[i])
+        self._gimbal_rate_prev = list(self.gimbal_actual)
+        self._gimbal_rate_t = now
+
+    def _probe_start(self, cmd: dict):
+        """一条指令开始：先结算上一条，再重新开一张记录。"""
+        self._probe_finish()
+        # 每条指令重新估转速：上一条的旧速度不能拿来算这一条还要转多久
+        self._gimbal_rates = [0.0, 0.0, 0.0]
+        self._gimbal_rate_prev = None
+        self._probe = {
+            'index': self.index,
+            'name': str(cmd.get('cmd', '?')),
+            't0': self._now(),
+            'start': list(self.gimbal_actual),
+            'end': list(self.gimbal_actual),
+            'last': list(self.gimbal_actual),
+            'pivot': list(self.gimbal_actual),
+            'dir': [0, 0, 0],
+            'rev': [0, 0, 0],
+            'lo': list(self.gimbal_actual),
+            'hi': list(self.gimbal_actual),
+        }
+
+    def _probe_sample(self):
+        """每拍采一次三轴实测角：记行程范围 + 数"反向"（超过 2° 的方向翻转）。"""
+        p = self._probe
+        if p is None:
+            return
+        for i in range(3):
+            a = float(self.gimbal_actual[i])
+            p['end'][i] = a
+            if a < p['lo'][i]:
+                p['lo'][i] = a
+            if a > p['hi'][i]:
+                p['hi'][i] = a
+            d = a - p['last'][i]
+            if abs(d) >= 0.3:                 # 0.3° 以下当噪声，不算方向
+                sign = 1 if d > 0 else -1
+                if p['dir'][i] == 0:
+                    p['dir'][i] = sign
+                elif sign != p['dir'][i]:
+                    if abs(a - p['pivot'][i]) >= 2.0:
+                        p['rev'][i] += 1      # 真掉头（走够 2° 才认）
+                        p['pivot'][i] = a
+                        p['dir'][i] = sign
+                else:
+                    p['pivot'][i] = a
+            p['last'][i] = a
+
+    def _probe_finish(self):
+        """一条指令结束：把耗时和"哪个轴动了、动了多远、掉了几次头"打出来。
+
+        反向次数是找震荡用的：正常一条 gimbal 指令每轴最多 1 次反
+        （过冲回一点）；出现 3 次以上就说明有东西在抢这一轴——
+        典型是视觉速度环和位置目标互相打架，或者两段目标接得太近。
+        """
+        p = self._probe
+        self._probe = None
+        if p is None:
+            return
+        took = self._now() - p['t0']
+        parts = []
+        for i, name in enumerate(('yaw', 'lift', 'extend')):
+            span = max(abs(p['end'][i] - p['start'][i]), p['hi'][i] - p['lo'][i])
+            if span < 1.0 and p['rev'][i] == 0:
+                continue
+            parts.append(f'{name} {p["start"][i]:+.0f}→{p["end"][i]:+.0f}'
+                         f'[{p["lo"][i]:+.0f},{p["hi"][i]:+.0f}]'
+                         f'{"" if p["rev"][i] == 0 else f" 反向{p["rev"][i]}次"}')
+        if took >= 0.05 and parts:
+            self.get_logger().info(
+                f'[{p["index"] + 1}/{len(self.commands)}] {p["name"]} '
+                f'用时 {took:.2f}s：' + '，'.join(parts))
+
     def _tick(self):
-        """每 0.1 秒调一次，推进状态机。"""
+        """按 tick_hz 推进状态机（默认 50Hz = 20ms 一拍）。"""
+        self._probe_sample()
+        self._update_gimbal_rate()
         if self.phase != 'idle':
             self._pub_active.publish(Bool(data=True))   # 占用控制权心跳（手柄靠它判断要不要让位）
 
@@ -687,15 +806,62 @@ class MotionPlannerNode(Node):
                 if 0 <= idx < 3:
                     label = ('yaw', 'lift', 'extend')[idx]
                     err = self.gimbal_actual[idx] - self._gimbal_wait_deg
-                    if abs(err) <= self._gimbal_wait_tol:
+                    # lead 放行：yaw 按"还剩多久"判定，但 ext 必须先收住 ——
+                    # 否则第二段把 ext 目标改成 extend_deg 时它还在往 retract 收，
+                    # 会中途掉头（收一半又伸出去，看着像来回震荡）。
+                    # lift 不参与判定：place_tray 两段的 lift 目标相同，不会掉头，
+                    # 等它纯属白等。
+                    others_ok = True
+                    # yaw 真到位了当然也算通过（lead 模式下 _gimbal_wait_tol 可能是
+                    # 0，只按角度判会永远等不到；按时间判又需要 yaw 还在动，
+                    # 已经停住时就永远不满足 → 白等到超时，表现是整个序列卡住）。
+                    yaw_ok = abs(err) <= max(self._gimbal_wait_tol,
+                                             self.gimbal_tol_deg)
+                    if self._gimbal_wait_lead:
+                        elapsed = self._now() - self._gimbal_wait_t0
+                        # ① ext 收住了吗？（到位 / 顶住不动 / 等得太久）
+                        e_ext = abs(self.gimbal_actual[2]
+                                    - self._gimbal_wait_targets[2])
+                        if e_ext > max(self.gimbal_tol_deg, 8.0):
+                            stuck = (elapsed > 0.3
+                                     and abs(self._gimbal_rates[2]) < 20.0)
+                            if not stuck and elapsed <= 1.2:
+                                others_ok = False
+                        # ② yaw 按"还要多久转完"放行：剩余角度 ÷ 实测转速。
+                        #    转速还没建立（刚下发）时不算，避免一上来就放行。
+                        rate = abs(self._gimbal_rates[0])
+                        if (self._gimbal_wait_lead_s is not None
+                                and rate >= 30.0):
+                            if abs(err) / rate <= self._gimbal_wait_lead_s:
+                                yaw_ok = True
+                    if yaw_ok and others_ok:
+                        if self._gimbal_wait_lead:
+                            rate = max(abs(self._gimbal_rates[0]), 1.0)
+                            self._publish_state(
+                                f'云台 {label} 还差 {abs(err):.1f}°'
+                                f'（约 {abs(err) / rate:.2f}s），'
+                                '符合提前量 → 开始伸 ext')
                         self.phase = 'stepping'
                     elif self._now() > self.gimbal_deadline:
-                        self._publish_state(
-                            f'云台 {label} 到位超时：目标 {self._gimbal_wait_deg:+.1f}°'
-                            f'，实测 {self.gimbal_actual[idx]:+.1f}°（差 {err:+.1f}°，'
-                            f'容差 ±{self._gimbal_wait_tol:.1f}°），继续执行后续指令')
-                        self.get_logger().warning(
-                            f'云台 {label} 到位超时（差 {err:+.1f}°）')
+                        if self._gimbal_wait_lead:
+                            # 本来就没打算等到位（等的是"进 lead 度内"），走到
+                            # 超时只说明这段转得比预期慢，直接开始下一段。
+                            why = (f'{label} 差 {err:+.1f}°'
+                                   if abs(err) > self._gimbal_wait_tol
+                                   else '另两轴还没到位')
+                            self._publish_state(
+                                f'云台提前放行超时（{why}），直接继续后续指令')
+                            self.get_logger().warning(
+                                f'云台提前放行超时（{why}）')
+                        else:
+                            self._publish_state(
+                                f'云台 {label} 到位超时：目标 '
+                                f'{self._gimbal_wait_deg:+.1f}°'
+                                f'，实测 {self.gimbal_actual[idx]:+.1f}°'
+                                f'（差 {err:+.1f}°，'
+                                f'容差 ±{self._gimbal_wait_tol:.1f}°），继续执行后续指令')
+                            self.get_logger().warning(
+                                f'云台 {label} 到位超时（差 {err:+.1f}°）')
                         self.phase = 'stepping'
                     else:
                         return
@@ -756,6 +922,7 @@ class MotionPlannerNode(Node):
            - stepping：非阻塞型，继续下一条
         moving 到位后若还要转，会由 _tick 转成 settling → turning。
         """
+        self._probe_start(cmd)      # 顺便把上一条的耗时/行程/反向次数打出来
         # 默认要求位置和朝向都到位；goto 可以显式关掉朝向等待。
         self.wait_yaw = True
         name = cmd.get('cmd')
@@ -823,17 +990,63 @@ class MotionPlannerNode(Node):
                     timeout = float(cmd['timeout_ms']) / 1000.0
                 except (KeyError, TypeError, ValueError):
                     timeout = self.gimbal_abs_timeout_s
-                self._gimbal_wait_all = True
+                # 提前放行（place_tray 用它把"伸 ext"和"转 yaw"叠起来）：
+                #   lead_deg —— yaw 进到这么多度内就放行（老写法，写死角度）；
+                #   lead_s   —— yaw **还剩多少秒**就放行。
+                # 两个任一满足即放行。按秒算是因为 yaw 跑满 1180°/s 时 50° 只有
+                # 40ms，"按角度"的提前量等于没有。
+                # ⚠ 只有指令里**显式写了**才走提前放行（place_tray 宏会自己带上）。
+                #   不能拿 place_tray_extend_lead_s 当默认值兜底 —— 那样序列里每一条
+                #   普通 gimbal（比如回位 (0,800,200)）都会变成"yaw 快到了就走"，
+                #   上一段还没走完就被下一条改目标，ext 就会掉头来回跑。
+                try:
+                    lead = abs(float(cmd['lead_deg']))
+                except (KeyError, TypeError, ValueError):
+                    lead = None
+                if lead is not None and lead <= 0.0:
+                    lead = None        # 0 = 不等提前，退回"三轴到位"
+                try:
+                    lead_s = abs(float(cmd['lead_s']))
+                except (KeyError, TypeError, ValueError):
+                    lead_s = None
+                if lead_s is not None and lead_s <= 0.0:
+                    lead_s = None
                 self._gimbal_wait_targets = list(a.data)
-                self._gimbal_wait_tol = tol
                 self.gimbal_deadline = self._now() + max(0.0, timeout)
-                self._publish_state(
-                    f'[{self.index+1}/{len(self.commands)}] 云台 '
-                    f'yaw={a.data[0]:+.1f}° lift={a.data[1]:+.1f}° '
-                    f'ext={a.data[2]:+.1f}°，等到位（±{tol:.1f}°）')
+                self._gimbal_wait_t0 = self._now()
+                if lead is not None or lead_s is not None:
+                    # 提前放行最多再等 4s：yaw 卡住 / 目标不可达时不要在 20s 的
+                    # 绝对到位超时上干等（那段时间整个序列是停住的）。
+                    self.gimbal_deadline = min(self.gimbal_deadline,
+                                               self._now() + 4.0)
+                    self._gimbal_wait_all = False
+                    self._gimbal_wait_lead = True
+                    self._gimbal_wait_axis = 0
+                    self._gimbal_wait_deg = a.data[0]
+                    self._gimbal_wait_tol = lead if lead is not None else 0.0
+                    self._gimbal_wait_lead_s = lead_s
+                    how = (f'yaw 转到差 {lead:.0f}°' if lead is not None
+                           else f'yaw 预计还剩 {lead_s:.2f}s')
+                    if lead is not None and lead_s is not None:
+                        how += f'（或剩 {lead_s:.2f}s）'
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 云台 '
+                        f'yaw={a.data[0]:+.1f}° lift={a.data[1]:+.1f}° '
+                        f'ext={a.data[2]:+.1f}°，{how}就伸 ext')
+                else:
+                    self._gimbal_wait_all = True
+                    self._gimbal_wait_lead = False
+                    self._gimbal_wait_lead_s = None
+                    self._gimbal_wait_tol = tol
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] 云台 '
+                        f'yaw={a.data[0]:+.1f}° lift={a.data[1]:+.1f}° '
+                        f'ext={a.data[2]:+.1f}°，等到位（±{tol:.1f}°）')
                 self.phase = 'gimbal'
             else:
                 self._gimbal_wait_all = False
+                self._gimbal_wait_lead = False
+                self._gimbal_wait_lead_s = None
                 self._publish_state(
                     f'[{self.index+1}/{len(self.commands)}] 云台 '
                     f'yaw={a.data[0]}° lift={a.data[1]}°')
@@ -871,10 +1084,13 @@ class MotionPlannerNode(Node):
             self._gimbal_keepalive_deadline = self._now() + self.gimbal_keepalive_s
 
             self._gimbal_wait_all = False
+            self._gimbal_wait_lead = False
+            self._gimbal_wait_lead_s = None
             self._gimbal_wait_axis = axis
             self._gimbal_wait_deg = target[axis]
             self._gimbal_wait_tol = tol
             self.gimbal_deadline = self._now() + max(0.0, timeout)
+            self._gimbal_wait_t0 = self._now()
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] 云台 {label} '
                 f'{delta:+.1f}° → {target[axis]:+.1f}°，等到位（±{tol:.1f}°）')
@@ -893,7 +1109,8 @@ class MotionPlannerNode(Node):
             self.commands[self.index + 1:self.index + 1] = steps
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] 放到载物盘：转 '
-                f'yaw={float(steps[-1]["yaw_deg"]):+.0f}°（同时收 ext，到位后再伸出）')
+                f'yaw={float(steps[-1]["yaw_deg"]):+.0f}°（同时收 ext，'
+                f'yaw 快到位时提前伸出）')
         elif name == 'tray_slot':    # 载物盘转到第 N 个料位（角度查 vehicle.yaml）
             try:
                 n = int(self._resolve_token(cmd.get('number'), 'number'))
@@ -1137,14 +1354,21 @@ class MotionPlannerNode(Node):
 
         1. 一条 gimbal 指令同时下发 yaw/lift 目标和 ext=retract：
            yaw 开始转的同时 ext 就往回收。ext 行程短、速度上限高（调参 0x16），
-           通常 0.3~0.5s 就收完，而 yaw 要转好几百度要好几十秒/几秒，所以
-           绝大部分转动时间里力臂都是短的 —— 既不像齐动那样一直吊着长臂抖，
-           也不用像"先收完再转"那样多等一个 ext 行程。
-        2. yaw/lift 到位后再把 ext 伸到 extend_deg（这一步不能提前：
-           还没到载物盘上空就伸出去会拖慢 yaw，也可能撞到东西）。
+           通常 0.3~0.5s 就收完，而 yaw 要转好几百度要好几秒，所以绝大部分
+           转动时间里力臂都是短的 —— 既不像齐动那样一直吊着长臂抖，也不用像
+           "先收完再转"那样多等一个 ext 行程。
+           **不等 yaw 到位**：只剩 place_tray_extend_lead_s 秒就放行。
+        2. 再把 ext 伸到 extend_deg。这一步和 yaw 最后那一小段叠在一起，
+           yaw 到位和 ext 伸到位几乎同时收工 —— 省掉"转完了再干等一个 ext 行程"。
 
-        两条都是阻塞的 gimbal 指令（等三轴 ±tol 到位才走下一段）；第一条是绝对
-        角度，所以从视觉跟随停在任意姿态都能直接跑。
+        提前量按**秒**算（lead_s），不按角度：yaw 跑满 1180°/s 时 50° 只有
+        40ms，写死角度等于没提前。放行条件是"剩余角度 ÷ 实测转速 ≤ lead_s"，
+        lead_s 填 ext 从 retract 到 extend_deg 的耗时（略小一点）即可。
+
+        放行还要求 lift/ext 真的到位 —— 否则第二段把 ext 目标改成 extend_deg
+        时，ext 可能还在往 retract 收，会中途掉头（收一半又伸出去，看着像来回
+        震荡）。第二条等三轴 ±tol 到位；两条都是绝对角度，所以从视觉跟随停在
+        任意姿态都能直接跑。
         """
         yaw = float(self._resolve_token(cmd.get('yaw_deg', 0.0), 'yaw_deg'))
         lift = float(self._resolve_token(cmd.get('lift_deg', 0.0), 'lift_deg'))
@@ -1154,10 +1378,26 @@ class MotionPlannerNode(Node):
         except (KeyError, TypeError, ValueError):
             retract = float(
                 self.get_parameter('place_tray_retract_extend_deg').value)
+        try:
+            lead = abs(float(cmd['lead_deg']))
+        except (KeyError, TypeError, ValueError):
+            lead = abs(float(
+                self.get_parameter('place_tray_extend_lead_deg').value))
+        try:
+            lead_s = abs(float(cmd['lead_s']))
+        except (KeyError, TypeError, ValueError):
+            lead_s = abs(float(
+                self.get_parameter('place_tray_extend_lead_s').value))
 
         steps = [{'cmd': 'gimbal', 'yaw_deg': yaw, 'lift_deg': lift,
                   'extend_deg': retract}]
         if abs(ext - retract) > self.gimbal_tol_deg:
+            # 有第二段才允许提前放行；只有一段时必须等 yaw 真正到位，
+            # 否则序列结束时 yaw 会停在差一截的地方。
+            if lead > 0.0:
+                steps[0]['lead_deg'] = lead
+            if lead_s > 0.0:
+                steps[0]['lead_s'] = lead_s
             steps.append({'cmd': 'gimbal', 'yaw_deg': yaw, 'lift_deg': lift,
                           'extend_deg': ext})
         return steps
@@ -1447,55 +1687,74 @@ class MotionPlannerNode(Node):
             self.phase = 'stepping'
             return
         if not data.get('ok', True):
+            # 只有 ok:true 才带 yaw/ext 角度和补偿量（见 vision 的 track_color），
+            # ok:false 时没有可信的落点，补偿一律不做 —— 所以"追踪完了却没有
+            # 修正动作"第一件事就是看这行：失败（超时/被停/颜色没标定）时本来
+            # 就不会有修正动作。
             self.get_logger().warning(
-                f'color_pick 失败：{data.get("reason", "未知原因")}')
+                f'color_pick 失败：{data.get("reason", "未知原因")}'
+                f'（未执行对中补偿，云台留在原地）')
             self._publish_state(
                 f'color_pick 失败：{data.get("reason", "未知原因")}'
-                '——继续执行后续指令')
+                '——未执行对中补偿，继续执行后续指令')
             self.phase = 'stepping'
             return
 
         # 视觉程序是自己在速度环上动云台的，状态机的目标镜像已经对不上了。
         # 重置成 None，后面 gimbal_yaw/lift/ext 这类相对指令改用实测角重新起算。
         self.gimbal_target = None
+        # 相机装在夹爪后面/侧面，画面里"对中"≠夹爪已经够到物料。
+        # 两个补偿量随摄像头安装位置变化，存在 track_pid.json 的 ext_offset_deg /
+        # yaw_offset_deg，由视觉程序随结果 JSON 回传；这里一起下发，序列里就不用
+        # 再手写 gimbal_ext / gimbal_yaw 补那一下。
+        try:
+            ext_off = float(data.get('ext_offset_deg', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ext_off = 0.0
+        try:
+            yaw_off = float(data.get('yaw_offset_deg', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            yaw_off = 0.0
+        # 这一行是排查"有时候有修正动作、有时候没有"的入口：它和下面
+        # "已下发对中补偿"成对出现才说明补偿真的发出去了。只有这一行没有
+        # 下一行 = 视觉回传的补偿量是 0（track_pid.json 被写回旧值/被恢复默认）。
         self.get_logger().info(
             f'color_pick {data.get("color", "?")} 完成：'
             f'yaw={data.get("yaw_deg", 0):+.1f}° '
             f'lift={data.get("lift_deg", 0):+.1f}° '
             f'ext={data.get("extend_deg", 0):+.1f}° '
-            f'补偿={data.get("ext_offset_deg", 0):+.1f}°')
+            f'补偿 yaw={yaw_off:+.1f}° ext={ext_off:+.1f}°')
         self._publish_state(
             f'云台已跟随到物料上方（color_pick，不自动抓取）：'
             f'yaw={data.get("yaw_deg", 0):+.1f}° '
             f'lift={data.get("lift_deg", 0):+.1f}° '
             f'ext={data.get("extend_deg", 0):+.1f}°')
-        # 相机装在夹爪后面，画面里"对中"≠夹爪已经够到物料。
-        # 这个补偿量随摄像头安装位置变化，存在 track_pid.json 的 ext_offset_deg，
-        # 由视觉程序随结果 JSON 回传；这里自动前伸，序列里就不用再手写一条 gimbal_ext。
-        try:
-            ext_off = float(data.get('ext_offset_deg', 0.0) or 0.0)
-        except (TypeError, ValueError):
-            ext_off = 0.0
-        if abs(ext_off) > 1e-3:
-            target = [float(data.get('yaw_deg', self.gimbal_actual[0])),
+        if abs(ext_off) > 1e-3 or abs(yaw_off) > 1e-3:
+            target = [float(data.get('yaw_deg', self.gimbal_actual[0])) + yaw_off,
                       float(data.get('lift_deg', self.gimbal_actual[1])),
                       float(data.get('extend_deg', self.gimbal_actual[2]))
                       + ext_off]
             a = Float32MultiArray()
             a.data = list(target)
             self._pub_gimbal.publish(a)
+            self.get_logger().info(
+                f'已下发对中补偿 → yaw={target[0]:+.1f}° lift={target[1]:+.1f}° '
+                f'ext={target[2]:+.1f}°（等三轴 ±{self.gimbal_tol_deg:.1f}°）')
             self.gimbal_target = list(target)
             self._gimbal_keepalive_deadline = (
                 self._now() + self.gimbal_keepalive_s)
-            # 只等 ext 轴到位；yaw/lift 的目标就是实测值，不会动。
-            self._gimbal_wait_all = False
-            self._gimbal_wait_axis = 2
-            self._gimbal_wait_deg = target[2]
+            # 三轴一起等：lift 的目标就是实测值不会动，yaw/ext 哪个补了就等哪个。
+            # （只盯 ext 的老写法在开了 yaw 补偿后会提前放行，夹爪还没转到位。）
+            self._gimbal_wait_all = True
+            self._gimbal_wait_lead = False
+            self._gimbal_wait_lead_s = None
+            self._gimbal_wait_targets = list(target)
             self._gimbal_wait_tol = self.gimbal_tol_deg
             self.gimbal_deadline = self._now() + self.gimbal_timeout_s
             self._publish_state(
-                f'对中后自动前伸 ext {ext_off:+.1f}° → '
-                f'{target[2]:+.1f}°，等到位（±{self.gimbal_tol_deg:.1f}°）')
+                f'对中后自动补偿 yaw {yaw_off:+.1f}° / ext {ext_off:+.1f}° → '
+                f'yaw={target[0]:+.1f}° ext={target[2]:+.1f}°，'
+                f'等到位（±{self.gimbal_tol_deg:.1f}°）')
             self.phase = 'gimbal'
             return
         self.phase = 'stepping'
@@ -1735,6 +1994,7 @@ class MotionPlannerNode(Node):
         self._pub_state.publish(s)
 
     def _finish(self):
+        self._probe_finish()        # 最后一条指令的耗时也打出来
         self._kill_proc()
         # 序列结束就把摄像头放掉：常驻进程留着也不会被下一条序列复用
         # （_start 第一件事就是 _vision_stop），只会一直占着 /dev/video0，

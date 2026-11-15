@@ -215,11 +215,13 @@ COMMAND_TYPES = {
         'hint': '叠放到第一批上方（环上已有物料，层+1）。同 number_put，例：$b2p1$'
     },
     'place_tray': {
-        'params': 'yaw_deg,lift_deg,extend_deg[,retract_deg]',
+        'params': 'yaw_deg,lift_deg,extend_deg[,retract_deg[,lead_s]]',
         'hint': '放到载物盘（阻塞）：yaw/lift 开始转的同时把 ext 收到 '
                 'place_tray_retract_extend_deg（ext 调得快就几百毫秒收完，转动全程'
-                '力臂短、带料不抖），yaw 到位后再伸出 ext。抓完料停在哪都能用。'
-                '例：650,-980,248'
+                '力臂短、带料不抖），yaw 预计还剩 lead_s 秒就把 ext 伸出去，两个'
+                '动作叠着跑。按秒不按度：yaw 跑满时 50° 只有 40ms，写死角度等于'
+                '没提前。retract/lead_s 不填就用 vehicle.yaml 的参数（0 = 等 yaw'
+                '完全到位再伸）。抓完料停在哪都能用。例：650,-980,248'
     },
     'tray_slot': {
         'params': 'number',
@@ -298,9 +300,24 @@ def cmd_to_text(cmd: dict) -> str:
     if name == 'place_tray':
         text = (f"放到载物盘 yaw={cmd.get('yaw_deg', 0)}° "
                 f"lift={cmd.get('lift_deg', 0)}° ext={cmd.get('extend_deg', 0)}°"
-                "（转的同时收 ext，到位后伸出）")
+                "（转的同时收 ext，yaw 快到位时伸出）")
         if 'retract_deg' in cmd:
             text += f" 收至 {cmd['retract_deg']}°"
+        if 'lead_s' in cmd:
+            try:
+                lead_s = float(cmd['lead_s'])
+            except (TypeError, ValueError):
+                text += f" 提前 {cmd['lead_s']}s"
+            else:
+                text += (' 不提前伸出' if lead_s == 0
+                         else f" yaw 剩 {lead_s:g}s 时伸")
+        elif 'lead_deg' in cmd:
+            try:
+                lead = float(cmd['lead_deg'])
+            except (TypeError, ValueError):
+                text += f" 提前 {cmd['lead_deg']}°"
+            else:
+                text += (' 不提前伸出' if lead == 0 else f" 提前 {lead:g}°")
         return text
     if name == 'tray_slot':
         return f"载物盘转到料位 {cmd.get('number', '?')}"
@@ -384,12 +401,15 @@ def build_cmd(name: str, params_str: str) -> dict:
         return cmd
 
     if name == 'place_tray':
-        # yaw,lift,extend[,retract]；retract 不填就用 vehicle.yaml 的参数。
+        # yaw,lift,extend[,retract[,lead_s]]；retract / lead_s 不填就用
+        # vehicle.yaml 的参数（lead_s=0 表示等 yaw 完全到位再伸 ext）。
         # 允许 $b1p1$ 这类占位符：原样存，motion_planner 展开时再解析。
         cmd = {'cmd': name}
-        for i, key in enumerate(('yaw_deg', 'lift_deg', 'extend_deg', 'retract_deg')):
+        optional = ('retract_deg', 'lead_s')
+        for i, key in enumerate(('yaw_deg', 'lift_deg', 'extend_deg',
+                                 'retract_deg', 'lead_s')):
             if i >= len(parts):
-                if key != 'retract_deg':
+                if key not in optional:
                     cmd[key] = 0.0
                 continue
             try:
@@ -475,6 +495,9 @@ TRACK_PARAMS = [
     # 这段是纯机械偏移，随摄像头安装位置变——改装后只改这一项，序列里
     # 不用再写 gimbal_ext。视觉程序随结果 JSON 回传，color_pick 结束时自动执行。
     ('ext_offset_deg',   '对中后前伸补偿 °',       -500.0, 500.0, 1.0, 0.0, False),
+    # 相机装在夹爪侧面时，画面"对中"之后夹爪还在物料旁边，要再转一点 yaw。
+    # 同样是纯机械偏移，和 ext_offset_deg 一起在 color_pick 结束时下发。
+    ('yaw_offset_deg',   '对中后 yaw 补偿 °',      -60.0,  60.0, 1.0, 0.0, False),
     ('deadband_px',      '死区 (px)',              0.0, 100.0, 1.0, 10.0, False),
     ('deriv_tau',        '微分低通 τ (s)',         0.0,  0.5, 0.01, 0.05, False),
     ('cam_rotation',     '摄像头旋转 °',           0,   270, 90,  180, True),
@@ -486,7 +509,7 @@ TRACK_GROUPS = [
     ('跟踪 yaw 环', ('kp_yaw', 'ki_yaw', 'kd_yaw')),
     ('跟踪 extend 环', ('kp_extend', 'ki_extend', 'kd_extend')),
     ('跟踪限幅 / 死区', ('max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau')),
-    ('抓取补偿（相机→夹爪）', ('ext_offset_deg',)),
+    ('抓取补偿（相机→夹爪）', ('yaw_offset_deg', 'ext_offset_deg')),
     ('摄像头 / 方向', ('cam_rotation', 'yaw_sign', 'ext_sign')),
 ]
 
@@ -741,6 +764,11 @@ class App:
         self.track_scales = {}
         self._track_after = None
         self._track_applying = False
+        # 用户这次真正拖过的滑块。保存时只写这些键 —— 否则界面上这份（启动时
+        # 读的快照）会把运行中手改的 track_pid.json 全部覆盖回去：改完
+        # ext_offset_deg 再动一下 kp 滑块，补偿量就被悄悄写回启动时的旧值，
+        # 表现就是"这次 color_pick 有修正动作、下次又没了"。
+        self._track_dirty = set()
         self.track_status = tk.StringVar(value='')
 
         # ---------- 舵机角度（夹爪/载物盘，上位机直接 /cmd_servo） ----------
@@ -1603,6 +1631,7 @@ class App:
         self.track_tune[key] = fv
         if getattr(self, '_track_applying', False):
             return
+        self._track_dirty.add(key)
         if self._track_after is not None:
             try:
                 self.root.after_cancel(self._track_after)
@@ -1622,7 +1651,12 @@ class App:
             pass
 
     def _save_track_profile(self):
-        """把跟踪参数写回 JSON；保留文件里可能有的其它键。"""
+        """把**这次拖过的**跟踪参数写回 JSON；文件里其它键原样保留。
+
+        只写 dirty 键而不是整个 track_tune：界面上那份是启动时的快照，全量回写会
+        把运行中手改/其它程序改的 track_pid.json 覆盖回去（补偿量突然变回 0 就是
+        这么来的）。
+        """
         self._track_after = None
         data = {}
         try:
@@ -1630,7 +1664,11 @@ class App:
                 data = json.load(f)
         except Exception:  # noqa: BLE001
             data = {}
-        data.update(self.track_tune)
+        if not self._track_dirty:
+            return
+        data.update({key: self.track_tune[key]
+                     for key in self._track_dirty if key in self.track_tune})
+        self._track_dirty.clear()
         try:
             os.makedirs(os.path.dirname(TRACK_PID_PATH), exist_ok=True)
             with open(TRACK_PID_PATH, 'w', encoding='utf-8') as f:
@@ -1653,6 +1691,8 @@ class App:
                     var.set(f'{default:g}')
         finally:
             self._track_applying = False
+        # 恢复默认是有意全量覆盖（包括两个补偿量归 0），标成全 dirty 再存。
+        self._track_dirty.update(self.track_tune)
         self._save_track_profile()
 
     # ---------- 舵机角度（夹爪 / 载物盘） ----------
