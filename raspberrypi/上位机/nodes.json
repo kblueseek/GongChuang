@@ -6,7 +6,8 @@
       "actions": [
         {
           "cmd": "spin_scan",
-          "deg": 90.0
+          "deg": 90.0,
+          "speed_dps": 45.0
         }
       ]
     },

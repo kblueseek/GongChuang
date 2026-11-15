@@ -235,10 +235,11 @@ COMMAND_TYPES = {
     },
     'spin_scan': {
         'params': 'deg[,speed_dps]',
+        'speed': True,          # 编辑器里额外给一个「转速」输入框
         'hint': '旋转扫描：原地慢速转 deg 度（正=逆时针/左转，负=顺时针/右转），'
                 '边转边让雷达攒点云，转完自动停、地图冻结。'
-                '角速度默认 spin_scan_speed_dps=30°/s，第 2 个参数可单独覆盖'
-                '（≤45，再快远处点云会拖成扇形）。'
+                '转速填右边的框；留空 = vehicle.yaml 的 spin_scan_speed_dps（30°/s）。'
+                '建议 15~45：越快越省时间，但 3m 外点云会拖成扇形（60°/s 时约 65mm）。'
                 '⚠ 车体两侧被挡住只能看车头一个扇区时用它补盲：'
                 '从启停区1 看全场张角约 118°，30°/s×3s=90° 就够。'
                 '⚠ 车必须先 enable，且原地转的外接圆要留够（300mm 车体 ≈ 212mm）'
@@ -966,8 +967,14 @@ class App:
         hint = ttk.Label(parent, text='', foreground='gray', wraplength=width * 7)
 
         def on_type(name):
+            cmd_type.set(name)          # 程序里直接调 on_type 时也保证类型同步
             hint.config(text=f"参数：{COMMAND_TYPES[name]['params']}  —  "
                              f"{COMMAND_TYPES[name]['hint']}")
+            # 转速只对 spin_scan 有意义：插在 hint（参数提示）之前，别挤到按钮行下面
+            if COMMAND_TYPES[name].get('speed'):
+                spinrow.pack(fill=tk.X, pady=1, before=hint)
+            else:
+                spinrow.pack_forget()
 
         cmd_type = tk.StringVar(value='move')
         menu = ttk.OptionMenu(addrow, cmd_type, 'move', *COMMAND_TYPES.keys(),
@@ -976,6 +983,16 @@ class App:
         menu.pack(side=tk.LEFT)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         hint.pack(anchor='w')
+
+        # 转速行（选 spin_scan 时才出现）：留空就交给 planner 用默认值，
+        # 填了就写进指令的 speed_dps，跟着这条动作走、导出 JSON 也带着。
+        spinrow = ttk.Frame(parent)
+        ttk.Label(spinrow, text='转速 °/s').pack(side=tk.LEFT)
+        spin_entry = ttk.Entry(spinrow, width=7)
+        spin_entry.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(spinrow, foreground='gray',
+                  text='留空 = 默认 30｜建议 15~45').pack(side=tk.LEFT)
+
         on_type('move')
 
         def add():
@@ -984,6 +1001,22 @@ class App:
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror('参数错误', f'参数解析失败：{e}')
                 return
+            # spin_scan 的转速框：填了就写进 speed_dps（覆盖参数里的第 2 个值）
+            if cmd.get('cmd') == 'spin_scan':
+                txt = spin_entry.get().strip()
+                if txt:
+                    try:
+                        sp = float(txt)
+                    except ValueError:
+                        messagebox.showerror('参数错误', f'转速要填数字：{txt!r}')
+                        return
+                    if not (5.0 <= sp <= 90.0):
+                        messagebox.showerror(
+                            '参数错误',
+                            f'转速 {sp:g} 超出范围（planner 限制 5~90，'
+                            f'建议 15~45；再快远处点云会拖成扇形）')
+                        return
+                    cmd['speed_dps'] = sp
             cmds = get_cmds()
             cmds.append(cmd)
             listbox.insert(tk.END, cmd_to_text(cmd))
@@ -1084,7 +1117,9 @@ class App:
         ttk.Button(editrow, text='清空', command=clear).pack(side=tk.LEFT, padx=2)
         ttk.Label(editrow, text='双击动作可改参数', foreground='gray').pack(
             side=tk.RIGHT, padx=4)
-        return {'type': cmd_type, 'entry': entry, 'hint': hint}
+        return {'type': cmd_type, 'entry': entry, 'hint': hint,
+                'spin_entry': spin_entry, 'spin_row': spinrow,
+                'on_type': on_type, 'add': add}
 
     # ---------- 双击编辑单条动作 ----------
 
@@ -1123,9 +1158,12 @@ class App:
 
         entries = {}
         r = 1
-        for key, val in cmd.items():
-            if key == 'cmd':
-                continue
+        items = [(k, v) for k, v in cmd.items() if k != 'cmd']
+        # spin_scan 没填过转速时也给它留一行：留空 = 用 planner 的默认值，
+        # 填数字就写进 speed_dps（否则这条动作永远调不了速）。
+        if name == 'spin_scan' and not any(k == 'speed_dps' for k, _ in items):
+            items.append(('speed_dps', None))
+        for key, val in items:
             ttk.Label(win, text=key).grid(row=r, column=0, sticky='e',
                                           padx=(8, 4), pady=2)
             var = tk.StringVar(value=self._val_to_str(val))
@@ -1136,6 +1174,12 @@ class App:
                 e.focus_set()
                 e.select_range(0, tk.END)
             r += 1
+        if name == 'spin_scan':
+            ttk.Label(win, foreground='gray', justify='left',
+                      text='speed_dps 留空 = 用 vehicle.yaml 的 spin_scan_speed_dps'
+                           '（30°/s），建议 15~45').grid(
+                row=r, column=0, columnspan=2, sticky='w', padx=8)
+            r += 1
         if not entries:
             ttk.Label(win, text='（这条动作没有参数）').grid(
                 row=r, column=0, columnspan=2, pady=8)
@@ -1145,7 +1189,16 @@ class App:
             new = {'cmd': name}
             try:
                 for key, (var, old) in entries.items():
-                    new[key] = self._coerce_val(var.get(), old)
+                    txt = var.get().strip()
+                    if old is None and txt == '':
+                        continue        # 留空 = 不加这个字段，交给默认值
+                    new[key] = (float(txt) if old is None
+                                else self._coerce_val(var.get(), old))
+                if 'speed_dps' in new:
+                    sp = float(new['speed_dps'])
+                    if not (5.0 <= sp <= 90.0):
+                        raise ValueError(f'转速 {sp:g} 超出 5~90（建议 15~45）')
+                    new['speed_dps'] = sp
             except Exception as error:  # noqa: BLE001
                 messagebox.showerror('参数错误', f'{error}', parent=win)
                 return

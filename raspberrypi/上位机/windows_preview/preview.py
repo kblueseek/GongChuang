@@ -68,6 +68,7 @@ class PreviewSim:
         self.hold_yaw = 0.0         # 行进段锁住的车头朝向（出发时的 yaw）
         self.sub = 'move'           # move / settle / turn：先走到位，再原地转
         self.sub_until = 0.0        # settle 的结束时刻
+        self.turn_rate_dps = MAX_W_DEG   # 原地转的角速度（spin_scan 会按指令覆盖）
         self.gimbal = [0.0, 0.0, 0.0]
         self.gimbal_tgt = [0.0, 0.0, 0.0]
         self.gripper = 120.0
@@ -219,6 +220,15 @@ class PreviewSim:
                 # 先走到位、再转向：行进段锁住出发朝向，到点停稳后才原地转。
                 self.hold_yaw = self.yaw
                 self.sub = 'move'
+                # 原地转的角速度：普通动作按 MAX_W_DEG 演示；spin_scan 按指令
+                # 给的 speed_dps 走，这样预览里也看得出 15°/s 和 60°/s 的差别。
+                self.turn_rate_dps = MAX_W_DEG
+                if name == 'spin_scan':
+                    try:
+                        self.turn_rate_dps = min(
+                            max(abs(float(cmd.get('speed_dps') or 30.0)), 5.0), 90.0)
+                    except (TypeError, ValueError):
+                        self.turn_rate_dps = 30.0
                 self._set_state('moving')
                 # spin_scan：和 motion_planner 一样广播 start/done，
                 # 这样预览里上位机也会跟着攒点云（不然看不出"边转边扫"）。
@@ -297,8 +307,8 @@ class PreviewSim:
             return (self.x, self.y,
                     self.yaw + math.radians(float(cmd.get('deg', 0) or 0)))
         if name == 'spin_scan':
-            # 位置不变，只转 deg°（正=逆时针）。预览不模拟 30°/s 的慢速，
-            # 用 MAX_W_DEG 转过去就行；真机上慢是因为要让点云不拖尾。
+            # 位置不变，只转 deg°（正=逆时针）。转速由 speed_dps 决定
+            # （没给就按 planner 的默认 30°/s），在 _exec 里存进 turn_rate_dps。
             return (self.x, self.y,
                     self.yaw + math.radians(float(cmd.get('deg', 90.0) or 90.0)))
         return (self.x, self.y, self.yaw)
@@ -335,7 +345,7 @@ class PreviewSim:
         if abs(dyaw) <= EPS_DEG:
             self.yaw = tyaw
             return True
-        wstep = MAX_W_DEG * dt
+        wstep = self.turn_rate_dps * dt
         self.yaw += math.radians(max(-wstep, min(wstep, dyaw)))
         self.yaw = math.radians(wrap_deg(math.degrees(self.yaw)))
         return False
