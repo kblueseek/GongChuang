@@ -3488,6 +3488,24 @@ class App:
                          + (f'；不通：{"；".join(bad)}' if bad else ''))
         self._redraw()
 
+    def _node0_spin_deg(self):
+        """节点 1 的动作里 spin_scan 的累计角度（度）。
+
+        发车到格子中心后先执行节点 1 的动作，如果里面有 spin_scan，车头就转过
+        一个角度了；第一段路径必须按"转完之后"的朝向算，否则规划会多补一次转身。
+        """
+        if not self.nodes:
+            return 0.0
+        total = 0.0
+        for act in (self.nodes[0].get('actions') or []):
+            if act.get('cmd') != 'spin_scan':
+                continue
+            try:
+                total += float(act.get('deg', 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
     def _append_node_actions(self, cmds, index):
         """把第 index 个节点（0 起）到点后要执行的动作整段拼进指令列表。"""
         if not (0 <= index < len(self.nodes)):
@@ -3582,33 +3600,39 @@ class App:
                         and math.hypot(cur[0] - start_pt[0],
                                        cur[1] - start_pt[1]) <= 150.0)
 
-        self._append_node_actions(cmds, 0)
         if car_at_start:
             gname = self.field.cell_name(*gateway)
             # 发车：横移+直行到格子中心（不转向）
             cmds += self._strafe_move_pair(
                 gateway[0] - cur[0], gateway[1] - cur[1], cur_f[2],
                 f'发车：横移到 {gname} 中心')
+            # 节点 1 的动作放在"发车到格子中心"之后：开局那句 spin_scan 要的是
+            # "先走到 E 中线、再原地转"，放在发车之前就会在启停区角上转（会顶墙）。
+            self._append_node_actions(cmds, 0)
+            # 节点动作里的 spin_scan 会把车头转走，第一段必须按"转完的朝向"算。
+            # 不改的话 DP 还是从出发朝向起算，到 E5 会补一个多余的转身。
+            start_yaw = wrap_deg(cur_f[2] + self._node0_spin_deg())
             # 第一段从格子中心重新规划（绕开外圈矩形线）
             leg0 = self.mission_legs[0]
             res = mapping.plan_path(
                 self.grid, self.mask, self.obstacles,
                 self.grid.w2c(*gateway), self.grid.w2c(*leg0['to_xy']),
                 self.field.robot_radius, cell_block=self._cell_block(),
-                cost_fn=self._cost_fn(), entry_heading_deg=cur_f[2])
+                cost_fn=self._cost_fn(), entry_heading_deg=start_yaw)
             if res['path']:
                 cmds += self._path_commands(
                     res['path_world'],
                     f'1. {leg0["from_name"]} → {leg0["to_name"]}',
-                    start_yaw_deg=cur_f[2],
+                    start_yaw_deg=start_yaw,
                     fixed_yaw_deg=leg0.get('final_yaw'))
             else:
                 cmds += self._path_commands(
                     leg0['path'], f'1. {leg0["from_name"]} → {leg0["to_name"]}',
-                    start_yaw_deg=cur_f[2],
+                    start_yaw_deg=start_yaw,
                     fixed_yaw_deg=leg0.get('final_yaw'))
             begin_i = 1
         else:
+            self._append_node_actions(cmds, 0)
             # 车不在启停区：保持原逻辑（先规划到起点，再按原计划走）
             if math.hypot(cur[0] - start_pt[0], cur[1] - start_pt[1]) > 150.0:
                 res = mapping.plan_path(
