@@ -117,6 +117,7 @@ import time        # 超时判断
 import rclpy
 from rclpy.node import Node
 from car_interfaces.msg import Pose2D               # 平面位姿：x, y, theta(弧度)，自定义消息
+from geometry_msgs.msg import Twist                # 底盘速度（旋转扫描用：恒速转）
 from nav_msgs.msg import Odometry                  # 里程计消息
 from std_msgs.msg import Bool, Float32MultiArray, String
 
@@ -167,6 +168,18 @@ class MotionPlannerNode(Node):
         # 物料一直在动、或者想尽快出第一条云台指令 → 设 0（检测到就追）。
         self.declare_parameter('vision_still_time_s', 0.3)
         self.declare_parameter('script_timeout_s', 60.0)
+        # ---- 旋转扫描（spin_scan 指令）----
+        # 角速度：慢转才能把点云扫准。D6 是 10Hz，30°/s 时一帧内车已转过 3°，
+        # 3m 处横向错 ~157mm；60°/s 翻倍。想快就用指令里的第 2 个参数单独覆盖。
+        self.declare_parameter('spin_scan_speed_dps', 30.0)
+        # 到位容差（度）：转够 目标±容差 就停。F407 那边航向环会继续把车按住，
+        # 停得比发 0 速度那一刻准。
+        self.declare_parameter('spin_scan_tol_deg', 1.5)
+        # 提前量（度）：F407 的航向目标是"把 Wz 积分出来的"，它比实测 yaw 超前
+        # 一个跟踪滞后 ω/heading_kp（当前调参 head_kp=2.4：45°/s 时约 19°）。
+        # 等实测到 90° 再停，内部目标已经跑到 109°，车会继续转到 109°。
+        # 所以提前这么多度就切到 /cmd_pose 的绝对角度目标，让车滑到 90° 停住。
+        self.declare_parameter('spin_scan_stop_lead_deg', 15.0)
         # 圆环视觉矫正（calibrate 指令）最多等多久：要覆盖摄像头打开、识别
         # 稳定、小步对位的全部时间，给足余量。
         self.declare_parameter('calibrate_timeout_s', 60.0)
@@ -233,6 +246,22 @@ class MotionPlannerNode(Node):
         sequence_file = str(self.get_parameter('sequence_file').value)
         self.default_script_timeout = float(self.get_parameter('script_timeout_s').value)
         self.calibrate_timeout_s = float(self.get_parameter('calibrate_timeout_s').value)
+        self.spin_speed_dps = abs(float(
+            self.get_parameter('spin_scan_speed_dps').value))
+        self.spin_tol_deg = abs(float(
+            self.get_parameter('spin_scan_tol_deg').value))
+        self.spin_stop_lead_deg = abs(float(
+            self.get_parameter('spin_scan_stop_lead_deg').value))
+        # 旋转扫描的运行态（spin_scan 指令在 spinning 相位里用）
+        self.spin_start_yaw = 0.0
+        self.spin_target_yaw = 0.0   # 绝对目标航向（rad），结束时用 POSE 精确压住
+        self.spin_last_yaw = 0.0
+        self.spin_progress = 0.0
+        self.spin_total = 0.0
+        self.spin_rate = 0.0
+        self.spin_sign = 1.0
+        self.spin_lead_rad = 0.0     # 这一条 spin_scan 的提前收油量（rad）
+        self.spin_stop_deadline = 0.0
 
         # ---- 发布的话题（本节点 -> 其他节点） ----
         self._pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)                     # 位姿目标
@@ -244,6 +273,15 @@ class MotionPlannerNode(Node):
         # 跑序列时按 10Hz 心跳重复发，手柄那边超时 0.6s 没收到就自动恢复手动，
         # 避免本节点崩溃后把手柄永久锁死。
         self._pub_active = self.create_publisher(Bool, '/motion_active', 10)
+
+        # ---- 旋转扫描（spin_scan 指令）----
+        # 为什么不用 /cmd_pose 转：位置环会把车"甩"到目标朝向（PID 全速），
+        # 转得快、点云拖成扇形，扫出来的图没法用。用 /cmd_vel 给恒定角速度，
+        # F407 那边照样把它积分进航向目标，停手后航向环还会按住不动。
+        self._pub_vel = self.create_publisher(Twist, '/cmd_vel', 10)
+        # 通知上位机"开始/结束攒点云"（上位机是唯一读雷达的进程）。
+        # 载荷就是 "start" / "done"；上位机没开也不影响动作本身。
+        self._pub_spin = self.create_publisher(String, '/spin_scan', 10)
 
         # ---- 订阅的话题（其他节点 -> 本节点） ----
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)          # 里程计：判断到位
@@ -419,6 +457,11 @@ class MotionPlannerNode(Node):
         重复处理会多发一次 POSE。
         """
         if bool(msg.data) and self.phase != 'idle':
+            # 正在旋转扫描时被叫停：先补一帧 0 速度 + 通知上位机收工，
+            # 否则上位机会一直以为"还在扫"，地图永远不冻结。
+            if self.phase == 'spinning':
+                self._publish_vel(0.0)
+                self._pub_spin.publish(String(data='done'))
             self._kill_proc()                            # 停止时把视觉/脚本子进程也收掉
             self._vision_stop()                          # 常驻视觉进程（摄像头）一并释放
             self._fix_result = None                      # 挂起的圆环矫正结果一并作废
@@ -774,6 +817,55 @@ class MotionPlannerNode(Node):
                     return
                 self._publish_pose(self.tx, self.ty, self.tyaw)
                 return
+        elif self.phase == 'spinning':
+            # 恒速旋转，按"累计转过多少度"判结束（不是按目标朝向的误差）。
+            # 用累计量是因为 F407 那边是"Wz 积分成航向目标"，中途丢了帧也只会
+            # 慢一点，不会突然反向追一个越跑越远的目标。
+            if self.odom is None:
+                self._spin_finish('里程计丢了')
+                return
+            d = self._angle_diff(self.odom[2], self.spin_last_yaw)
+            self.spin_last_yaw = self.odom[2]
+            self.spin_progress += d
+            remain = self.spin_total - self.spin_progress
+            tol = math.radians(self.spin_tol_deg)
+            # 提前 spin_lead_rad 就收油。F407 的航向目标是把收到的 Wz 积分出来的，
+            # 它比实测 yaw 超前一个跟踪滞后 ω/head_kp；等实测到 90° 再停，内部
+            # 目标已经跑到 90°+滞后，车会继续转过去 —— 这就是"设 90 实际转了
+            # 100 多度"的原因，而且转得越快滞后越大。
+            arrived = ((self.spin_total >= 0.0
+                        and remain <= tol + self.spin_lead_rad) or
+                       (self.spin_total < 0.0
+                        and remain >= -(tol + self.spin_lead_rad)))
+            if arrived:
+                # 顺序不能反：VEL 帧会清掉 F407 的 PosTarget.Valid。
+                # 先发一帧 0 清掉残留 Wz（否则内部目标还会继续积分），
+                # 再用 POSE 把航向目标钉死在精确角度上 —— 之后完全由 F407
+                # 的航向环收敛，不依赖"积分出来的目标"。
+                self._publish_vel(0.0)
+                if self.odom is not None:
+                    self._publish_pose(self.odom[0], self.odom[1],
+                                       self.spin_target_yaw)
+                self.spin_stop_deadline = self._now() + 2.0
+                self.phase = 'spin_stop'
+                return
+            if self.move_deadline and self._now() > self.move_deadline:
+                self._spin_finish('超时')
+                return
+            self._publish_vel(self.spin_sign * self.spin_rate)
+            return
+        elif self.phase == 'spin_stop':
+            # 等 F407 收敛到 POSE 的精确航向。这里**不能再发 VEL**：
+            # VEL 帧会清掉 PosTarget.Valid，刚发下去的 POSE 就作废了。
+            if self.odom is not None:
+                err = abs(self._angle_diff(self.odom[2], self.spin_target_yaw))
+                if err <= math.radians(self.spin_tol_deg):
+                    self._spin_finish(None)
+                    return
+            if self._now() > self.spin_stop_deadline:
+                self._spin_finish('到位超时')
+                return
+            return
         elif self.phase == 'waiting':
             if self._now() < self.deadline:   # 还没到时间，继续等
                 return
@@ -950,6 +1042,8 @@ class MotionPlannerNode(Node):
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 转向 {cmd.get("deg", 0):+.0f}°')
             self.yaw_stable_since = 0.0
             self.phase = 'turning'
+        elif name == 'spin_scan':     # 原地慢速旋转：雷达边走边扫，转完自动停
+            self._spin_start(cmd)
         elif name == 'goto':          # 绝对位姿（里程计世界系，米/度）
             self.tx = float(cmd.get('x_m', self.tx))
             self.ty = float(cmd.get('y_m', self.ty))
@@ -1992,6 +2086,97 @@ class MotionPlannerNode(Node):
         s = String()
         s.data = text
         self._pub_state.publish(s)
+
+    # ==================== 旋转扫描（spin_scan 指令） ====================
+
+    def _publish_vel(self, wz, vx=0.0, vy=0.0):
+        """发底盘速度。wz 单位 rad/s，正 = 逆时针（俯视）。"""
+        t = Twist()
+        t.linear.x = float(vx)
+        t.linear.y = float(vy)
+        t.angular.z = float(wz)
+        self._pub_vel.publish(t)
+
+    def _spin_start(self, cmd):
+        """进入 spinning 相位：慢速恒速原地转 |deg| 度。
+
+        不用 /cmd_pose 转，是因为位置环会把车全速甩到目标朝向（快、点云拖尾）。
+        /cmd_vel 给恒速，F407 会把它积分进航向目标，停手后航向环继续按住。
+
+        参数（上位机「动作序列」里填）：
+            deg         相对转角，正 = 逆时针（左转），默认 90
+            speed_dps   可选，覆盖 vehicle.yaml 的 spin_scan_speed_dps
+        """
+        try:
+            deg_req = float(cmd.get('deg', 90.0))
+        except (TypeError, ValueError):
+            deg_req = 90.0
+        try:
+            speed = abs(float(cmd.get('speed_dps', self.spin_speed_dps)))
+        except (TypeError, ValueError):
+            speed = self.spin_speed_dps
+        speed = min(max(speed, 5.0), 90.0)      # 太慢扫不完，太快点云拖成扇形
+
+        prefix = f'[{self.index+1}/{len(self.commands)}] '
+        if self.odom is None:
+            self._publish_state(prefix + '旋转扫描需要里程计，跳过')
+            self.phase = 'stepping'
+            return
+        if abs(deg_req) < 0.5 or speed < 1.0:
+            self._publish_state(prefix + '旋转扫描角度为 0，跳过')
+            self.phase = 'stepping'
+            return
+
+        self.spin_total = math.radians(deg_req)
+        self.spin_sign = 1.0 if deg_req >= 0.0 else -1.0
+        self.spin_rate = math.radians(speed)
+        self.spin_start_yaw = self.odom[2]
+        # 绝对目标航向：结束时用 POSE 下发，F407 的航向环直接以它为 0 误差点，
+        # 不再受"Wz 积分目标超前"的影响。卷绕回 (-180,180]。
+        self.spin_target_yaw = self._angle_diff(
+            self.spin_start_yaw + self.spin_total, 0.0)
+        # 提前收油量 = 跟踪滞后 ω/head_kp（当前调参页 head_kp=2.4）。参数只是
+        # 上限；改过调参页的 head_kp 就按 2.4/新值 重算，或者直接调
+        # spin_scan_stop_lead_deg。最多提前一半，短角度别一上来就交给 POSE。
+        self.spin_lead_rad = min(math.radians(self.spin_stop_lead_deg),
+                                 self.spin_rate / 2.4,
+                                 abs(self.spin_total) * 0.5)
+        self.spin_last_yaw = self.odom[2]
+        self.spin_progress = 0.0
+        # 兜底超时：正常 |deg|/speed 秒；给 3 倍 + 6s（含起步的加速段）
+        self.move_deadline = (self._now()
+                              + abs(deg_req) / max(speed, 1.0) * 3.0 + 6.0)
+        self._publish_vel(0.0)                  # 先清掉上一次残留的速度
+        self._pub_spin.publish(String(data='start'))   # 通知上位机开始攒点
+        self._publish_state(
+            prefix + f'旋转扫描 {deg_req:+.0f}° @ {speed:.0f}°/s'
+                     f'（{"逆时针" if deg_req >= 0 else "顺时针"}，边转边扫）')
+        self.phase = 'spinning'
+
+    def _spin_finish(self, reason):
+        """收工：目标位姿同步到实测、通知上位机冻结地图。"""
+        # 正常路径已经在 spin_stop 发了 POSE 精确目标，这里**不能**再发 VEL：
+        # VEL 帧会清掉 PosTarget.Valid，车就会停在半路。只有中止/超时才刹一帧。
+        if reason:
+            self._publish_vel(0.0)
+        self._pub_spin.publish(String(data='done'))
+        if self.odom is not None:
+            # 车转过了，状态机的目标位姿必须跟上，否则下一条 move/goto 会
+            # 按旧朝向算位移（表现为走歪、越走越偏）。正常完成时用 POSE 的
+            # 精确目标，别用还在收敛的实测值。
+            self.tx, self.ty = self.odom[0], self.odom[1]
+            self.tyaw = self.odom[2] if reason else self.spin_target_yaw
+        turned = (math.degrees(self.spin_total) if not reason
+                  else math.degrees(self.spin_progress))
+        target = math.degrees(self.spin_total)
+        if reason:
+            self._publish_state(
+                f'旋转扫描中止（{reason}）：已转 {turned:+.1f}° / 目标 {target:+.0f}°')
+            self.get_logger().warning(f'spin_scan 中止：{reason}，已转 {turned:+.1f}°')
+        else:
+            self._publish_state(
+                f'旋转扫描完成：已转 {turned:+.1f}°（POS 精确收尾）')
+        self.phase = 'stepping'
 
     def _finish(self):
         self._probe_finish()        # 最后一条指令的耗时也打出来

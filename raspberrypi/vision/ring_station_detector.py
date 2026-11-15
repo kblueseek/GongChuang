@@ -496,8 +496,13 @@ class RingStationDetector:
         self._roi_failures = 0
         return _raw_detection(frame, self.config), "full_fallback"
 
-    def detect(self, frame) -> RingStationDetection:
-        """检测一帧，返回三环对位误差、纠偏量、质量和耗时。"""
+    def detect(self, frame, require_quality: bool = True) -> RingStationDetection:
+        """检测一帧，返回三环对位误差、纠偏量、质量和耗时。
+
+        require_quality=False 时，置信度/仿射残差/透视比只作为提示写进 detail，
+        不再拦掉这一帧：只要三个环稳定可见就继续算稳定窗口和纠偏量。
+        ring_fix 用这个模式，实现"视野里出现三个环就开始矫正"。
+        """
 
         started = time.perf_counter()
         if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
@@ -537,7 +542,7 @@ class RingStationDetector:
             ):
                 quality_detail = "圆环透视比超出标定适用范围"
 
-        if quality_detail is not None:
+        if quality_detail is not None and require_quality:
             self._samples.clear()
             return RingStationDetection(
                 detected=True,
@@ -558,6 +563,11 @@ class RingStationDetector:
 
         # 可见环数一变，稳定窗口要重来（1 环和 3 环的中值不能混算）。
         if self._samples and len(self._samples[-1]["centers"]) != count:
+            self._samples.clear()
+        # 共线状态变了也要重来：不共线的样本 yaw=None，和共线样本混在一起
+        # 算中值会 None - float 直接抛异常（会跳过整帧甚至打断控制）。
+        if self._samples and ((self._samples[-1]["yaw"] is None)
+                              != (raw["yaw"] is None)):
             self._samples.clear()
         self._samples.append(raw)
         # 连续帧中，每个圆心的X/Y分别取中值；坐标单位为原图像素。
@@ -583,11 +593,16 @@ class RingStationDetector:
             angle_error = 0.0
             yaw = config.reference_yaw_deg
         else:
+            # 防御：窗口里理论上已经保证全是带 yaw 的样本，这里再过滤一次
             yaw_errors = [
                 _normalize_angle(sample["yaw"] - config.reference_yaw_deg)
                 for sample in self._samples
+                if sample["yaw"] is not None
             ]
-            angle_error = float(np.median(yaw_errors))
+            if not yaw_errors:
+                angle_error = 0.0
+            else:
+                angle_error = float(np.median(yaw_errors))
             yaw = _normalize_angle(config.reference_yaw_deg + angle_error)
 
         affine = np.asarray(config.image_to_station_affine)
@@ -640,6 +655,9 @@ class RingStationDetector:
             detail = "工位视觉残差已达到验收精度"
         else:
             detail = "工位偏差超出验收精度"
+        if quality_detail is not None:
+            # require_quality=False：质量只提示，照常给纠偏量（车会先动起来）
+            detail = f"{quality_detail}（仅提示，继续纠偏）；{detail}"
         return RingStationDetection(
             detected=True,
             stable=stable,

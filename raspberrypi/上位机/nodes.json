@@ -8,12 +8,166 @@
     {
       "name": "2. 扫码区",
       "route": "扫码区",
-      "actions": []
+      "actions": [
+        {
+          "cmd": "color_pick",
+          "color": "open"
+        }
+      ]
     },
     {
       "name": "3. 原料区",
       "route": "原料区",
-      "actions": []
+      "actions": [
+        {
+          "cmd": "gimbal",
+          "yaw_deg": 0.0,
+          "lift_deg": 800.0,
+          "extend_deg": 200.0
+        },
+        {
+          "cmd": "gripper",
+          "deg": 100.0
+        },
+        {
+          "cmd": "color_pick",
+          "color": "1"
+        },
+        {
+          "cmd": "tray_slot",
+          "number": "1"
+        },
+        {
+          "cmd": "gripper",
+          "deg": 173.0
+        },
+        {
+          "cmd": "delay",
+          "ms": 350
+        },
+        {
+          "cmd": "place_tray",
+          "yaw_deg": 650.0,
+          "lift_deg": 100.0,
+          "extend_deg": 780.0,
+          "retract_deg": 100.0,
+          "lead_deg": 50.0
+        },
+        {
+          "cmd": "gimbal_lift",
+          "delta_deg": 240.0
+        },
+        {
+          "cmd": "gripper",
+          "deg": 100.0
+        },
+        {
+          "cmd": "gimbal_lift",
+          "delta_deg": -240.0
+        },
+        {
+          "cmd": "gimbal",
+          "yaw_deg": 0.0,
+          "lift_deg": 800.0,
+          "extend_deg": 200.0
+        },
+        {
+          "cmd": "gripper",
+          "deg": 100.0
+        },
+        {
+          "cmd": "color_pick",
+          "color": "2"
+        },
+        {
+          "cmd": "tray_slot",
+          "number": "2"
+        },
+        {
+          "cmd": "gripper",
+          "deg": 173.0
+        },
+        {
+          "cmd": "delay",
+          "ms": 350
+        },
+        {
+          "cmd": "place_tray",
+          "yaw_deg": 650.0,
+          "lift_deg": 100.0,
+          "extend_deg": 780.0,
+          "retract_deg": 100.0,
+          "lead_deg": 50.0
+        },
+        {
+          "cmd": "gimbal_lift",
+          "delta_deg": 240.0
+        },
+        {
+          "cmd": "gripper",
+          "deg": 100.0
+        },
+        {
+          "cmd": "gimbal_lift",
+          "delta_deg": -240.0
+        },
+        {
+          "cmd": "gimbal",
+          "yaw_deg": 0.0,
+          "lift_deg": 800.0,
+          "extend_deg": 200.0
+        },
+        {
+          "cmd": "gripper",
+          "deg": 100.0
+        },
+        {
+          "cmd": "color_pick",
+          "color": "4"
+        },
+        {
+          "cmd": "tray_slot",
+          "number": "3"
+        },
+        {
+          "cmd": "gripper",
+          "deg": 173.0
+        },
+        {
+          "cmd": "delay",
+          "ms": 350
+        },
+        {
+          "cmd": "place_tray",
+          "yaw_deg": 647.0,
+          "lift_deg": 100.0,
+          "extend_deg": 780.0,
+          "retract_deg": 100.0,
+          "lead_deg": 50.0
+        },
+        {
+          "cmd": "gimbal_lift",
+          "delta_deg": 240.0
+        },
+        {
+          "cmd": "gripper",
+          "deg": 100.0
+        },
+        {
+          "cmd": "gimbal_lift",
+          "delta_deg": -240.0
+        },
+        {
+          "cmd": "gimbal",
+          "yaw_deg": 0.0,
+          "lift_deg": 800.0,
+          "extend_deg": 200.0
+        },
+        {
+          "cmd": "color_pick",
+          "color": "close"
+        }
+      ]
     },
     {
       "name": "4. 粗加工区",

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -70,6 +71,48 @@ def _find_vision_dir() -> str:
     return ''
 
 
+class _PID:
+    """和 vision/gimbal_track_pick.py 同一套 PID：输出限幅、积分抗饱和、微分低通。
+
+    ki=kd=0 就是纯 P。kd 提供阻尼，能在不加大振荡的前提下提高 kp；ki 消稳态
+    误差，但视觉测量有噪声，先给 0~小值。
+    """
+
+    def __init__(self, kp, ki, kd, limit, deriv_tau=0.1):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self.limit = abs(float(limit))
+        self.deriv_tau = max(0.0, float(deriv_tau))
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.deriv = 0.0
+
+    def update(self, err, dt):
+        if dt <= 0.0:
+            dt = 0.01
+        raw_deriv = (err - self.prev_err) / dt
+        self.prev_err = err
+        if self.deriv_tau > 0.0:
+            alpha = dt / (self.deriv_tau + dt)
+            self.deriv += alpha * (raw_deriv - self.deriv)
+        else:
+            self.deriv = raw_deriv
+        p = self.kp * err
+        d = self.kd * self.deriv
+        pre = p + self.ki * self.integral + d
+        saturated = abs(pre) >= self.limit
+        if self.ki != 0.0 and not (saturated and pre * err > 0.0):
+            self.integral += err * dt
+            bound = self.limit / abs(self.ki)
+            self.integral = max(-bound, min(bound, self.integral))
+        out = p + self.ki * self.integral + d
+        return max(-self.limit, min(self.limit, out))
+
+
 class RingFixNode(Node):
     def __init__(self):
         super().__init__('ring_fix')
@@ -87,14 +130,47 @@ class RingFixNode(Node):
         self.declare_parameter('align_offset_y_m', 0.0)
         # 对准后车体的航向（度）。留空 = 只修正位置、不修正航向。
         self.declare_parameter('align_yaw_deg', '')
-        # ---- 伺服参数 ----
-        self.declare_parameter('step_max_xy_m', 0.04)      # 单步最大平移（米）
-        self.declare_parameter('step_max_yaw_deg', 4.0)    # 单步最大转向（度）
-        self.declare_parameter('step_interval_s', 0.30)    # 相邻两步的最小间隔（秒）
-        self.declare_parameter('converge_tol_xy_mm', 4.0)  # 收敛判定：位置（毫米）
-        self.declare_parameter('converge_tol_yaw_deg', 1.5)  # 收敛判定：航向（度）
-        self.declare_parameter('converge_hold_frames', 3)  # 连续多少帧满足才算对准
+        # ---- 伺服：底盘对位 PID（和 vision/config/track_pid.json 一个思路）----
+        # 误差单位：x/y = 毫米，yaw = 度；PID 输出是速度（mm/s、°/s），
+        # 再按 tick 周期积分成位姿小步发给 F407。
+        # 以前是"每 0.3s 直接走 100% 纠偏量"（等效 Kp=1、无阻尼），相机有
+        # ~100ms 延迟，所以来回震荡；现在用可调 PID + 速度限幅压住。
+        self.declare_parameter('ctrl_kp_xy', 1.0)
+        self.declare_parameter('ctrl_ki_xy', 0.02)
+        self.declare_parameter('ctrl_kd_xy', 0.15)
+        self.declare_parameter('ctrl_kp_yaw', 1.0)
+        self.declare_parameter('ctrl_ki_yaw', 0.0)
+        self.declare_parameter('ctrl_kd_yaw', 0.15)
+        self.declare_parameter('max_xy_speed_m_s', 0.06)    # 平移速度上限
+        self.declare_parameter('max_yaw_speed_deg_s', 15.0)  # 转向速度上限
+        self.declare_parameter('ctrl_deadband_xy_mm', 0.5)   # 小于这个误差不再输出
+        self.declare_parameter('ctrl_deadband_yaw_deg', 0.15)
+        self.declare_parameter('ctrl_deriv_tau', 0.1)        # 微分低通（压视觉噪声）
+        # 视觉误差一阶低通：检测本身有 ±0.5~1mm 抖动，直接进 PID 会让车
+        # 在原地来回蹭。tau 越大越稳、越慢；0 = 不滤波。
+        self.declare_parameter('ctrl_filter_tau', 0.15)
+        # 滞环（防抖）：误差进到 stop 以内就完全停车、命令"保持当前位姿"；
+        # 只有超过 resume（=验收容差）才重新起步。两个值之间是死区。
+        self.declare_parameter('ctrl_stop_xy_mm', 1.0)
+        self.declare_parameter('ctrl_stop_yaw_deg', 0.35)
+        # 停车后先等这么久再开始计收敛帧，让滤波值稳定下来
+        self.declare_parameter('ctrl_settle_s', 0.2)
+        # F407 内环增益：位置环 Kp（m/s per m）和航向环 Kp（°/s per °）。
+        # PID 输出的是速度，要换算成"领先当前位姿多少"的 POSE 目标：
+        #   lead_mm = v_mm_s / pos_kp，lead_deg = ω_dps / head_kp
+        # 这两个数要和调参页一致（vehicle.yaml 里 tune_profile 的 pos_kp/head_kp），
+        # 填大了车会冲、填小了会慢，但视觉外环会兜住。
+        self.declare_parameter('chassis_pos_kp', 1.5)
+        self.declare_parameter('chassis_heading_kp', 2.4)
+        # 单拍位姿领先量上限（防止增益/标定异常时目标飞出去）
+        self.declare_parameter('max_lead_xy_mm', 80.0)
+        self.declare_parameter('max_lead_yaw_deg', 8.0)
+        self.declare_parameter('converge_tol_xy_mm', 2.0)  # 收敛判定：位置（毫米）
+        self.declare_parameter('converge_tol_yaw_deg', 0.8)  # 收敛判定：航向（度）
+        self.declare_parameter('converge_hold_frames', 5)  # 连续多少帧满足才算对准
         self.declare_parameter('timeout_s', 45.0)          # 单次矫正总超时（秒）
+        # false = 只要三个环稳定可见就开始纠偏；置信度/透视比等只提示不拦截。
+        self.declare_parameter('require_quality', False)
         # ---- 实时预览 ----
         # true = 矫正时在树莓派桌面弹出识别画面（窗口名 ring_fix）；
         # 无桌面环境（纯 SSH）首次显示失败会自动关掉预览，不影响矫正。
@@ -109,14 +185,59 @@ class RingFixNode(Node):
         align_yaw_raw = str(self.get_parameter('align_yaw_deg').value).strip()
         self._align_yaw = (math.radians(float(align_yaw_raw))
                            if align_yaw_raw else None)
-        self._step_max_xy = abs(float(self.get_parameter('step_max_xy_m').value))
-        self._step_max_yaw = abs(float(self.get_parameter('step_max_yaw_deg').value))
-        self._step_interval = float(self.get_parameter('step_interval_s').value)
+        self._max_xy_speed = abs(float(
+            self.get_parameter('max_xy_speed_m_s').value)) * 1000.0   # mm/s
+        self._max_yaw_speed = abs(float(
+            self.get_parameter('max_yaw_speed_deg_s').value))         # °/s
+        self._deadband_xy = abs(float(
+            self.get_parameter('ctrl_deadband_xy_mm').value))
+        self._deadband_yaw = abs(float(
+            self.get_parameter('ctrl_deadband_yaw_deg').value))
+        self._filter_tau = max(0.0, float(
+            self.get_parameter('ctrl_filter_tau').value))
+        self._stop_xy = abs(float(
+            self.get_parameter('ctrl_stop_xy_mm').value))
+        self._stop_yaw = abs(float(
+            self.get_parameter('ctrl_stop_yaw_deg').value))
+        self._settle_s = max(0.0, float(
+            self.get_parameter('ctrl_settle_s').value))
+        self._pos_kp = max(0.1, abs(float(
+            self.get_parameter('chassis_pos_kp').value)))
+        self._heading_kp = max(0.1, abs(float(
+            self.get_parameter('chassis_heading_kp').value)))
+        self._max_lead_xy = abs(float(
+            self.get_parameter('max_lead_xy_mm').value))
+        self._max_lead_yaw = abs(float(
+            self.get_parameter('max_lead_yaw_deg').value))
+        self._require_quality = bool(self.get_parameter('require_quality').value)
+        deriv_tau = float(self.get_parameter('ctrl_deriv_tau').value)
+        self._pid_x = _PID(self.get_parameter('ctrl_kp_xy').value,
+                           self.get_parameter('ctrl_ki_xy').value,
+                           self.get_parameter('ctrl_kd_xy').value,
+                           self._max_xy_speed, deriv_tau)
+        self._pid_y = _PID(self.get_parameter('ctrl_kp_xy').value,
+                           self.get_parameter('ctrl_ki_xy').value,
+                           self.get_parameter('ctrl_kd_xy').value,
+                           self._max_xy_speed, deriv_tau)
+        self._pid_yaw = _PID(self.get_parameter('ctrl_kp_yaw').value,
+                             self.get_parameter('ctrl_ki_yaw').value,
+                             self.get_parameter('ctrl_kd_yaw').value,
+                             self._max_yaw_speed, deriv_tau)
         self._tol_xy = abs(float(self.get_parameter('converge_tol_xy_mm').value))
         self._tol_yaw = abs(float(self.get_parameter('converge_tol_yaw_deg').value))
         self._hold_need = max(1, int(self.get_parameter('converge_hold_frames').value))
         self._timeout = float(self.get_parameter('timeout_s').value)
         self._show_preview = bool(self.get_parameter('show_preview').value)
+        # 没桌面时不能调 cv2.imshow：OpenCV 的 Qt 后端连不上 display 会**直接
+        # abort 整个进程**（不是抛 Python 异常，try/except 拦不住）。SSH 启动
+        # 整车时在触发 calibrate 那一刻节点就没了，表现就是"点了没反应、也没画面"。
+        if (self._show_preview
+                and not os.environ.get('DISPLAY')
+                and not os.environ.get('WAYLAND_DISPLAY')):
+            self._show_preview = False
+            self.get_logger().warning(
+                '没有 DISPLAY/WAYLAND_DISPLAY：实时预览已自动关闭'
+                '（矫正照常执行；要看画面请在树莓派桌面终端里启动）')
         self._preview_active = False   # 预览窗口当前是否开着（含重试降级）
 
         # ---- 加载视觉配置（import vision 的检测器） ----
@@ -138,6 +259,9 @@ class RingFixNode(Node):
             load_ring_station_config, RingStationDetector,
             RingStationDetectionError,
         )
+        # 这个 import 写在 __init__ 里（要先把 vision_dir 塞进 sys.path），
+        # 名字只是局部变量；回调里要用必须挂到 self 上，否则 NameError。
+        self._RingStationDetector = RingStationDetector
         self._RingStationDetectionError = RingStationDetectionError
         vision = Path(vision_dir)
         self._ring_config = load_ring_station_config(
@@ -168,8 +292,14 @@ class RingFixNode(Node):
         self._start_t = 0.0
         self._cam_retry_t = 0.0
         self._hold_frames = 0
-        self._last_step_t = 0.0
+        self._last_ctrl_t = 0.0      # 上一次 PID 控制时刻（算 dt）
+        self._last_usable_t = 0.0    # 上一次拿到可用三环的时刻
         self._hold_pose = None       # 当前保持的位姿目标 (x, y, yaw)
+        self._filt = None            # 低通后的纠偏量 [x_mm, y_mm, yaw_deg]
+        self._filt_t = 0.0
+        self._moving = False         # 滞环：是否处于"纠偏中"
+        self._anchor_pose = None     # 停车时锁存的位姿目标（保持用）
+        self._settle_until = 0.0     # 停车后多少秒内不计收敛帧
         self._last_diag_t = 0.0
 
         self._timer = self.create_timer(0.05, self._tick)   # 20Hz
@@ -191,14 +321,22 @@ class RingFixNode(Node):
                 f'已有矫正在进行（{self._phase}），新目标 ({msg.x:.3f},{msg.y:.3f}) 忽略')
             return
         self._ring_target = (float(msg.x), float(msg.y))
-        self._detector = RingStationDetector(self._ring_config)
+        self._detector = self._RingStationDetector(self._ring_config)
         self._release_camera()
         self._phase = 'starting'
         self._start_t = time.monotonic()
         self._cam_retry_t = 0.0
         self._hold_frames = 0
-        self._last_step_t = 0.0
+        self._last_ctrl_t = 0.0
+        self._last_usable_t = 0.0
         self._hold_pose = None
+        self._filt = None
+        self._filt_t = 0.0
+        self._moving = False
+        self._anchor_pose = None
+        self._settle_until = 0.0
+        for pid in (self._pid_x, self._pid_y, self._pid_yaw):
+            pid.reset()
         self.get_logger().info(
             f'开始圆环矫正：中间环里程计 = ({msg.x:.3f}, {msg.y:.3f}) m')
 
@@ -224,32 +362,61 @@ class RingFixNode(Node):
             frame = self._cv2.remap(
                 frame, self._map1, self._map2, self._cv2.INTER_LINEAR)
         try:
-            result = self._detector.detect(frame)
+            result = self._detector.detect(
+                frame, require_quality=self._require_quality)
         except self._RingStationDetectionError as error:
             self._fail(f'圆环检测异常：{error}')
+            return
+        except Exception as error:  # noqa: BLE001
+            # rclpy 的定时器回调里抛异常会直接把整个节点进程带走（之后所有
+            # calibrate 都石沉大海、也不会有预览）。检测器的偶发错误只跳过这一帧。
+            self.get_logger().warning(f'圆环检测异常（本帧跳过）：{error}')
             return
         self._draw_preview(frame, result)
 
         usable = (result.detected and result.stable
                   and len(result.centers_px) == 3
-                  and result.correction_body_x_mm is not None)
+                  and result.correction_body_x_mm is not None
+                  # 必须是"三环共线"那条路径（残差有限）；否则只是零星圆，
+                  # 拿它们配对纠偏会把车带偏。
+                  and math.isfinite(result.affine_residual))
+        cx_mm = cy_mm = cyaw = fx = fy = fyaw = None
         if usable:
             cx_mm = result.correction_body_x_mm
             cy_mm = result.correction_body_y_mm
             cyaw = result.correction_yaw_deg
-            # 收敛判定：纠偏量持续小于门槛（不依赖 within_tolerance 的
-            # 严格验收门槛，避免抖动导致永远等不到稳定窗口）。
-            if (max(abs(cx_mm), abs(cy_mm)) <= self._tol_xy
-                    and abs(cyaw) <= self._tol_yaw):
+            self._last_usable_t = now
+            # 先低通再进控制/收敛判定：检测本身 ±0.5~1mm 的抖动如果直接喂
+            # PID，车会在目标附近一直蹭，收敛帧也会被单帧噪声打断。
+            fx, fy, fyaw = self._filter_correction(now, cx_mm, cy_mm, cyaw)
+            self._update_motion_state(now, fx, fy, fyaw)
+
+            # 收敛判定：用滤波后的值，且必须已经停车、过了 settle 时间。
+            if (not self._moving
+                    and now >= self._settle_until
+                    and max(abs(fx), abs(fy)) <= self._tol_xy
+                    and abs(fyaw) <= self._tol_yaw):
                 self._hold_frames += 1
             else:
                 self._hold_frames = 0
             if self._hold_frames >= self._hold_need:
                 self._converge()
                 return
-            self._maybe_step(now, cx_mm, cy_mm, cyaw)
+            if self._moving:
+                self._control_step(now, fx, fy, fyaw)
+            elif self._anchor_pose is not None:
+                # 停车阶段：按住锁存的锚点位姿，位置/航向环持续有误差可修，
+                # 不会像"每拍发当前位姿"那样等于放弃保持。
+                self._hold_pose = self._anchor_pose
         else:
             self._hold_frames = 0
+            # 丢环超过 0.5s 就清 PID/滤波器，免得旧积分/微分在重新看到环时顶一下
+            if now - self._last_usable_t > 0.5:
+                for pid in (self._pid_x, self._pid_y, self._pid_yaw):
+                    pid.reset()
+                self._last_ctrl_t = 0.0
+                self._filt = None
+                self._moving = False
 
         # F407 的位姿目标约 100ms 过期：每拍重发保持位姿，别让它散开。
         if self._hold_pose is not None:
@@ -258,41 +425,110 @@ class RingFixNode(Node):
         if now - self._last_diag_t >= 1.0:
             self._last_diag_t = now
             detail = result.detail if result.detected else '未检测到三个圆环'
-            err = (f'纠偏=({result.correction_body_x_mm:+.1f},'
-                   f'{result.correction_body_y_mm:+.1f}mm '
-                   f'{result.correction_yaw_deg:+.2f}°)'
-                   if usable else '--')
+            if usable:
+                err = (f'raw=({cx_mm:+.1f},{cy_mm:+.1f}mm {cyaw:+.2f}°) '
+                       f'filt=({fx:+.1f},{fy:+.1f}mm {fyaw:+.2f}°) '
+                       f'{"纠偏中" if self._moving else "保持"}')
+            else:
+                err = '--'
             self.get_logger().info(
                 f'矫正中 [{self._phase}] {detail} {err} '
                 f'稳定帧 {self._hold_frames}/{self._hold_need}')
 
     # ---------------- 伺服 ----------------
 
-    def _maybe_step(self, now: float, cx_mm: float, cy_mm: float, cyaw_deg: float):
-        """把纠偏量裁成小步，以"当前里程计 ⊕ 小步"为目标发 /cmd_pose。"""
-        if now - self._last_step_t < self._step_interval:
-            return
-        if (self._odom is None
-                or now - self._odom_t > 0.5):
+    def _filter_correction(self, now: float, cx_mm: float, cy_mm: float,
+                           cyaw_deg: float):
+        """视觉纠偏量一阶低通（EMA）。返回滤波后的 (x, y, yaw)。"""
+        if self._filt is None:
+            self._filt = [cx_mm, cy_mm, cyaw_deg]
+            self._filt_t = now
+            return cx_mm, cy_mm, cyaw_deg
+        dt = min(max(now - self._filt_t, 1e-3), 0.2)
+        self._filt_t = now
+        alpha = 1.0 if self._filter_tau <= 0.0 else dt / (self._filter_tau + dt)
+        for i, value in enumerate((cx_mm, cy_mm, cyaw_deg)):
+            self._filt[i] += alpha * (value - self._filt[i])
+        return self._filt[0], self._filt[1], self._filt[2]
+
+    def _update_motion_state(self, now: float, fx: float, fy: float, fyaw: float):
+        """滞环：进到 stop 带就停车，超过验收容差才重新起步。
+
+        没有滞环时，误差在死区边缘被噪声推来推去，PID 每隔几拍就顶一下，
+        车看起来就是原地抖、收敛帧永远攒不够。
+        """
+        mag = max(abs(fx), abs(fy))
+        if self._moving:
+            if mag <= self._stop_xy and abs(fyaw) <= self._stop_yaw:
+                self._moving = False
+                # 锁存停车时的实测位姿做保持目标。不能每拍都发"当前位姿"：
+                # 那样位置环误差恒为 0，等于没在保持，车会被地面/轮隙慢慢带跑。
+                self._anchor_pose = self._odom
+                self._settle_until = now + self._settle_s
+                for pid in (self._pid_x, self._pid_y, self._pid_yaw):
+                    pid.reset()
+        elif mag > self._tol_xy or abs(fyaw) > self._tol_yaw:
+            self._moving = True
+            self._anchor_pose = None
+            self._last_ctrl_t = 0.0
+            for pid in (self._pid_x, self._pid_y, self._pid_yaw):
+                pid.reset()
+
+    def _control_step(self, now: float, cx_mm: float, cy_mm: float, cyaw_deg: float):
+        """PID 速度环：纠偏量(mm/mm/°) → 速度(mm/s、°/s) → 一拍的位姿小步。
+
+        和物料跟随（vision/gimbal_track_pick.py）同一套 PID：输出限幅、积分
+        抗饱和、微分低通。以前是每 0.3s 直接走 100% 纠偏量（等效 Kp=1、无
+        阻尼），相机有 ~100ms 延迟，所以车在目标两侧来回震荡。
+        """
+        if self._odom is None or now - self._odom_t > 0.5:
             return   # 没有新鲜里程计不动车，超时兜底
+        if self._last_ctrl_t <= 0.0:
+            self._last_ctrl_t = now
+            for pid in (self._pid_x, self._pid_y, self._pid_yaw):
+                pid.reset()
+            return
+        dt = min(max(now - self._last_ctrl_t, 1e-3), 0.2)
+        self._last_ctrl_t = now
 
-        dist = math.hypot(cx_mm, cy_mm)
-        if dist > self._step_max_xy * 1000.0:
-            scale = self._step_max_xy * 1000.0 / dist
-            cx_mm *= scale
-            cy_mm *= scale
-        cyaw = max(-self._step_max_yaw, min(self._step_max_yaw, cyaw_deg))
-        if max(abs(cx_mm), abs(cy_mm)) < 0.5 and abs(cyaw) < 0.05:
-            return   # 步子小到没意义，等收敛判定
+        # 死区：已经压线就别再抖
+        ex = 0.0 if abs(cx_mm) <= self._deadband_xy else cx_mm
+        ey = 0.0 if abs(cy_mm) <= self._deadband_xy else cy_mm
+        eyaw = 0.0 if abs(cyaw_deg) <= self._deadband_yaw else cyaw_deg
 
+        vx = self._pid_x.update(ex, dt)          # mm/s（正 = 车体系 +x）
+        vy = self._pid_y.update(ey, dt)          # mm/s（正 = 车体系 +y）
+        vyaw = self._pid_yaw.update(eyaw, dt)    # °/s
+        # 合成平移速度限幅，斜向别超速
+        speed = math.hypot(vx, vy)
+        if speed > self._max_xy_speed and speed > 1e-6:
+            scale = self._max_xy_speed / speed
+            vx *= scale
+            vy *= scale
+        vyaw = max(-self._max_yaw_speed, min(self._max_yaw_speed, vyaw))
+
+        # 速度 → 位姿领先量。F407 的位置环是纯 P（输出 m/s = Kp × 误差 m）：
+        # 目标领先当前位姿 L 毫米，车就以 Kp·L 的速度走。所以
+        #   L = v / Kp   （mm/s ÷ 1/s = mm）
+        # 直接把 v·dt 当步长会被位置环衰减几十倍（3mm 领先只对应 4.5mm/s）。
+        lead_x = vx / self._pos_kp
+        lead_y = vy / self._pos_kp
+        lead = math.hypot(lead_x, lead_y)
+        if lead > self._max_lead_xy and lead > 1e-6:
+            scale = self._max_lead_xy / lead
+            lead_x *= scale
+            lead_y *= scale
+        lead_yaw = max(-self._max_lead_yaw, min(self._max_lead_yaw,
+                                               vyaw / self._heading_kp))
+        # 车体系 → 里程计系
         ox, oy, oyaw = self._odom
         c, s = math.cos(oyaw), math.sin(oyaw)
-        tx = ox + (cx_mm * c - cy_mm * s) / 1000.0
-        ty = oy + (cx_mm * s + cy_mm * c) / 1000.0
-        tyaw = oyaw + math.radians(cyaw)
-        self._publish_pose(tx, ty, tyaw)
+        tx = ox + (lead_x * c - lead_y * s) / 1000.0
+        ty = oy + (lead_x * s + lead_y * c) / 1000.0
+        tyaw = oyaw + math.radians(lead_yaw)
+        # 这一拍的目标；_tick 末尾的 hold 逻辑会把它按 20Hz 重发，F407 的目标
+        # 约 100ms 过期，所以必须持续发。
         self._hold_pose = (tx, ty, tyaw)
-        self._last_step_t = now
 
     def _publish_pose(self, x: float, y: float, yaw: float):
         p = Pose2D()
@@ -412,7 +648,8 @@ class RingFixNode(Node):
         else:
             line2 = 'corr: -- (waiting for stable observation)'
         line3 = f'hold: {self._hold_frames}/{self._hold_need}  left: {remain:.0f}s'
-        for i, text in enumerate((line1, line2, line3)):
+        line4 = 'blue cross = REF center (aim here); green/yellow = detected rings'
+        for i, text in enumerate((line1, line2, line3, line4)):
             y = 30 + i * 26
             cv2.rectangle(vis, (4, y - 20), (640, y + 6), (0, 0, 0), -1)
             cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,

@@ -13,7 +13,10 @@
       · 按 field.json 的尺寸画出场地（灰色车道、淡黄禁行块、5×5 格）；
       · 接 D6 雷达串口（或模拟雷达）扫几圈，把回波打到地图上；
       · 自动识别圆柱/未知障碍，把占住的 450mm 格标红；
-      · 鼠标点地图上的任意位置 → A* 规划绕开障碍的路径（只规划，不下发）。
+      · 鼠标点地图上的任意位置 → A* 规划绕开障碍的路径（只规划，不下发）；
+      · 旋转扫描（④）：车体两侧被挡、只看得见车头一个扇区时，让车原地转
+        90°，边转边把每帧点云按当拍车头角放回场地系 —— 覆盖率从 50~68%
+        补到 100%（视野 90°/120° 时）。几何推导和实测覆盖率见 spin_scan.py。
 
   【节点动作序列】整场比赛的 9 个点：每到一个点要做什么，都在这里编辑。
       点的位置来自 field.json 的 mission.route（START → 扫码 → 原料 → … → START，
@@ -93,11 +96,14 @@ import math
 import re
 import os
 import queue
+import threading
+import time
 from collections import deque
 
 import rclpy
 from rclpy.node import Node
 from car_interfaces.msg import Pose2D
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray, String
 
@@ -106,6 +112,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import lidar_d6
 import mapping
+import spin_scan
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "field.json")
@@ -227,6 +234,17 @@ COMMAND_TYPES = {
         'params': 'number',
         'hint': '载物盘转到第 N 个料位（1~3）。角度在 vehicle.yaml 的 tray_slotN_deg 实测填写'
     },
+    'spin_scan': {
+        'params': 'deg[,speed_dps]',
+        'speed': True,          # 编辑器里额外给一个「转速」输入框
+        'hint': '旋转扫描：原地慢速转 deg 度（正=逆时针/左转，负=顺时针/右转），'
+                '边转边让雷达攒点云，转完自动停、地图冻结。'
+                '转速填右边的框；留空 = vehicle.yaml 的 spin_scan_speed_dps（30°/s）。'
+                '建议 15~45：越快越省时间，但 3m 外点云会拖成扇形（60°/s 时约 65mm）。'
+                '⚠ 车体两侧被挡住只能看车头一个扇区时用它补盲：'
+                '从启停区1 看全场张角约 118°，30°/s×3s=90° 就够。'
+                '⚠ 车必须先 enable，且原地转的外接圆要留够（300mm 车体 ≈ 212mm）'
+    },
 }
 
 
@@ -321,6 +339,11 @@ def cmd_to_text(cmd: dict) -> str:
         return text
     if name == 'tray_slot':
         return f"载物盘转到料位 {cmd.get('number', '?')}"
+    if name == 'spin_scan':
+        text = f"旋转扫描 {float(cmd.get('deg', 0) or 0):+.0f}°"
+        if cmd.get('speed_dps') is not None:
+            text += f" @ {float(cmd['speed_dps']):.0f}°/s"
+        return text + "（边转边扫）"
     return str(cmd)
 
 
@@ -420,6 +443,17 @@ def build_cmd(name: str, params_str: str) -> dict:
 
     if name == 'tray_slot':
         return {'cmd': name, 'number': parts[0] if parts else ''}
+
+    if name == 'spin_scan':
+        # deg 正=逆时针（和 turn 同一个约定）；speed_dps 可选，覆盖
+        # vehicle.yaml 的 spin_scan_speed_dps。
+        cmd = {'cmd': name, 'deg': float(parts[0]) if parts else 90.0}
+        if len(parts) > 1:
+            try:
+                cmd['speed_dps'] = float(parts[1])
+            except ValueError:
+                pass
+        return cmd
 
     if name in ('pick', 'place'):
         vals = [float(p) for p in parts] + [0.0] * 7
@@ -535,6 +569,11 @@ class GuiRosNode(Node):
         self.pub_stop = self.create_publisher(Bool, '/motion_stop', 10)
         self.pub_tune = self.create_publisher(Float32MultiArray, '/cmd_tune', 10)
         self.pub_enable = self.create_publisher(Bool, '/cmd_enable', 10)
+        # 底盘速度直通（旋转扫描用：原地转时只发 wz）
+        self.pub_vel = self.create_publisher(Twist, '/cmd_vel', 10)
+        # 绝对位姿（旋转扫描收尾用：把车头钉在精确角度上，抵消 F407
+        # "Wz 积分目标比实测超前"造成的过冲）
+        self.pub_pose = self.create_publisher(Pose2D, '/cmd_pose', 10)
         # 云台标定：置零 / 限位 / 松轴（和树莓派状态屏共用同一套话题）
         self.pub_gimbal_zero = self.create_publisher(Int32, '/cmd_gimbal_zero', 10)
         self.pub_gimbal_limit = self.create_publisher(Float32MultiArray, '/cmd_gimbal_limit', 10)
@@ -543,6 +582,9 @@ class GuiRosNode(Node):
         self.pub_servo = self.create_publisher(Float32MultiArray, '/cmd_servo', 10)
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
         self.create_subscription(String, '/motion_state', self._cb_state, 10)
+        # 动作序列里的 spin_scan：motion_planner 广播 start/done，
+        # 上位机收到就开始/结束攒雷达点云（雷达只有上位机这一个读者）。
+        self.create_subscription(String, '/spin_scan', self._cb_spin_scan, 10)
         self.create_subscription(Int32MultiArray, '/robot_status', self._cb_status, 10)
         # PID 波形用的"目标值"：
         #   /cmd_pose   motion_planner 下发的目标位姿
@@ -574,6 +616,7 @@ class GuiRosNode(Node):
         self.tune_ack = {}          # 参数编号 -> 407 回显的生效值
         self.odom_shift = None      # 待处理的里程计坐标系平移 (t_x, t_y, t_yaw)
         self.task_raw = ''          # 当前任务码（未扫到为空串）
+        self.spin_scan_msg = None   # /spin_scan 事件（'start'/'done'），App 消费后清空
         self.task_code = None       # 解析结果 dict（batch1_colors 等）
 
     def _cb_odom(self, msg: Odometry):
@@ -587,6 +630,10 @@ class GuiRosNode(Node):
 
     def _cb_state(self, msg: String):
         self.motion_state = msg.data
+
+    def _cb_spin_scan(self, msg: String):
+        """/spin_scan：motion_planner 的旋转扫描动作开始/结束。"""
+        self.spin_scan_msg = str(msg.data or '').strip().lower()
 
     def _cb_status(self, msg: Int32MultiArray):
         if len(msg.data) >= 3:
@@ -652,6 +699,32 @@ class GuiRosNode(Node):
 
     def send_enable(self, en: bool):
         self.pub_enable.publish(Bool(data=bool(en)))
+
+    def send_vel(self, vx: float = 0.0, vy: float = 0.0, wz_rad: float = 0.0):
+        """直接发底盘速度（m/s、m/s、rad/s）。旋转扫描用它让车原地转。
+
+        注意：PI_CMD_VEL 会清掉 F407 里的位姿目标（PosTarget.Valid），
+        所以旋转扫描必须等动作序列停着的时候跑，别和 /cmd_pose 抢。
+        """
+        t = Twist()
+        t.linear.x = float(vx)
+        t.linear.y = float(vy)
+        t.angular.z = float(wz_rad)
+        self.pub_vel.publish(t)
+
+    def send_pose(self, x_m: float, y_m: float, theta_rad: float):
+        """发绝对位姿（米/米/弧度，F407 里程计系）。
+
+        旋转扫描收尾用：VEL 只能给角速度，F407 把 Wz 积分成航向目标，实测 yaw
+        比目标滞后 ω/head_kp；停 VEL 后车还会追着那个超前目标转过去。发一帧
+        POSE 把航向目标直接设成目标角度，车才停在设定值上。
+        注意顺序：先发 VEL 0 清掉残留 wz（VEL 会清 PosTarget.Valid），再发 POSE。
+        """
+        p = Pose2D()
+        p.x = float(x_m)
+        p.y = float(y_m)
+        p.theta = float(theta_rad)
+        self.pub_pose.publish(p)
 
     def send_gimbal_zero(self, mask: int = 0x07):
         """把云台三轴当前位置定义成 0 点（电机掉电不保存位置）。"""
@@ -731,6 +804,34 @@ class App:
         self.scanning = False
         self.scan_revs_done = 0
         self.scan_target_revs = int(self.cfg["scan"]["revolutions"])
+
+        # ---------- 旋转扫描（车原地转 + 雷达边转边扫） ----------
+        # 车不动时只能用"雷达安装位姿"这一个静态偏移，转到别的朝向就全错；
+        # 旋转扫描改成每帧取一次车头角，把点云按当拍位姿放回场地系，
+        # 几何换算全在 spin_scan.py（有自测：python3 spin_scan.py）。
+        sp = self.cfg["scan"].get("spin", {}) or {}
+        self.spinning = False
+        self.spin = None            # spin_scan.SpinScan 实例
+        self.spin_t0 = 0.0          # 上一拍的时刻（算 dt / 超时）
+        self.spin_max_s = 0.0       # 整段扫描的兜底超时
+        self.spin_last_yaw = None
+        self.spin_speed = float(sp.get("speed_dps", spin_scan.DEFAULT_SPEED_DPS))
+        self.spin_target = float(sp.get("target_deg", spin_scan.DEFAULT_TARGET_DEG))
+        self.spin_sign = float(sp.get("sign", spin_scan.SIGN_AUTO))
+        self.spin_abs = None        # 目标雷达绝对朝向°；None = 按"总转角"转
+        self.spin_target_field = None  # 车头最终场地朝向°（收尾 POSE 用）
+        self.spin_passive = False   # True = 车由 motion_planner 的 spin_scan 动作转
+        # 动作序列触发的那次扫描结束后，断开雷达串口（D6 停转电机、释放 ttyUSB0）。
+        # 手动按【④】不关：调参要反复扫，每扫一次都重连太烦。
+        self.spin_close_after = bool(sp.get("close_after_action", True))
+        self.lidar_fov = float(sp.get("fov_deg", spin_scan.DEFAULT_FOV_DEG))
+        # 雷达相对车体的安装偏置（车体系：车头 +x、车左 +y，mm / 度）
+        mr = (self.cfg.get("lidar", {}) or {}).get("mount_rel", {}) or {}
+        self.lidar_dx = float(mr.get("dx_mm", 0.0))
+        self.lidar_dy = float(mr.get("dy_mm", 0.0))
+        self.lidar_dyaw = float(mr.get("yaw_deg", 0.0))
+        self.lidar_on_car = bool((self.cfg.get("lidar", {}) or {}).get("on_car", True))
+
         self._last_hover = None
         self._last_odom = None
         self._need_redraw = True
@@ -885,8 +986,14 @@ class App:
         hint = ttk.Label(parent, text='', foreground='gray', wraplength=width * 7)
 
         def on_type(name):
+            cmd_type.set(name)          # 程序里直接调 on_type 时也保证类型同步
             hint.config(text=f"参数：{COMMAND_TYPES[name]['params']}  —  "
                              f"{COMMAND_TYPES[name]['hint']}")
+            # 转速只对 spin_scan 有意义：插在 hint（参数提示）之前，别挤到按钮行下面
+            if COMMAND_TYPES[name].get('speed'):
+                spinrow.pack(fill=tk.X, pady=1, before=hint)
+            else:
+                spinrow.pack_forget()
 
         cmd_type = tk.StringVar(value='move')
         menu = ttk.OptionMenu(addrow, cmd_type, 'move', *COMMAND_TYPES.keys(),
@@ -895,6 +1002,16 @@ class App:
         menu.pack(side=tk.LEFT)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         hint.pack(anchor='w')
+
+        # 转速行（选 spin_scan 时才出现）：留空就交给 planner 用默认值，
+        # 填了就写进指令的 speed_dps，跟着这条动作走、导出 JSON 也带着。
+        spinrow = ttk.Frame(parent)
+        ttk.Label(spinrow, text='转速 °/s').pack(side=tk.LEFT)
+        spin_entry = ttk.Entry(spinrow, width=7)
+        spin_entry.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(spinrow, foreground='gray',
+                  text='留空 = 默认 30｜建议 15~45').pack(side=tk.LEFT)
+
         on_type('move')
 
         def add():
@@ -903,6 +1020,22 @@ class App:
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror('参数错误', f'参数解析失败：{e}')
                 return
+            # spin_scan 的转速框：填了就写进 speed_dps（覆盖参数里的第 2 个值）
+            if cmd.get('cmd') == 'spin_scan':
+                txt = spin_entry.get().strip()
+                if txt:
+                    try:
+                        sp = float(txt)
+                    except ValueError:
+                        messagebox.showerror('参数错误', f'转速要填数字：{txt!r}')
+                        return
+                    if not (5.0 <= sp <= 90.0):
+                        messagebox.showerror(
+                            '参数错误',
+                            f'转速 {sp:g} 超出范围（planner 限制 5~90，'
+                            f'建议 15~45；再快远处点云会拖成扇形）')
+                        return
+                    cmd['speed_dps'] = sp
             cmds = get_cmds()
             cmds.append(cmd)
             listbox.insert(tk.END, cmd_to_text(cmd))
@@ -1003,7 +1136,9 @@ class App:
         ttk.Button(editrow, text='清空', command=clear).pack(side=tk.LEFT, padx=2)
         ttk.Label(editrow, text='双击动作可改参数', foreground='gray').pack(
             side=tk.RIGHT, padx=4)
-        return {'type': cmd_type, 'entry': entry, 'hint': hint}
+        return {'type': cmd_type, 'entry': entry, 'hint': hint,
+                'spin_entry': spin_entry, 'spin_row': spinrow,
+                'on_type': on_type, 'add': add}
 
     # ---------- 双击编辑单条动作 ----------
 
@@ -1042,9 +1177,12 @@ class App:
 
         entries = {}
         r = 1
-        for key, val in cmd.items():
-            if key == 'cmd':
-                continue
+        items = [(k, v) for k, v in cmd.items() if k != 'cmd']
+        # spin_scan 没填过转速时也给它留一行：留空 = 用 planner 的默认值，
+        # 填数字就写进 speed_dps（否则这条动作永远调不了速）。
+        if name == 'spin_scan' and not any(k == 'speed_dps' for k, _ in items):
+            items.append(('speed_dps', None))
+        for key, val in items:
             ttk.Label(win, text=key).grid(row=r, column=0, sticky='e',
                                           padx=(8, 4), pady=2)
             var = tk.StringVar(value=self._val_to_str(val))
@@ -1055,6 +1193,12 @@ class App:
                 e.focus_set()
                 e.select_range(0, tk.END)
             r += 1
+        if name == 'spin_scan':
+            ttk.Label(win, foreground='gray', justify='left',
+                      text='speed_dps 留空 = 用 vehicle.yaml 的 spin_scan_speed_dps'
+                           '（30°/s），建议 15~45').grid(
+                row=r, column=0, columnspan=2, sticky='w', padx=8)
+            r += 1
         if not entries:
             ttk.Label(win, text='（这条动作没有参数）').grid(
                 row=r, column=0, columnspan=2, pady=8)
@@ -1064,7 +1208,16 @@ class App:
             new = {'cmd': name}
             try:
                 for key, (var, old) in entries.items():
-                    new[key] = self._coerce_val(var.get(), old)
+                    txt = var.get().strip()
+                    if old is None and txt == '':
+                        continue        # 留空 = 不加这个字段，交给默认值
+                    new[key] = (float(txt) if old is None
+                                else self._coerce_val(var.get(), old))
+                if 'speed_dps' in new:
+                    sp = float(new['speed_dps'])
+                    if not (5.0 <= sp <= 90.0):
+                        raise ValueError(f'转速 {sp:g} 超出 5~90（建议 15~45）')
+                    new['speed_dps'] = sp
             except Exception as error:  # noqa: BLE001
                 messagebox.showerror('参数错误', f'{error}', parent=win)
                 return
@@ -2151,6 +2304,24 @@ class App:
         ttk.Button(box, text='雷达 = 车起点（雷达装在车上时用）',
                    command=self._mount_from_start).pack(fill=tk.X, pady=(2, 0))
 
+        # ---- 雷达相对车体（旋转扫描用这一组） ----
+        mbox = ttk.LabelFrame(tab, text='雷达相对车体（车体系 mm/°，旋转扫描用）', padding=4)
+        mbox.pack(fill=tk.X, pady=3)
+        self.var_oncar = tk.BooleanVar(value=self.lidar_on_car)
+        ttk.Checkbutton(mbox, text='雷达装在车上（随车转，用下面这组偏置）',
+                        variable=self.var_oncar,
+                        command=self._apply_mount_rel).pack(anchor='w')
+        mf = ttk.Frame(mbox); mf.pack(fill=tk.X)
+        self.ent_mdx = self._grid_entry(mf, 0, 0, 'dx', self.lidar_dx, self._apply_mount_rel)
+        self.ent_mdy = self._grid_entry(mf, 0, 1, 'dy', self.lidar_dy, self._apply_mount_rel)
+        mf2 = ttk.Frame(mbox); mf2.pack(fill=tk.X)
+        self.ent_mdyaw = self._row_entry(mf2, 'yaw_rel(°)', self.lidar_dyaw,
+                                         self._apply_mount_rel)
+        ttk.Label(mbox, foreground='#6b6b6b', justify='left', wraplength=330, text=(
+            'dx 向车头、dy 向车左（mm）。雷达 0° 朝车头 → yaw_rel=0、dx≈+150（车长一半）；'
+            '装车尾就是 yaw_rel=180、dx≈-150。雷达装车上时，上面那组场地 x/y/yaw 不参与换算。')
+        ).pack(anchor='w', pady=(2, 0))
+
         # ---- 车起点 / 里程计原点 ----
         box = ttk.LabelFrame(tab, text='车起点（场地系 mm/°，安装参数）', padding=4)
         box.pack(fill=tk.X, pady=3)
@@ -2185,6 +2356,68 @@ class App:
                    command=self.plan_to_goal).pack(fill=tk.X, pady=1)
         ttk.Button(box, text='清空点云', command=self.clear_scan).pack(fill=tk.X, pady=1)
         ttk.Button(box, text='保存场地参数', command=self.save_cfg).pack(fill=tk.X, pady=1)
+
+        # ---- 旋转扫描：车原地转，雷达边转边扫 ----
+        span = ttk.LabelFrame(tab, text='旋转扫描（车原地转，雷达边转边扫）', padding=4)
+        span.pack(fill=tk.X, pady=3)
+        ttk.Label(span, justify='left', text=(
+            '车体两侧被挡住，静止时只能看到车头一个扇区。转车把这个扇区\n'
+            '搬到别的朝向，拼起来才覆盖全场。需先标定车起点、车要能原地转。')
+        ).pack(anchor='w')
+
+        srow = ttk.Frame(span)
+        srow.pack(fill=tk.X, pady=(3, 0))
+        ttk.Label(srow, text='角速度°/s').pack(side=tk.LEFT)
+        self.ent_spin_speed = ttk.Entry(srow, width=5)
+        self.ent_spin_speed.insert(0, f'{self.spin_speed:g}')
+        self.ent_spin_speed.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(srow, text='总转角°').pack(side=tk.LEFT)
+        self.ent_spin_target = ttk.Entry(srow, width=5)
+        self.ent_spin_target.insert(0, f'{self.spin_target:g}')
+        self.ent_spin_target.pack(side=tk.LEFT, padx=(2, 6))
+
+        srow2 = ttk.Frame(span)
+        srow2.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(srow2, text='视野°').pack(side=tk.LEFT)
+        self.ent_spin_fov = ttk.Entry(srow2, width=5)
+        self.ent_spin_fov.insert(0, f'{self.lidar_fov:g}')
+        self.ent_spin_fov.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(srow2, text='方向').pack(side=tk.LEFT)
+        self.cb_spin_dir = ttk.Combobox(srow2, width=12, state='readonly',
+                                        values=('自动（朝场心）', '逆时针', '顺时针'))
+        if abs(self.spin_sign) < 0.5:
+            self.cb_spin_dir.set('自动（朝场心）')
+        else:
+            self.cb_spin_dir.set('顺时针' if self.spin_sign < 0 else '逆时针')
+        self.cb_spin_dir.pack(side=tk.LEFT, padx=(2, 0))
+
+        srow3 = ttk.Frame(span)
+        srow3.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(srow3, text='目标雷达朝向°').pack(side=tk.LEFT)
+        self.ent_spin_abs = ttk.Entry(srow3, width=6)
+        self.ent_spin_abs.pack(side=tk.LEFT, padx=(2, 4))
+        ttk.Label(srow3, foreground='#6b6b6b',
+                  text='留空=按转角转；填了就转到这个绝对朝向（如 270=正下）'
+                  ).pack(side=tk.LEFT)
+
+        ttk.Button(span, text='④ 旋转扫描（边转边扫，转完自动停）',
+                   command=self.start_spin_scan).pack(fill=tk.X, pady=(3, 1))
+        ttk.Button(span, text='停止旋转（立刻发 0 速度）',
+                   command=lambda: self.stop_spin_scan('手动停止')
+                   ).pack(fill=tk.X, pady=1)
+        self.var_spin_close = tk.BooleanVar(value=self.spin_close_after)
+        ttk.Checkbutton(span, text='动作扫描结束后断开雷达（D6 停转、释放串口）',
+                        variable=self.var_spin_close,
+                        command=self._apply_spin_close).pack(anchor='w')
+        ttk.Label(span, foreground='#6b6b6b', justify='left', text=(
+            '勾上后，导航/九点任务里每个 ≥60° 的原地转都会拆成'
+            '「走到点 → spin_scan 转过去」。每用一次会清空点云重扫，'
+            '所以只建议开局那一下勾着，跑图中途别开。')
+        ).pack(anchor='w')
+        ttk.Label(span, foreground='#6b6b6b', justify='left', text=(
+            '角速度 ≤45°/s：一圈 100ms，转太快同一帧内车已经转过好几度，\n'
+            '远处点云会拖成扇形。车头角来自 F407 里程计（50Hz），不需要改固件。')
+        ).pack(anchor='w', pady=(2, 0))
 
         # 模拟雷达时手上有抽签位置，就照着实摆；再点一次同一个障碍 = 删掉
         self.var_edit_obs = tk.BooleanVar(value=False)
@@ -2370,6 +2603,29 @@ class App:
         else:
             self._redraw()
 
+    def _apply_mount_rel(self):
+        """雷达相对车体的安装偏置：旋转扫描（车边转边扫）全靠这一组。
+
+        雷达 0° 朝车头 → yaw_rel=0；装车尾朝后 → yaw_rel=180。
+        填错的表现是整张点云绕车拧一个固定角度，而且旋转扫描时拧的角度会跟着
+        车头一起变，看起来像"越转越歪"。
+        """
+        self.lidar_on_car = bool(self.var_oncar.get())
+        self.lidar_dx = self._num(self.ent_mdx, self.lidar_dx)
+        self.lidar_dy = self._num(self.ent_mdy, self.lidar_dy)
+        self.lidar_dyaw = self._num(self.ent_mdyaw, self.lidar_dyaw)
+        self.cfg.setdefault('lidar', {})['on_car'] = self.lidar_on_car
+        self.cfg['lidar']['mount_rel'] = {'dx_mm': self.lidar_dx,
+                                          'dy_mm': self.lidar_dy,
+                                          'yaw_deg': self.lidar_dyaw}
+        if self.raw_points and not self.spinning:
+            self._reproject()
+        self._need_redraw = True
+        self._set_status(
+            f'雷达相对车体：{"装在车上" if self.lidar_on_car else "固定在场边"} '
+            f'dx={self.lidar_dx:g} dy={self.lidar_dy:g} yaw_rel={self.lidar_dyaw:g}°'
+            f'| 雷达轴在场地的方向 = 车头 + {self.lidar_dyaw:g}°')
+
     def _apply_robot_start(self):
         self.robot_start = (self._num(self.ent_rx, self.robot_start[0]),
                             self._num(self.ent_ry, self.robot_start[1]),
@@ -2406,9 +2662,19 @@ class App:
         self._set_status(f'yaw = {(cur + delta) % 360:.0f}°（点云和实景对上了就停）')
 
     def _reproject(self):
-        """改 yaw / 角度方向后，用原始回波立刻重算世界坐标，不用重扫。"""
-        self.points = [(*self.field.lidar_to_world(a, d), i)
-                       for (a, d, i) in self.raw_points]
+        """改 yaw / 角度方向后，用原始回波立刻重算世界坐标，不用重扫。
+
+        雷达装在车上时按"车当前位姿 + 相对偏置"重算（车没动才成立）；
+        固定在场边时仍用场地安装位姿。旋转扫描攒下的点没有逐点位姿，
+        这函数重算不准 —— 调用方（_apply_mount_rel）已经挡掉运行中的情况。
+        """
+        if self.lidar_on_car:
+            lp = self._lidar_pose_field()
+            self.points = [(*spin_scan.point_from_scan(lp, a, d, self.field.angle_sign), i)
+                           for (a, d, i) in self.raw_points]
+        else:
+            self.points = [(*self.field.lidar_to_world(a, d), i)
+                           for (a, d, i) in self.raw_points]
 
     def _apply_white(self):
         """切换"白区能不能走"，重建可通行掩码并重新规划。"""
@@ -2572,7 +2838,27 @@ class App:
     def _on_frame(self, pts, ring):
         # 只在扫描阶段收数据；扫完冻结，避免比赛途中地图一直变。
         if self.scanning:
-            self.lidar_q.put(('frame', (pts, ring)))
+            # 旋转扫描：车头角必须在"这一帧到达时"取一次，不能等到 GUI 排空队列
+            # 再取 —— 那时车已经转过去了，整帧点云会被拧一个角度。
+            pose = None
+            if self.spinning:
+                try:
+                    pose = self._robot_field()
+                except Exception:
+                    pose = None
+            self.lidar_q.put(('frame', (pts, ring, pose)))
+
+    def _lidar_pose_field(self, robot_pose=None):
+        """雷达在场地系的位姿 (x, y, yaw_deg)。
+
+        · 雷达装在车上（默认）：跟着车体位姿 + 安装偏置走，车一转它就转
+        · 雷达固定在场边：始终用 field.json 里的 lidar.x/y/yaw_deg
+        """
+        if not self.lidar_on_car:
+            return (self.field.lidar_x, self.field.lidar_y, self.field.lidar_yaw)
+        rx, ry, ryaw = robot_pose if robot_pose is not None else self._robot_field()
+        return spin_scan.lidar_pose(float(rx), float(ry), float(ryaw),
+                                    self.lidar_dx, self.lidar_dy, self.lidar_dyaw)
 
     def _drain(self):
         got = False
@@ -2584,18 +2870,30 @@ class App:
             if kind == 'log':
                 self._set_status(str(payload))
             elif kind == 'frame':
-                pts, ring = payload
+                if len(payload) >= 3:
+                    pts, ring, pose = payload[0], payload[1], payload[2]
+                else:
+                    pts, ring = payload[0], payload[1]
+                    pose = None
                 if ring and self.scanning:
                     self.scan_revs_done += 1
+                # 旋转扫描的每帧位姿只算一次，别在点的循环里重复算
+                lpose = self._lidar_pose_field(pose) if pose is not None else None
                 for ang, d, inten in pts:
                     if (d < self.cfg['scan']['range_min_mm']
                             or d > self.cfg['scan']['range_max_mm']):
                         continue
                     self.raw_points.append((ang, d, inten))
-                    x, y = self.field.lidar_to_world(ang, d)
+                    if lpose is None:
+                        x, y = self.field.lidar_to_world(ang, d)
+                    else:
+                        x, y = spin_scan.point_from_scan(
+                            lpose, ang, d, self.field.angle_sign)
                     self.points.append((x, y, inten))
                 got = True
-                if self.scanning and self.scan_revs_done >= self.scan_target_revs:
+                # 圈数到了就冻结；旋转扫描走自己的完成判据（按角度，不按圈数）
+                if (self.scanning and not self.spinning
+                        and self.scan_revs_done >= self.scan_target_revs):
                     self._finish_scan()
         return got
 
@@ -2620,6 +2918,318 @@ class App:
         self.scanning = False
         self._set_status(f'扫描完成：{len(self.points)} 个回波点，开始识别')
         self.detect()
+
+    # ==================== 旋转扫描（车原地转 + 边转边扫） ====================
+
+    def _apply_spin_close(self):
+        """勾/取消「动作扫描结束后断开雷达」。"""
+        self.spin_close_after = bool(self.var_spin_close.get())
+        self.cfg.setdefault('scan', {}).setdefault('spin', {})[
+            'close_after_action'] = self.spin_close_after
+        self._set_status(
+            '动作扫描结束后：断开雷达（省电、释放串口）' if self.spin_close_after
+            else '动作扫描结束后：雷达保持连接（只是不再攒点）')
+
+    def _read_spin_params(self):
+        """把界面上的三个数字读回来（非法输入就退回原值，不让界面崩）。"""
+        def _num(entry, lo, hi, cur):
+            try:
+                v = float(entry.get())
+            except (ValueError, tk.TclError):
+                return cur
+            return max(lo, min(hi, v))
+
+        self.spin_speed = _num(self.ent_spin_speed, 5.0, 45.0, self.spin_speed)
+        self.spin_target = _num(self.ent_spin_target, 10.0, 720.0, self.spin_target)
+        self.lidar_fov = _num(self.ent_spin_fov, 20.0, 359.0, self.lidar_fov)
+        txt = str(self.cb_spin_dir.get())
+        if txt.startswith('自动'):
+            self.spin_sign = spin_scan.SIGN_AUTO
+        else:
+            self.spin_sign = -1.0 if txt.startswith('顺') else 1.0
+
+        # 目标绝对朝向：留空 = 按"总转角"转；填了就按最短弧转到那个方向
+        try:
+            t = str(self.ent_spin_abs.get()).strip()
+            self.spin_abs = spin_scan.wrap_deg(float(t)) if t else None
+        except (ValueError, tk.TclError):
+            self.spin_abs = None
+        # 回写一次，让被夹到范围内的值显示出来（比如填 200 会被压到 45）
+        for ent, v in ((self.ent_spin_speed, self.spin_speed),
+                       (self.ent_spin_target, self.spin_target),
+                       (self.ent_spin_fov, self.lidar_fov)):
+            try:
+                ent.delete(0, tk.END)
+                ent.insert(0, f'{v:g}')
+            except tk.TclError:
+                pass
+        # 顺手记进配置，点【保存场地参数】就一起存盘（下次开界面自动带上）
+        try:
+            self.cfg.setdefault('scan', {})['spin'] = {
+                'speed_dps': self.spin_speed,
+                'target_deg': self.spin_target,
+                'sign': self.spin_sign,
+                'fov_deg': self.lidar_fov,
+            }
+            self.cfg.setdefault('lidar', {})['on_car'] = self.lidar_on_car
+            self.cfg['lidar']['mount_rel'] = {
+                'dx_mm': self.lidar_dx,
+                'dy_mm': self.lidar_dy,
+                'yaw_deg': self.lidar_dyaw,
+            }
+        except Exception:
+            pass
+
+    def start_spin_scan(self, passive: bool = False):
+        """车原地转、雷达边走边扫，把车头看不到的方位补上。
+
+        两种来源：
+          · 地图页【④ 旋转扫描】→ 本函数自己发 /cmd_vel，带顶墙检查；
+          · 动作序列里的 spin_scan 指令 → passive=True，车由 motion_planner 转，
+            这边只攒点云（见 _on_spin_scan_event）。此时不检查墙、不发速度。
+
+        为什么必须转：车体两侧（立柱/机械臂）跟着车一起转，静止时那个扇区
+        永远只指向一个方向。转车 = 把这个可见扇区搬到别的朝向，在场地系里
+        拼起来才能覆盖全场。几何细节见 spin_scan.py 开头的推导。
+        """
+        if passive:
+            self._start_spin_passive()
+            return
+        if self.spinning:
+            self.stop_spin_scan('手动停止')
+            return
+        if self.lidar is None:
+            messagebox.showinfo('先连雷达', '先点【连接并开始】（没硬件就勾模拟雷达）')
+            return
+        if self.node.odom is None:
+            messagebox.showinfo('没有里程计',
+                                '旋转扫描靠车头角把点云放回场地系，现在没收到 /odom。\n'
+                                '确认串口/BLE 连着、F407 上电、心跳正常。')
+            return
+        if self.odom_start[2] is None:
+            messagebox.showinfo('先标定车起点',
+                                '需要先告诉程序"车现在在场地哪儿"，否则旋转后的点云没有参照。\n'
+                                '把车摆到启停区，等界面自动锁存起点（或手动点【车起点 = 当前位姿】）再试。')
+            return
+
+        self._read_spin_params()
+        rx, ry, yaw0 = self._robot_field()
+        yaw0 = float(yaw0)
+        lp = self._lidar_pose_field()
+        cur_lidar_yaw = float(lp[2])
+
+        # 目标：给了绝对朝向就按最短弧算（正左 180° → 正下 270° 是 +90°），
+        # 否则按"总转角"，方向为自动时朝场心。
+        target_deg = self.spin_target
+        sign = self.spin_sign
+        if self.spin_abs is not None:
+            sign, target_deg = spin_scan.abs_delta(cur_lidar_yaw, self.spin_abs)
+            if target_deg < 0.5:
+                messagebox.showinfo(
+                    '已经在那了',
+                    f'雷达现在就是 {cur_lidar_yaw:+.0f}°，和目标一致，不用转。')
+                return
+        elif sign == spin_scan.SIGN_AUTO:
+            sign = spin_scan.prefer_sign(lp[0], lp[1], lp[2])
+
+        # 顶墙检查：原地转扫过的是外接圆（300mm 车体 → 212mm），
+        # 启停区里车中心离墙只有 150mm，直接转会把车头顶到墙上（电机堵转/丢步）。
+        need = spin_scan.sweep_radius(self.robot_size)
+        have = spin_scan.clearance_mm(self.field.hw, self.field.hh, rx, ry)
+        if have < need + 20.0:
+            if not messagebox.askyesno(
+                    '会顶墙',
+                    f'车中心离最近的墙只有 {have:.0f}mm，原地转一圈要扫过 '
+                    f'{need:.0f}mm（车体 {self.robot_size:.0f}mm 的外接圆），'
+                    f'还差 {need + 20.0 - have:.0f}mm。\n\n'
+                    f'在启停区里直接把车转 90° 会顶墙：车拐角顶墙、电机堵转，'
+                    f'转不到位还白扫一遍。\n'
+                    f'先用车把车往场内开一段，让离墙 ≥ {need + 40.0:.0f}mm 再转。\n\n'
+                    f'仍要继续吗？（模拟雷达时随便）'):
+                return
+
+        # 收尾用的绝对目标：车头最终场地朝向。SpinScan 判到位后先发 VEL 0，
+        # 再发一帧 POSE 到这个角度 —— F407 的 Wz 积分目标总是比实测超前
+        # ω/head_kp（45°/s 时约 19°），只发 0 会停过头。
+        self.spin_target_field = wrap_deg(yaw0 + sign * target_deg)
+
+        self.spin = spin_scan.SpinScan(self.spin_speed, target_deg, sign)
+        self.spin.start(yaw0)
+
+        # 清点云：旋转扫描是从零开始拼一张图，混着旧点分不清哪张是哪张
+        self.points = []
+        self.raw_points = []
+        self.obstacles = []
+        self.blocked_cells = set()
+        self.plan = None
+        self.lst.delete(0, tk.END)
+
+        self.spinning = True
+        self.scanning = True
+        self.scan_revs_done = 0
+        now = time.monotonic()
+        self.spin_t0 = now
+        # 兜底超时：正常只要 target/speed 秒，给 3 倍 + 6s 的余量
+        self.spin_deadline = now + (self.spin_target / max(self.spin_speed, 1.0)
+                                    * 3.0 + 6.0)
+
+        # 使能 + 先发一帧 0 速度，确认链路活着（F407 收到 0 不会动）
+        self.node.send_enable(True)
+        self.node.send_vel(0.0, 0.0, 0.0)
+        self._set_status(
+            f'旋转扫描开始：{self.spin.summary()}，视野 {self.lidar_fov:.0f}°，'
+            + (f'雷达 {cur_lidar_yaw:+.0f}° → {self.spin_abs:+.0f}°'
+               if self.spin_abs is not None else f'车头 {yaw0:+.0f}°')
+            + '（车原地转，别站雷达视野里）')
+        self._need_redraw = True
+
+    def _start_spin_passive(self):
+        """动作序列里的 spin_scan：车由 motion_planner 转，这里只负责攒点云。
+
+        不建 SpinScan、不发 /cmd_vel、不做顶墙检查 —— 车在哪、会不会撞是规划
+        的事；这里只做"按当拍车头角把回波放到场地系 + 结束时冻结"。
+        """
+        if self.lidar is None:
+            self._set_status('序列里有旋转扫描：雷达没连，这一步只转不扫')
+            return
+        if self.spinning and not self.spin_passive:
+            # 手动按钮正在转，序列又要转：先把手动那段停掉并发 0 速度，
+            # 否则两路 /cmd_vel 打架，最后谁停谁赢都说不准。
+            self.stop_spin_scan('被动作序列接管')
+        if self.node.odom is None:
+            # 没有里程计就真的没法落点（不知道车头朝哪），只能干转
+            self._set_status('序列里有旋转扫描：没收到 /odom，只转不扫')
+            return
+        if self.odom_start[2] is None:
+            # 没标定车起点也能扫：_robot_field() 会按"车还在起点"算。
+            # 台架/原地测试够用；跑图之前记得标定，否则整张图会整体偏。
+            self._set_status(
+                '未标定车起点：旋转扫描按"车在起点"落位（原地测试可以，跑图前要标定）')
+        self.points = []
+        self.raw_points = []
+        self.obstacles = []
+        self.blocked_cells = set()
+        self.plan = None
+        self.lst.delete(0, tk.END)
+        self.spin_passive = True
+        self.spinning = True
+        self.scanning = True
+        self.scan_revs_done = 0
+        self._set_status('旋转扫描（动作序列）：边转边攒点云，转完自动冻结…')
+        self._need_redraw = True
+
+    def _on_spin_scan_event(self, ev: str):
+        """motion_planner 的 /spin_scan 广播：start=开始攒点，done=收工冻结。"""
+        if ev == 'start':
+            self.start_spin_scan(passive=True)
+        elif ev == 'done':
+            if not self.spin_passive:
+                return
+            self.spin_passive = False
+            self.spinning = False
+            self.scanning = False
+            if len(self.points) >= 3:
+                self._finish_scan()
+            else:
+                self._set_status('旋转扫描（动作序列）结束：点太少，不识别')
+            # 开局那一次扫完就断开雷达：D6 停转、释放 ttyUSB0，后面整场都不再扫。
+            # 点云已经落在 self.points 里，关雷达不影响已建好的地图和后续规划。
+            if self.spin_close_after and self.lidar is not None:
+                self.stop_lidar()
+                self._set_status(
+                    f'旋转扫描完成并已断开雷达（{len(self.points)} 点）；'
+                    f'本场不再扫描，需要重扫请点【连接并开始】')
+
+    def stop_spin_scan(self, reason: str = '已停止'):
+        was = self.spinning
+        passive = self.spin_passive
+        self.spinning = False
+        self.spin_passive = False
+        if self.spin is not None:
+            self.spin.done = True
+        if passive:
+            # 车是 motion_planner 在转，本地发 0 速度下一拍就被覆盖，
+            # 必须叫停状态机（只发 /motion_stop，不顺手失能整车）。
+            try:
+                self.node.pub_stop.publish(Bool(data=True))
+            except Exception:
+                pass
+        else:
+            try:
+                self.node.send_vel(0.0, 0.0, 0.0)
+            except Exception:
+                pass
+        self.scanning = False
+        self.spin_target_field = None
+        if was:
+            tail = '（已叫停动作序列）' if passive else ''
+            self._set_status(f'旋转扫描{reason}：收了 {len(self.points)} 个点{tail}')
+        self._need_redraw = True
+
+    def _send_spin_final_pose(self):
+        """把车头钉到 spin_target_field（场地系）对应的里程计绝对朝向。
+
+        必须在这之前先发过一帧 VEL 0：VEL 帧会清掉 F407 的 PosTarget.Valid，
+        先 POSE 后 VEL 等于白发。没标定车起点时不发（没有场地↔里程计换算）。
+        """
+        if self.spin_target_field is None:
+            return False
+        if self.odom_start[2] is None or self.node.odom is None:
+            return False
+        try:
+            fx, fy, _ = self._robot_field()
+            ox, oy, oth = self._field_to_odom(fx, fy, self.spin_target_field)
+        except Exception:  # noqa: BLE001
+            return False
+        self.node.send_pose(ox, oy, oth)
+        return True
+
+    def _spin_tick(self):
+        """10Hz 推进（由 _refresh 调）：算角度、发 wz、判完成。"""
+        if self.spin_passive:
+            return          # 动作序列模式：车由 motion_planner 转，这里不动手
+        if not self.spinning or self.spin is None:
+            return
+        now = time.monotonic()
+        dt = now - self.spin_t0
+        self.spin_t0 = now
+        if dt <= 0.0:
+            return
+
+        try:
+            yaw = float(self._robot_field()[2])
+        except Exception:
+            return
+        wz_dps, done = self.spin.update(yaw, dt)
+
+        # 卡死保护：1.5s 一点没转就停（IMU 离线时 F407 的航向环不工作，
+        # 或者车没使能、被 /cmd_pose 抢了控制权 —— 这时继续发速度只会一直转圈）
+        if self.spin.stall_s > 1.5:
+            self.stop_spin_scan('中止：车没有转动（IMU 离线 / 未使能 / 被位姿指令占用）')
+            return
+        if now > self.spin_deadline:
+            self.stop_spin_scan('超时中止')
+            return
+
+        if done:
+            self.scanning = False
+            self.spinning = False
+            self.node.send_vel(0.0, 0.0, 0.0)
+            # 只用 VEL 停会过冲：F407 内部航向目标比实测超前 ω/head_kp。
+            # 补一帧 POSE 把目标钉在设定角度上，这里顺便让车滑到准确值。
+            posed = self._send_spin_final_pose()
+            self.spin_target_field = None
+            self._set_status(
+                f'旋转扫描完成：{self.spin.summary()}，{len(self.points)} 个点，开始识别'
+                + ('（POS 精确收尾）' if posed else ''))
+            self._finish_scan()
+            return
+
+        self.node.send_vel(0.0, 0.0, math.radians(wz_dps))
+        self._set_status(
+            f'旋转扫描中：{self.spin.summary()}，剩余 {self.spin.remaining:.0f}° '
+            f'｜车头 {yaw:+.0f}° ｜点 {len(self.points)}')
+
 
     def detect(self):
         if not self.points:
@@ -2979,6 +3589,24 @@ class App:
                          + (f'；不通：{"；".join(bad)}' if bad else ''))
         self._redraw()
 
+    def _node0_spin_deg(self):
+        """节点 1 的动作里 spin_scan 的累计角度（度）。
+
+        发车到格子中心后先执行节点 1 的动作，如果里面有 spin_scan，车头就转过
+        一个角度了；第一段路径必须按"转完之后"的朝向算，否则规划会多补一次转身。
+        """
+        if not self.nodes:
+            return 0.0
+        total = 0.0
+        for act in (self.nodes[0].get('actions') or []):
+            if act.get('cmd') != 'spin_scan':
+                continue
+            try:
+                total += float(act.get('deg', 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
     def _append_node_actions(self, cmds, index):
         """把第 index 个节点（0 起）到点后要执行的动作整段拼进指令列表。"""
         if not (0 <= index < len(self.nodes)):
@@ -3073,33 +3701,39 @@ class App:
                         and math.hypot(cur[0] - start_pt[0],
                                        cur[1] - start_pt[1]) <= 150.0)
 
-        self._append_node_actions(cmds, 0)
         if car_at_start:
             gname = self.field.cell_name(*gateway)
             # 发车：横移+直行到格子中心（不转向）
             cmds += self._strafe_move_pair(
                 gateway[0] - cur[0], gateway[1] - cur[1], cur_f[2],
                 f'发车：横移到 {gname} 中心')
+            # 节点 1 的动作放在"发车到格子中心"之后：开局那句 spin_scan 要的是
+            # "先走到 E 中线、再原地转"，放在发车之前就会在启停区角上转（会顶墙）。
+            self._append_node_actions(cmds, 0)
+            # 节点动作里的 spin_scan 会把车头转走，第一段必须按"转完的朝向"算。
+            # 不改的话 DP 还是从出发朝向起算，到 E5 会补一个多余的转身。
+            start_yaw = wrap_deg(cur_f[2] + self._node0_spin_deg())
             # 第一段从格子中心重新规划（绕开外圈矩形线）
             leg0 = self.mission_legs[0]
             res = mapping.plan_path(
                 self.grid, self.mask, self.obstacles,
                 self.grid.w2c(*gateway), self.grid.w2c(*leg0['to_xy']),
                 self.field.robot_radius, cell_block=self._cell_block(),
-                cost_fn=self._cost_fn(), entry_heading_deg=cur_f[2])
+                cost_fn=self._cost_fn(), entry_heading_deg=start_yaw)
             if res['path']:
                 cmds += self._path_commands(
                     res['path_world'],
                     f'1. {leg0["from_name"]} → {leg0["to_name"]}',
-                    start_yaw_deg=cur_f[2],
+                    start_yaw_deg=start_yaw,
                     fixed_yaw_deg=leg0.get('final_yaw'))
             else:
                 cmds += self._path_commands(
                     leg0['path'], f'1. {leg0["from_name"]} → {leg0["to_name"]}',
-                    start_yaw_deg=cur_f[2],
+                    start_yaw_deg=start_yaw,
                     fixed_yaw_deg=leg0.get('final_yaw'))
             begin_i = 1
         else:
+            self._append_node_actions(cmds, 0)
             # 车不在启停区：保持原逻辑（先规划到起点，再按原计划走）
             if math.hypot(cur[0] - start_pt[0], cur[1] - start_pt[1]) > 150.0:
                 res = mapping.plan_path(
@@ -3741,12 +4375,30 @@ class App:
             c.create_text(*_corner(0, -hf - 40), text='车（未接车，按起点画）',
                           fill='#8d8d8d', font=('', 8))
 
-        # 雷达
-        lx, ly = self._w2p(f.lidar_x, f.lidar_y)
+        # 雷达：位置/朝向跟着车走（雷达装在车上时），并画出可见扇区
+        lp = self._lidar_pose_field((fx, fy, fd))
+        lx, ly = self._w2p(lp[0], lp[1])
         c.create_oval(lx - 5, ly - 5, lx + 5, ly + 5, fill=C_LIDAR, outline='')
-        a = math.radians(f.lidar_yaw)
+        a = math.radians(lp[2])
         c.create_line(lx, ly, lx + 34 * math.cos(a), ly - 34 * math.sin(a),
                       fill=C_LIDAR, width=3, arrow=tk.LAST)
+        # 可见扇区：宽度来自【视野°】，画多长只影响观感（不参与识别）
+        if self.lidar_fov > 0 and abs(self.lidar_fov - 360.0) > 0.5:
+            fov = min(359.0, self.lidar_fov)
+            arc = [self._w2p(px, py) for px, py in
+                   spin_scan.sector_points(lp, fov, 900.0, 6.0)]
+            c.create_polygon(*[v for p in arc for v in p], fill='',
+                             outline=C_LIDAR if not self.spinning else '#c62828',
+                             width=1, dash=(3, 3) if not self.spinning else ())
+            # 扇区中心线（雷达 0 度轴）
+            c.create_line(lx, ly, *self._w2p(lp[0] + 500 * math.cos(a),
+                                             lp[1] + 500 * math.sin(a)),
+                          fill=C_LIDAR, width=1)
+            if self.spinning and self.spin is not None:
+                c.create_text(lx + 40, ly - 30, anchor='w', fill='#c62828',
+                              font=('', 9, 'bold'),
+                              text=f'旋转扫描 {self.spin.turned:+.0f}°'
+                                   f' / {self.spin.target:.0f}°')
 
         # 图例 / 比例尺
         c.create_text(10, 10, anchor='nw', fill='#555555',
@@ -3820,6 +4472,13 @@ class App:
 
     def _refresh(self):
         got = self._drain()
+        # 动作序列里的旋转扫描：planner 广播 start/done，这边跟着开/停
+        ev = getattr(self.node, 'spin_scan_msg', None)
+        if ev:
+            self.node.spin_scan_msg = None
+            self._on_spin_scan_event(ev)
+        # 旋转扫描：10Hz 推进（点云由 _drain 按当拍位姿落到场地系）
+        self._spin_tick()
         o = self.node.odom
         if o is not None:
             if (self._last_odom is None
@@ -3967,20 +4626,34 @@ def main():
     root = tk.Tk()
     app = App(root, node)
 
+    # ROS 回调必须独立于 Tk 主循环跑：以前是 root.after(20) 里 spin_once，
+    # 地图上有几千个点时 _redraw 一次要上百毫秒，期间 /odom 回调全被堵住。
+    # 旋转扫描是"按当拍车头角投影点云"，odom 一陈旧，车转得越快整帧点云被
+    # 拧得越多（45°/s 时 100ms = 4.5°，3m 外横向错 235mm），看起来就是拖成
+    # 一条线。放独立线程后 odom 保持 50Hz 实时。
     def spin_ros():
-        rclpy.spin_once(node, timeout_sec=0)
-        root.after(20, spin_ros)
+        try:
+            rclpy.spin(node)
+        except Exception:  # noqa: BLE001  关闭时 rclpy 会抛，直接退出线程
+            pass
+
+    threading.Thread(target=spin_ros, name='ros-spin', daemon=True).start()
 
     def on_close():
         try:
             app.close()
         finally:
-            node.destroy_node()
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()      # 先关 executor，让 spin 线程退出
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                node.destroy_node()
+            except Exception:  # noqa: BLE001
+                pass
             root.destroy()
 
     root.protocol('WM_DELETE_WINDOW', on_close)
-    root.after(20, spin_ros)
     root.mainloop()
 
 
