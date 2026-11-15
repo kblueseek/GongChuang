@@ -212,7 +212,7 @@ class PreviewSim:
             self.i += 1
             return
 
-        if name in ('goto', 'move', 'strafe', 'turn'):
+        if name in ('goto', 'move', 'strafe', 'turn', 'spin_scan'):
             if self.target is None:
                 self.target = self._target_of(cmd)
                 self.wait_yaw = bool(cmd.get('arrive_yaw', True))
@@ -220,7 +220,13 @@ class PreviewSim:
                 self.hold_yaw = self.yaw
                 self.sub = 'move'
                 self._set_state('moving')
+                # spin_scan：和 motion_planner 一样广播 start/done，
+                # 这样预览里上位机也会跟着攒点云（不然看不出"边转边扫"）。
+                if name == 'spin_scan':
+                    self.node._cb_spin_scan(String('start'))
             if self._step_toward(now, dt):
+                if name == 'spin_scan':
+                    self.node._cb_spin_scan(String('done'))
                 self.i += 1
                 self.target = None
             else:
@@ -290,6 +296,11 @@ class PreviewSim:
         if name == 'turn':
             return (self.x, self.y,
                     self.yaw + math.radians(float(cmd.get('deg', 0) or 0)))
+        if name == 'spin_scan':
+            # 位置不变，只转 deg°（正=逆时针）。预览不模拟 30°/s 的慢速，
+            # 用 MAX_W_DEG 转过去就行；真机上慢是因为要让点云不拖尾。
+            return (self.x, self.y,
+                    self.yaw + math.radians(float(cmd.get('deg', 90.0) or 90.0)))
         return (self.x, self.y, self.yaw)
 
     def _step_toward(self, now, dt):

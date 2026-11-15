@@ -3,7 +3,12 @@
     {
       "name": "1. START",
       "route": "START",
-      "actions": []
+      "actions": [
+        {
+          "cmd": "spin_scan",
+          "deg": 90.0
+        }
+      ]
     },
     {
       "name": "2. 扫码区",

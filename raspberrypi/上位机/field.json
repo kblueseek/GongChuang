@@ -111,19 +111,27 @@
   "robot_start": {
     "x": 1050.0,
     "y": 1050.0,
-    "yaw_deg": 180.0
+    "yaw_deg": 180.0,
+    "_注": "车【体】中心位姿，yaw 是车头方向。雷达装在车头且 0° 朝车头 → 车头和雷达同向，所以这里是 180°（正左）。这条要和 lidar.mount_rel 自洽：车头 = 雷达朝向 − yaw_rel"
   },
   "lidar": {
     "port": "/dev/ttyUSB0",
     "baud": 230400,
     "mount": "启停区1",
-    "x": 1050.0,
+    "x": 900.0,
     "y": 1050.0,
     "yaw_deg": 180.0,
     "angle_cw": true,
     "_angle_cw注": "true = 设备角度顺时针为正（D6 官方文档就是这样），程序内部取反后再当数学角用。东西对、南北镜像时勾这个",
     "height_mm": 120,
-    "_注": "mount 只是给人看的标签；x/y/yaw 才是真参数。yaw=225 表示雷达0度朝向场地中心（左下）"
+    "on_car": true,
+    "mount_rel": {
+      "dx_mm": 150.0,
+      "dy_mm": 0.0,
+      "yaw_deg": 0.0,
+      "_注": "雷达装在【车头】：0° 朝车头所以 yaw_rel=0；dx=+150 是车体 300mm 的一半（贴车头前沿），实测改。dx 向车头为正、dy 向车左为正"
+    },
+    "_注": "x/y/yaw 是【雷达自身】在场地系的位姿（车头朝 180° 时，车头前 150mm 那一点就是 (900,1050)）。on_car=true 时这组只在雷达固定在场边、或不随车转的情况下才参与换算；旋转扫描用 mount_rel"
   },
   "cylinder": {
     "diameter_mm": 50,
@@ -138,7 +146,15 @@
     "revolutions": 5,
     "range_min_mm": 120,
     "range_max_mm": 8000,
-    "min_intensity": 0
+    "min_intensity": 0,
+    "spin": {
+      "speed_dps": 30.0,
+      "target_deg": 90.0,
+      "sign": 0.0,
+      "fov_deg": 150.0,
+      "_注": "旋转扫描：speed 太大远处点云会拖成扇形（≤45）；sign 0=按场心自动判方向，±1 手动指定；fov 是雷达实际可见扇区宽度，不知道就先填 150；close_after_action=动作扫描结束后断开雷达。target_deg 只给地图页【④】按钮用，动作序列里的 spin_scan 由指令自带角度",
+      "close_after_action": true
+    }
   },
   "grid": {
     "cell_mm": 20

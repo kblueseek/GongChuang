@@ -32,6 +32,14 @@ motion_planner:
     # 状态栏只报"视觉程序没有返回 JSON"。
     vision_program: 'python3'
     vision_args: '$HOME/GongChuang/raspberrypi/vision/gimbal_track_pick.py --roi-bottom 1.0'
+    # ---- 旋转扫描（动作序列里的 spin_scan 指令）----
+    # 慢速原地转，边转边让上位机攒雷达点云（上位机订阅 /spin_scan 的 start/done）。
+    # 为什么不用 turn 转：turn 走位置环，F407 会全速甩到目标朝向，点云拖成扇形。
+    # 30°/s 时一圈 100ms 内车已转 3°，3m 处横向偏 ~157mm；45°/s 还能接受，
+    # 再快远处就糊了。单条指令写第 2 个参数可覆盖（如：90,40）。
+    spin_scan_speed_dps: 30.0
+    # 到位容差（度）。转够 目标±容差 就停；F407 航向环随后会把车按住。
+    spin_scan_tol_deg: 1.5
     # color_pick 开始跟随前先等物料静止多久（秒）。转盘转到抓取位会停一下 → 0.3；
     # 物料一直在动、或者想尽快出第一条云台指令就设 0（检测到就追，会跟着转）。
     vision_still_time_s: 0.3
