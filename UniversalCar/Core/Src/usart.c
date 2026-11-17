@@ -577,7 +577,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART1)
         uart1_tx_err_cnt++;
     else if (huart->Instance == UART4)
-        PiComm_ErrorCallback();
+    {
+        PiComm_ErrorCallback();     /* LoRa 遥测下行（LORA_DOWNLINK_ENABLE=0 时是空实现） */
+        Ops_ErrorCallback();        /* OPS 里程计：溢出后标记重挂 DMA，否则从此收不到 */
+    }
     else if (huart->Instance == USART2)
     {
         /* 蓝牙上行：溢出（ORE）会让 HAL 中止接收并关掉 RXNEIE。如果只清标志不重新

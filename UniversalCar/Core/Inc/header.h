@@ -40,6 +40,7 @@
 #include "JY901S.h"
 #include "MSPM0imu.h"
 #include "PiComm.h"
+#include "Ops.h"
 #if BLE_CONTROL_ENABLE
 #include "BleControl.h"
 #endif

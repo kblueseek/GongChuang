@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "Ops.h"          /* OPS 里程计：UART4 IDLE 中断入口 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -229,7 +230,9 @@ void USART3_IRQHandler(void)
 void UART4_IRQHandler(void)
 {
   /* USER CODE BEGIN UART4_IRQn 0 */
-
+  /* OPS 里程计：DMA 循环接收 + IDLE 断帧。必须在 HAL 之前处理并清掉 IDLE，
+     HAL_UART_IRQHandler 不认 IDLE 这个中断源。 */
+  Ops_IRQHandler();
   /* USER CODE END UART4_IRQn 0 */
   HAL_UART_IRQHandler(&huart4);
   /* USER CODE BEGIN UART4_IRQn 1 */

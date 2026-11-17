@@ -229,6 +229,26 @@ static void Chassis_OdometryUpdate(void)
 {
     static uint32_t s_OdomTick = 0;
 
+    /* ---- OPS 在线维护：无论用不用它做里程计都要跑 ----
+       这里负责判在线、发上电配置命令、锁存航向对齐；OPS_USE_FOR_ODOMETRY=0
+       时只是不用它的位置，OPS_* 仍然可以在调试器里看，方便和编码器对比精度。 */
+    Ops_Poll(HAL_GetTick());
+
+#if OPS_USE_FOR_ODOMETRY
+    /* ---- 位置来源：OPS 优先，编码器兜底 ----
+       OPS 在线且已完成航向对齐时，世界系位置直接取它的全局 X/Y（精度不随
+       轮子打滑/麦轮侧滑漂）。同时把编码器差分基准刷成当前值：OPS 一旦掉线
+       立刻切回下面那套编码器积分，基准不会是上电时的 0，不会跳变。
+       速度/轮速仍由编码器算（OPS 掉线时照常可用），所以这里只接管 Pos。 */
+    if (Ops_GetPosition(&Chassis.Pos.X, &Chassis.Pos.Y)) {
+        for (int i = 0; i < 4; i++)
+            Chassis.WheelLastCount[i] = Chassis.Wheel[i].Position.RawCount;
+        s_OdomTick = HAL_GetTick();
+        Chassis.OdomReady = 1;
+        return;
+    }
+#endif
+
     /* 首帧：等 4 轮都收到编码器反馈后再初始化差分基准，避免起始跳变 */
     if (!Chassis.OdomReady) {
         for (int i = 0; i < 4; i++)
@@ -366,6 +386,11 @@ void ChassisTask(void const* argument)
     Chassis.OdomReady = 0;
     for (int i = 0; i < 4; i++)
         Chassis.WheelLastCount[i] = 0;
+
+    /* ---- OPS 里程计（UART4，921600）----
+       只改 UART4 的波特率/DMA/中断，再按 OPS_TIMEOUT_MS 判在线；
+       上电配置（100Hz、位置清零、轮径）在 Ops_Poll 里等够 3s 自动发。 */
+    Ops_Init();
 
     Chassis.isEnable = 0;
 

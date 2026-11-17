@@ -625,6 +625,11 @@
               <FilePath>..\ExHardware\PiComm.c</FilePath>
             </File>
             <File>
+              <FileName>Ops.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\ExHardware\Ops.c</FilePath>
+            </File>
+            <File>
               <FileName>Servo.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\ExHardware\Servo.c</FilePath>

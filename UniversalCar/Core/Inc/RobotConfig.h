@@ -165,6 +165,28 @@ enum
 
 #define PI_CMD_TIMEOUT_MS   500     /* 超过此时长收不到指令 → 底盘停车、云台保持 */
 
+/* ==================== OPS 里程计（Odom1_lite，UART4） ==================== */
+/* 接线：OPS TX → PC11(UART4_RX)，OPS RX → PC10(UART4_TX)，必须共地，
+   OPS 用独立 5V。电平按 3.3V 处理。
+   ⚠️ 占用 UART4（原来给 LoRa 下行用），所以 LORA_DOWNLINK_ENABLE 必须为 0；
+      两个同时打开会在 Ops.c 里编译报错。 */
+#define OPS_UART_BAUD          921600   /* OPS 固定 921600 8N1，改不了 */
+#define OPS_USE_FOR_ODOMETRY   1        /* 1=底盘里程计位置改用 OPS；0=回到编码器积分 */
+#define OPS_TIMEOUT_MS         300      /* 这么久没有遥测帧 → 判离线，自动回退编码器 */
+#define OPS_SEND_PERIOD_MS     10       /* 遥测周期：10=100Hz，20=50Hz */
+#define OPS_WHEEL_DIAMETER_MM  48       /* OPS 测量轮直径（40~55），5m 直线实测微调 */
+
+/* 安装方向标定：先看"车往前开 1m"时 OPS 的哪个字段在涨、涨多少。
+   - 涨的是 Y 而不是 X → OPS_SWAP_XY 置 1
+   - 字段数值为负 → 对应 SIGN 改 -1
+   - 原地逆时针转 90°，看 RawYaw 变大还是变小 → 反了就 OPS_YAW_SIGN 改 -1
+   这三个量只影响"OPS 世界系长什么样"，航向对齐（Ops.YawOffsetDeg）会自动
+   把它旋到 IMU 的坐标系里，所以改完不用重新标定别的东西。 */
+#define OPS_SWAP_XY            0
+#define OPS_X_SIGN             (1.0f)
+#define OPS_Y_SIGN             (1.0f)
+#define OPS_YAW_SIGN           (1.0f)
+
 /* 遥测频率（USART6 115200，11.52 字节/ms）：
      里程计 17B × 50Hz ≈ 850B/s
      云台位置 13B × 20Hz ≈ 260B/s

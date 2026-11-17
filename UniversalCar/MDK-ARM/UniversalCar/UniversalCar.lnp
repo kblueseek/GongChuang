@@ -42,6 +42,7 @@
 "universalcar\jy901s.o"
 "universalcar\mspm0imu.o"
 "universalcar\picomm.o"
+"universalcar\ops.o"
 "universalcar\servo.o"
 "universalcar\led.o"
 "universalcar\zdtmotor.o"
