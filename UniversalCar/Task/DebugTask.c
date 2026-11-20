@@ -35,7 +35,11 @@ void DebugTask(void const* argument)
         DebugData.Value[10] = BLE_RxByteCount;       // USART2 收到的字节数（0=完全没收到）
 #else
         /* 云台三轴实时角度（°）：实测行程时看这三个通道，手动推到机械限位读刻度 */
+#if GIMBAL_YAW_USE_DM
+        DebugData.Value[6] = Gimbal.YawDM.Motor.Position.Degree;
+#else
         DebugData.Value[6] = Gimbal.Yaw.Motor.Position.Real;
+#endif
         DebugData.Value[7] = Gimbal.Lift.Motor.Position.Real;
         DebugData.Value[8] = Gimbal.Extend.Motor.Position.Real;
         DebugData.Value[9] = 0;

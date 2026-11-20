@@ -85,9 +85,9 @@ motion_planner:
     # 老的角度写法：yaw 进到这么多度内也放行（和 lead_s 任一满足即可）。
     # 0 = 不用角度条件（默认）。
     place_tray_extend_lead_deg: 0.0
-    tray_slot1_deg: 180.0
-    tray_slot2_deg: 92.0
-    tray_slot3_deg: 7.0
+    tray_slot1_deg: 172.0
+    tray_slot2_deg: 96.0
+    tray_slot3_deg: 16.0
     # ---- vision_pick/color_pick 抓取位姿兜底与整体偏移（视觉 JSON 缺字段时用；
     #      offset 加在视觉输出上，机械标定修正不用改视觉程序）----
     pick_default_yaw_deg: 0.0
@@ -95,7 +95,7 @@ motion_planner:
     pick_default_extend_deg: 0.0
     pick_safe_lift_deg: 0.0
     pick_gripper_open_deg: 100.0
-    pick_gripper_close_deg: 173.0
+    pick_gripper_close_deg: 168.0
     pick_settle_ms: 800
     pick_yaw_offset_deg: 0.0
     pick_lift_offset_deg: 0.0

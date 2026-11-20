@@ -61,9 +61,15 @@ static float s_MinDeg[3] = { GIMBAL_YAW_MIN,   GIMBAL_LIFT_MIN,   GIMBAL_EXTEND_
 static float s_MaxDeg[3] = { GIMBAL_YAW_MAX,   GIMBAL_LIFT_MAX,   GIMBAL_EXTEND_MAX };
 
 /* 每轴"速度指令正方向 → 编码器坐标"的符号（见 RobotConfig.h）。
-   限位判断必须在这个坐标里做，否则符号为 -1 的轴会整个反过来。 */
+   限位判断必须在这个坐标里做，否则符号为 -1 的轴会整个反过来。
+   yaw 换了达妙之后，正方向由达妙自己的坐标系决定，所以用 DM_YAW_CMD_SIGN。 */
 static const float s_CmdSign[3] = {
-    GIMBAL_YAW_CMD_SIGN, GIMBAL_LIFT_CMD_SIGN, GIMBAL_EXTEND_CMD_SIGN
+#if GIMBAL_YAW_USE_DM
+    DM_YAW_CMD_SIGN,
+#else
+    GIMBAL_YAW_CMD_SIGN,
+#endif
+    GIMBAL_LIFT_CMD_SIGN, GIMBAL_EXTEND_CMD_SIGN
 };
 
 /* 三轴的顺序固定为 0=Yaw 1=Lift 2=Extend，和 PiCommand.GimbalVel[] 的下标一致 */
@@ -75,6 +81,46 @@ static ZdtMotor_t* const s_Axis[3] = {
 static const uint8_t s_AxisInstalled[3] = {
     GIMBAL_YAW_INSTALLED, 1, 1
 };
+
+/* ============ 轴访问抽象 ============
+   yaw 可能换成达妙 4310（标准帧 MIT），lift/extend 一直是 ZDT（扩展帧）。
+   下面四个函数把两种驱动的差异收在一处，上层的位置环/限位/零点和原来一样，
+   只是把 s_Axis[i] 的直读换成访问器。 */
+static int Axis_IsOnline(uint8_t i)
+{
+#if GIMBAL_YAW_USE_DM
+    if (i == 0)
+        return DMMotor_IsOnline(&Gimbal.YawDM.Motor);
+#endif
+    return ZdtMotor_IsOnline(s_Axis[i]);
+}
+
+static uint32_t Axis_LastOnlineTick(uint8_t i)
+{
+#if GIMBAL_YAW_USE_DM
+    if (i == 0)
+        return Gimbal.YawDM.Motor.LastOnlineTick;
+#endif
+    return s_Axis[i]->LastOnlineTick;
+}
+
+static float Axis_PositionDeg(uint8_t i)
+{
+#if GIMBAL_YAW_USE_DM
+    if (i == 0)
+        return Gimbal.YawDM.Motor.Position.Degree;
+#endif
+    return s_Axis[i]->Position.Real;
+}
+
+static uint8_t Axis_Addr(uint8_t i)
+{
+#if GIMBAL_YAW_USE_DM
+    if (i == 0)
+        return DM_YAW_CAN_ID;
+#endif
+    return s_Axis[i]->Addr;
+}
 
 static uint32_t s_EnableTick   = 0;
 static uint32_t s_FeedbackTick = 0;
@@ -143,23 +189,46 @@ static void Gimbal_SyncLimits(void)
         }
 }
 
+/* yaw 走达妙时的软件加减速状态：当前真正下发的 °/s。
+   MIT 帧没有 acc 字段，速度是阶跃的，这里按 DM_YAW_ACC_DEG_S2 逐步逼近。 */
+#if GIMBAL_YAW_USE_DM
+static float s_YawCmdDps = 0.0f;
+#endif
+
 /* 单轴目标转速写入（带限位）。离线 / 中位未锁存时一律给 0。 */
 static void Gimbal_SetAxisSpeed(uint8_t i, float degPerSec)
 {
     const float stopBand = 5.0f;   /* 离限位多近（°）就强制停 */
 
-    if (!ZdtMotor_IsOnline(s_Axis[i]) || !s_OffsetValid[i]) {
+    if (!Axis_IsOnline(i) || !s_OffsetValid[i]) {
         GimbalTx.Rpm[i] = 0.0f;
+#if GIMBAL_YAW_USE_DM
+        if (i == 0)
+            s_YawCmdDps = 0.0f;
+#endif
         return;
     }
 
-    float rel = s_Axis[i]->Position.Real - s_Offset[i];
+    float rel = Axis_PositionDeg(i) - s_Offset[i];
     /* 先把速度换到编码器坐标：正值 = 让 rel 变大。这样"往里推/往外拉"的判断
        与电机转向设置无关，编码器方向相反的轴（Yaw）也不会把限位判断弄反。 */
     float cmdInEncoder = degPerSec * s_CmdSign[i];
     if ((cmdInEncoder > 0.0f && rel >= s_MaxDeg[i] - stopBand) ||
         (cmdInEncoder < 0.0f && rel <= s_MinDeg[i] + stopBand))
         degPerSec = 0.0f;
+
+#if GIMBAL_YAW_USE_DM
+    /* 梯形曲线的"斜坡段"：ZDT 靠 F6 帧的 acc 字节在驱动器里做，达妙没有，
+       只能在这里把速度按加速度限幅一步步加上去/减下来。 */
+    if (i == 0) {
+        const float step = DM_YAW_ACC_DEG_S2 * (GIMBAL_TASK_UPDATE_TICK * 0.001f);
+        float delta = degPerSec - s_YawCmdDps;
+        if (delta > step)       delta = step;
+        else if (delta < -step) delta = -step;
+        s_YawCmdDps += delta;
+        degPerSec = s_YawCmdDps;
+    }
+#endif
 
     GimbalTx.Rpm[i] = degPerSec / 6.0f;   /* 1 RPM = 6 °/s */
 }
@@ -169,8 +238,17 @@ void Gimbal_GetRelDeg(float out[3])
 {
     for (uint8_t i = 0; i < 3; i++)
         out[i] = s_OffsetValid[i]
-               ? (s_Axis[i]->Position.Real - s_Offset[i])
+               ? (Axis_PositionDeg(i) - s_Offset[i])
                : 0.0f;
+}
+
+/* 单轴是否在线（0=yaw 1=lift 2=extend）。yaw 换成达妙后 ZdtMotorList[5] 是空的，
+   ReceiveTask 的"电机在线掩码"必须走这里，否则上层会把 yaw 一直显示成离线。 */
+uint8_t Gimbal_AxisOnline(uint8_t axis)
+{
+    if (axis >= 3)
+        return 0;
+    return (uint8_t)Axis_IsOnline(axis);
 }
 
 void Gimbal_GetLimits(float minDeg[3], float maxDeg[3])
@@ -245,10 +323,10 @@ static void Gimbal_ApplyZero(void)
     for (uint8_t i = 0; i < 3; i++) {
         if (!(mask & (1u << i)) || !s_AxisInstalled[i])
             continue;
-        if (s_Axis[i]->LastOnlineTick == 0)     /* 从没收到过反馈，不知道当前位置 */
+        if (Axis_LastOnlineTick(i) == 0)     /* 从没收到过反馈，不知道当前位置 */
             continue;
 
-        s_Offset[i]      = s_Axis[i]->Position.Real;
+        s_Offset[i]      = Axis_PositionDeg(i);
         s_OffsetValid[i] = 1;
 
         /* 置零后旧目标全部作废，否则会突然往旧坐标跑 */
@@ -317,6 +395,28 @@ void Gimbal_TxService(void)
         if (!a)
             continue;
 
+#if GIMBAL_YAW_USE_DM
+        if (i == 0) {
+            /* 达妙：使能/失能/清错是专门的命令帧；回传是自动的，没有"定时返回配置" */
+            if (GimbalTx.DisableLeft[i]) {
+                DMMotor_Disable(&Gimbal.YawDM.Motor);
+                GimbalTx.DisableLeft[i]--;
+            }
+            else if (GimbalTx.EnableLeft[i]) {
+                DMMotor_Enable(&Gimbal.YawDM.Motor);
+                GimbalTx.EnableLeft[i]--;
+            }
+            else if (GimbalTx.ClearLeft[i]) {
+                DMMotor_CleanError(&Gimbal.YawDM.Motor);
+                GimbalTx.ClearLeft[i]--;
+            }
+            else if (GimbalTx.FeedbackLeft[i]) {
+                GimbalTx.FeedbackLeft[i] = 0;   /* 不需要 */
+            }
+            continue;
+        }
+#endif
+
         if (GimbalTx.DisableLeft[i]) {
             ZdtCan_Enable(a, 0);            /* 松轴：电机控制板失能，人手可拨 */
             GimbalTx.DisableLeft[i]--;
@@ -350,9 +450,21 @@ void Gimbal_SendAxisSpeedFrames(void)
     if (Gimbal.isReleased)
         return;
 
-    for (uint8_t i = 0; i < 3; i++)
-        if (s_AxisInstalled[i] && GimbalTx.Addr[i])
-            ZdtMotor_SetSpeed(s_Axis[i], GimbalTx.Rpm[i]);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!s_AxisInstalled[i] || !GimbalTx.Addr[i])
+            continue;
+#if GIMBAL_YAW_USE_DM
+        if (i == 0) {
+            /* 达妙：RPM → rad/s（输出轴），组一帧 MIT 控制发出去。
+               位置环还在本任务里做，这里只是"速度源"。 */
+            DMMotor_SetSpeed(&Gimbal.YawDM.Motor,
+                             GimbalTx.Rpm[i] * (2.0f * PI / 60.0f));
+            DMMotor_Output(&Gimbal.YawDM.Motor);
+            continue;
+        }
+#endif
+        ZdtMotor_SetSpeed(s_Axis[i], GimbalTx.Rpm[i]);
+    }
 }
 #else
 void Gimbal_TxService(void) {}
@@ -360,6 +472,11 @@ void Gimbal_SendAxisSpeedFrames(void) {}
 void Gimbal_GetRelDeg(float out[3])
 {
     out[0] = out[1] = out[2] = 0.0f;
+}
+uint8_t Gimbal_AxisOnline(uint8_t axis)
+{
+    (void)axis;
+    return 0;
 }
 void Gimbal_GetLimits(float minDeg[3], float maxDeg[3])
 {
@@ -376,11 +493,20 @@ void GimbalTask(void const* argument)
 
 #if GIMBAL_MOTOR_INSTALLED
     /* ---- 初始化三轴电机（地址 5~7），把地址交给底盘任务 ---- */
+#if GIMBAL_YAW_USE_DM
+    /* yaw 换成达妙 4310：MIT 模式，Kp=0（位置环仍在软件里）、Kd 当速度环增益 */
+    DMMotor_Init(&Gimbal.YawDM.Motor, DM_YAW_CAN_ID, DM_YAW_MASTER_ID,
+                 DM_YAW_KP, DM_YAW_KD,
+                 DM_YAW_P_MIN, DM_YAW_P_MAX,
+                 DM_YAW_V_MIN, DM_YAW_V_MAX,
+                 DM_YAW_T_MIN, DM_YAW_T_MAX);
+#else
     ZdtMotor_Init(&Gimbal.Yaw.Motor,    ZDT_MOTOR_YAW);
+#endif
     ZdtMotor_Init(&Gimbal.Lift.Motor,   ZDT_MOTOR_LIFT);
     ZdtMotor_Init(&Gimbal.Extend.Motor, ZDT_MOTOR_EXTEND);
     for (uint8_t i = 0; i < 3; i++) {
-        GimbalTx.Addr[i] = s_Axis[i]->Addr;
+        GimbalTx.Addr[i] = Axis_Addr(i);
         GimbalTx.Rpm[i]  = 0.0f;
         if (s_AxisInstalled[i])
             GimbalTx.FeedbackLeft[i] = 3;    /* 上电分成 3 拍发，确保三轴都收到回传配置 */
@@ -436,6 +562,9 @@ void GimbalTask(void const* argument)
                     }
                 Gimbal.isReleased = 1;
                 Gimbal.isEnable   = 0;
+#if GIMBAL_YAW_USE_DM
+                s_YawCmdDps = 0.0f;  /* 松轴期间不发帧，退出时从 0 重新爬 */
+#endif
             }
         }
         else if (Gimbal.isReleased)
@@ -469,8 +598,8 @@ void GimbalTask(void const* argument)
 
         /* ---- 上电中位锁存：每轴第一次收到反馈时记下（不管使能与否） ---- */
         for (uint8_t i = 0; i < 3; i++)
-            if (s_AxisInstalled[i] && !s_OffsetValid[i] && s_Axis[i]->LastOnlineTick != 0) {
-                s_Offset[i]      = s_Axis[i]->Position.Real;
+            if (s_AxisInstalled[i] && !s_OffsetValid[i] && Axis_LastOnlineTick(i) != 0) {
+                s_Offset[i]      = Axis_PositionDeg(i);
                 s_OffsetValid[i] = 1;
             }
 
@@ -487,6 +616,9 @@ void GimbalTask(void const* argument)
                 if (s_PosPidReady)
                     PID_Clear(&s_PosPid[i]);
             }
+#if GIMBAL_YAW_USE_DM
+            s_YawCmdDps = 0.0f;      /* 重新使能从 0 开始爬，不会接着失能前的速度 */
+#endif
         }
         else
         {
@@ -521,10 +653,24 @@ void GimbalTask(void const* argument)
 
                 /* 位置目标有效期内：位置环接管，手柄速度让位 */
                 if (Gimbal_PosActive(i, now)) {
-                    float rel = s_Axis[i]->Position.Real - s_Offset[i];
+                    float rel = Axis_PositionDeg(i) - s_Offset[i];
                     PID_Calc(&s_PosPid[i], rel, s_TargetDeg[i]);
                     /* PID 输出是"让编码器坐标变大"的速度，换回速度指令坐标 */
-                    Gimbal_SetAxisSpeed(i, s_PosPid[i].Output * s_CmdSign[i]);
+                    float out = s_PosPid[i].Output * s_CmdSign[i];
+#if GIMBAL_YAW_USE_DM
+                    /* 梯形曲线的"刹车段"：剩余角度只够刹到某个速度时，不允许再快。
+                       v ≤ √(2·a·s)。没有这一条，PID 会一路全速冲到目标跟前再猛刹，
+                       达妙直驱没有皮带缓冲，必然过冲。只对 yaw（达妙）做。 */
+                    if (i == 0) {
+                        float remain = fabsf(s_TargetDeg[i] - rel);
+                        float vmax = sqrtf(2.0f * DM_YAW_ACC_DEG_S2 * remain);
+                        if (vmax < 5.0f)
+                            vmax = 5.0f;    /* 留一点爬行速度，别把位置环憋死 */
+                        if (out > vmax)        out = vmax;
+                        else if (out < -vmax)  out = -vmax;
+                    }
+#endif
+                    Gimbal_SetAxisSpeed(i, out);
                     continue;
                 }
 

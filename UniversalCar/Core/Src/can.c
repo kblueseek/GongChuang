@@ -132,7 +132,14 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
     /* 电机已切回 CAN 模式：把收到的帧交给 ZDT 解析器 */
     CAN_RxHeaderTypeDef RxMessage;
     uint8_t Data[8];
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxMessage, Data) == HAL_OK)
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxMessage, Data) != HAL_OK)
+        return;
+
+    /* 按帧类型分流：张大头用扩展帧（29 位 ID），达妙用标准帧（11 位 ID）。
+       两者在总线上是两个 ID 空间，混在一条 CAN 上不会冲突。 */
+    if (RxMessage.IDE == CAN_ID_STD)
+        DMMotor_RxCallback(RxMessage.StdId, Data, (uint8_t)RxMessage.DLC);
+    else
         ZdtCan_RxCallback(RxMessage.ExtId, Data, (uint8_t)RxMessage.DLC);
 }
 

@@ -1,0 +1,203 @@
+{
+  "commands": [
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": 100.0,
+      "extend_deg": 695.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
+    },
+    {
+      "cmd": "tray_slot",
+      "number": "3"
+    },
+    {
+      "cmd": "calibrate",
+      "x_m": -2.169,
+      "y_m": 1.061
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 650.0,
+      "lift_deg": 100.0,
+      "extend_deg": 800.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 290.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 173.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 350
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": -290.0
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": 100.0,
+      "extend_deg": 650.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 100
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 19.0,
+      "lift_deg": 1510.0,
+      "extend_deg": 621.0
+    },
+    {
+      "cmd": "vision_put",
+      "ring": 0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 150
+    },
+    {
+      "cmd": "tray_slot",
+      "number": "2"
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": 100.0,
+      "extend_deg": 695.0
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 650.0,
+      "lift_deg": 100.0,
+      "extend_deg": 800.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 290.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 173.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 350
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": -290.0
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 0.0,
+      "lift_deg": 100.0,
+      "extend_deg": 400.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 100
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": -165.0,
+      "lift_deg": 1483.0,
+      "extend_deg": 1106.0
+    },
+    {
+      "cmd": "vision_put",
+      "ring": 0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 100
+    },
+    {
+      "cmd": "tray_slot",
+      "number": "1"
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": -165.0,
+      "lift_deg": 100.0,
+      "extend_deg": 650.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 100
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 650.0,
+      "lift_deg": 100.0,
+      "extend_deg": 800.0
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": 290.0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 173.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 350
+    },
+    {
+      "cmd": "gimbal_lift",
+      "delta_deg": -290.0
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 183.0,
+      "lift_deg": 400.0,
+      "extend_deg": 400.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 100
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 183.0,
+      "lift_deg": 1455.0,
+      "extend_deg": 1200.0
+    },
+    {
+      "cmd": "vision_put",
+      "ring": 0
+    },
+    {
+      "cmd": "gripper",
+      "deg": 100.0
+    },
+    {
+      "cmd": "delay",
+      "ms": 100
+    },
+    {
+      "cmd": "gimbal",
+      "yaw_deg": 183.0,
+      "lift_deg": 100.0,
+      "extend_deg": 650.0
+    }
+  ]
+}

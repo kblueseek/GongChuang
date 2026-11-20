@@ -35,6 +35,7 @@
 
 //外部硬件
 #include "ZdtMotor.h"
+#include "DMMotor.h"
 #include "Servo.h"
 #include "Led.h"
 #include "JY901S.h"

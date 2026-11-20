@@ -117,6 +117,52 @@ enum
       两个电机绝不能共用同一个地址（会同时动作、无法单独控制）。 */
 #define GIMBAL_YAW_INSTALLED     1
 
+/* ==================== 云台 Yaw：达妙 DM4310（可选） ==================== */
+/* 1 = yaw 轴用达妙 4310（标准帧 MIT 模式），0 = 仍用 ZDT（地址 5，扩展帧）。
+   改完要重新编译烧录。lift / extend 不受影响，一直是 ZDT。
+
+   ⚠️ 共用一条 CAN 总线是安全的：
+       ZDT 走扩展帧（29 位 ID），达妙走标准帧（11 位 ID），是不同的 ID 空间，
+       硬件层面不会互相覆盖。接收侧在 can.c 里按 IDE 位分流。
+
+   ⚠️ 电机侧要先在达妙上位机里配好：控制模式 = MIT，CAN 波特率 = 1M，
+      电机 ID = 下面 DM_YAW_CAN_ID，Master ID = DM_YAW_MASTER_ID。
+      换完电机第一次上电，要在上位机里把当前位置设成零点（或用 DMMotor_SetZero），
+      然后整车上电，让云台任务重新锁存软件 0 点。 */
+#define GIMBAL_YAW_USE_DM        1
+
+#define DM_YAW_CAN_ID            5      /* 控制帧 ID = 电机 ID（MIT 模式） */
+#define DM_YAW_MASTER_ID         0      /* 回传帧 ID（电机里配的 Master ID） */
+
+/* MIT 参数。云台位置环在 F407 软件里做（输出 °/s），所以这里用"速度源"用法：
+   Kp = 0（不参与位置），Kd 当速度环增益，TorqueFF = 0。
+   Kd 太小跟不动、太大会抖；负载大就往上加，先 0.5~1.0 试。 */
+#define DM_YAW_KP                0.0f
+#define DM_YAW_KD                0.8f
+
+/* MIT 映射范围（DM4310 V1.1）。换 4310P / V1.2 或别的型号要按手册改。
+   ⚠️ P_MAX = 12.5 rad = 716°：yaw 轴的角度（相对 0 点）必须留在这个范围里，
+      超了会被限幅、位置反馈也会翻转。 */
+#define DM_YAW_P_MIN             (-12.5f)
+#define DM_YAW_P_MAX             ( 12.5f)
+#define DM_YAW_V_MIN             (-30.0f)
+#define DM_YAW_V_MAX             ( 30.0f)
+#define DM_YAW_T_MIN             (-10.0f)
+#define DM_YAW_T_MAX             ( 10.0f)
+
+/* 达妙 MIT 模式没有内部加减速曲线（ZDT 的 F6 帧有 acc 字节，达妙没有），
+   所以加减速在 F407 里用软件限：每 5ms 最多变这么多 °/s²。
+   这就是"梯形曲线的斜坡段"，配合 GimbalTask 里的刹车曲线一起用。
+     3000 °/s²：0→120°/s 用 40ms，够快、起步不冲
+     6000 °/s²：视觉跟随更跟手，但起步冲击明显
+     1000 °/s²：很柔和，位置移动会明显变慢 */
+#define DM_YAW_ACC_DEG_S2        3000.0f
+
+/* 达妙 yaw 的"正速度 → 位置反馈变大"符号，只用于软限位判断。
+   装好后手动推一下：正速度让角度变大就填 +1，变小填 -1。
+   填反的表现和 ZDT 一样：顶到限位后往回拨不动、往越界方向反而能动。 */
+#define DM_YAW_CMD_SIGN          (1.0f)
+
 /* 三轴软限位（相对「0 点」的角度，单位 °），往越界方向推不发速度，防止撞结构。
    云台任务在每轴第一次收到位置反馈时先锁存一个临时 0 点；把轴摆到固定位后，
    树莓派面板或上位机发 PI_CMD_GIMBAL_ZERO 把此刻位置改成 0 点，所以这里的 ± 值
@@ -131,7 +177,13 @@ enum
    云台电机本身只有速度模式，位置环在 GimbalTask 里做；限位靠"相对 0 点的位置 + 运动方向"
    在速度指令上掐掉。 */
 #define GIMBAL_YAW_MIN      -182.0f
+#if GIMBAL_YAW_USE_DM
+/* 达妙 MIT 位置映射只有 ±12.5 rad = ±716°，超过就被限幅、反馈也会翻转，
+   所以兜底限位跟着收到 700°。正常情况下限位由树莓派示教下发，这里只是兜底。 */
+#define GIMBAL_YAW_MAX      700.0f
+#else
 #define GIMBAL_YAW_MAX      800.0f
+#endif
 #define GIMBAL_LIFT_MIN      -990.0f
 #define GIMBAL_LIFT_MAX       575.0f
 #define GIMBAL_EXTEND_MIN    -420.0f

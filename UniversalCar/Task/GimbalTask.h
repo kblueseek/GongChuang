@@ -18,14 +18,16 @@
 #include "cmsis_os.h"
 
 #include "ZdtMotor.h"
+#include "DMMotor.h"
 #include "Servo.h"
 
 /// @brief 云台实例
 typedef struct
 {
-    struct { ZdtMotor_t Motor; } Yaw;       /* 旋转轴   ZDT 地址 5 */
+    struct { ZdtMotor_t Motor; } Yaw;       /* 旋转轴   ZDT 地址 5（仅 GIMBAL_YAW_USE_DM=0 时有效） */
     struct { ZdtMotor_t Motor; } Lift;      /* Z 升降轴 ZDT 地址 6 */
     struct { ZdtMotor_t Motor; } Extend;    /* X 伸缩轴 ZDT 地址 7 */
+    struct { DMMotor_t Motor; } YawDM;      /* 旋转轴换达妙 4310 后用它（GIMBAL_YAW_USE_DM=1） */
 
     Servo_t GripperServo;   /* 夹爪舵机 */
     Servo_t CamServo;       /* 摄像头舵机 */
@@ -64,6 +66,9 @@ void Gimbal_SendAxisSpeedFrames(void);
 
 /// @brief 取三轴当前位置（相对 0 点，°）。遥测回传和限位示教都用这个坐标。
 void Gimbal_GetRelDeg(float out[3]);
+
+/// @brief 单轴是否在线（0=yaw 1=lift 2=extend）。yaw 换达妙后也要能用。
+uint8_t Gimbal_AxisOnline(uint8_t axis);
 
 /// @brief 取三轴当前生效的软限位（相对 0 点，°）
 void Gimbal_GetLimits(float minDeg[3], float maxDeg[3]);

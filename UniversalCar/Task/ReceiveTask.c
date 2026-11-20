@@ -73,11 +73,16 @@ void ReceiveTask(void const* argument)
         {
             LastReportTick = NowTick;
 
-            /* 电机在线掩码：bit0-6 = 电机1-7 */
+            /* 电机在线掩码：bit0-6 = 电机1-7。
+               1~4 是底盘轮（ZDT），5~7 是云台三轴——云台统一走 Gimbal_AxisOnline，
+               这样 yaw 换成达妙之后掩码仍然对得上，上层不用改。 */
             uint8_t mask = 0;
-            for (int i = 1; i <= 7; i++)
+            for (int i = 1; i <= 4; i++)
                 if (ZdtMotorList[i] != NULL && ZdtMotor_IsOnline(ZdtMotorList[i]))
                     mask |= (1 << (i - 1));
+            for (uint8_t axis = 0; axis < 3; axis++)
+                if (Gimbal_AxisOnline(axis))
+                    mask |= (1 << (4 + axis));
 
             PiComm_SendStatus(Receive.State, Receive.ErrorFlag, mask);
         }

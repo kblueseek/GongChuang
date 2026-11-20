@@ -63,15 +63,23 @@
            先跑视觉程序，读它输出的 {"yaw_deg":..,"lift_deg":..,"extend_deg":..}
            （缺省字段沿用下面 pick 的默认值），随后自动执行一次 pick 抓取宏。
   color_pick {"cmd":"color_pick", "color":"1"}
-           按颜色跟随：视觉程序用 /cmd_gimbal_vel 把物料对到画面中心，只跟随不抓取。
-           对中后如果视觉结果里带 ext_offset_deg（来自 vision/config/track_pid.json
-           的同名项，上位机跟踪页可调），自动把 extend 再前伸这个角度并等到位——
-           序列里不用再手写 gimbal_ext；摄像头改装后只改那个参数。
+           按颜色跟随：视觉程序用 /cmd_gimbal_vel 把物料对到目标像素，只跟随不抓取。
+           对中后不做任何补偿，跟踪结果就是最终落点；要偏一点就直接改目标像素
+           （--target-x/--target-y 或 track_pid.json 的 target_x/target_y）。
            lift 仍按物料高度自己在序列里补（高度不固定，视觉不做）。
            color 也可以写 "open" / "close"：视觉程序改成常驻进程（--server），
            open 只点火预热（不阻塞，车没到工位时先跑），N 只发一行请求，
            close 释放摄像头。连抓多种颜色只付一次启动时间。
            可写 "still_time":0 覆盖 vision_still_time_s（先等物料静止多久再跟随）。
+  vision_put {"cmd":"vision_put", "ring":0, "target_x":640, "target_y":360}
+           盲放到大概位置之后的视觉闭环（阻塞）：跑 vision/vision_put_align.py，
+           用圆环工位检测找到环心，再用 /cmd_gimbal_vel 把环心推到 target 像素。
+           因为摄像头和夹爪相对位置固定，"环心落在目标像素"就等于"夹爪正对环心"，
+           所以不需要识别物料。ring=0 取离目标像素最近的环（也可以写 1~3）。
+           程序先确认云台已经走到盲放位置（0.2s 不动），然后直接发速度——
+           F407 收到非零速度帧会立即顶掉位置保持，不用等那 3s。整段就是
+           "臂到位 + 视觉对中"的时间。返回 JSON 后状态机继续往下走，
+           并把对中后的角度锁回位置模式。
   track_debug {"cmd":"track_debug", "color":"1"}
            纯调参（阻塞）：一直跟随该颜色，永远不判"对中完成"，直到点■停止 /
            超时 timeout_s（默认 600s）。视觉端每秒重读 config/track_pid.json，
@@ -1366,6 +1374,31 @@ class MotionPlannerNode(Node):
                 f'一直跟随（最长 {timeout:.0f}s）——上位机 PID 页拖滑块实时调参，'
                 '点■停止结束')
             self.phase = 'vision'
+        elif name == 'vision_put':     # 盲放之后：用圆环做视觉闭环，把环心对到固定像素
+            argv = self._vision_put_argv(cmd)
+            if not argv:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] vision_put：'
+                    '没配置视觉程序（vision_args），跳过')
+                return
+            try:
+                timeout = float(cmd.get('timeout_s', 45.0))
+            except (TypeError, ValueError):
+                timeout = 45.0
+            vp = {'cmd': 'vision_put',
+                  'program': (cmd.get('program')
+                              or self.get_parameter('vision_program').value or ''),
+                  'args': argv,
+                  'timeout_s': timeout}
+            if self._start_proc(vp, 'vision_put'):
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] vision_put：'
+                    '等云台停稳 → 圆环对到目标像素…')
+                self.phase = 'proc'
+            else:
+                self._publish_state(
+                    f'[{self.index+1}/{len(self.commands)}] vision_put：'
+                    '视觉程序没启动起来，跳过')
         elif name in ('number_put', 'double_put'):   # 按环号放置 / 叠放
             try:
                 number = int(self._resolve_token(cmd.get('number'), 'number'))
@@ -1643,6 +1676,14 @@ class MotionPlannerNode(Node):
         if thr is not None:
             thr.join(timeout=1.0)
         self._proc_result = self._parse_proc_result()
+        if (self._proc_result is None
+                and kind in ('align', 'vision_pick', 'vision_put')
+                and getattr(self, '_proc_tail', None)):
+            # 子程序秒退（参数不认、摄像头打不开、路径错）时，以前这些输出被
+            # 吞掉，界面上只剩"没返回 JSON"，看起来就是"点了运行没反应"。
+            self.get_logger().warning(
+                f'{kind}: 子程序没有返回 JSON（退出码 {code}），最后输出：'
+                + ' | '.join(self._proc_tail))
         # 子程序（尤其 color_pick 的视觉跟随）会直接动云台，状态机的目标镜像
         # 已经对不上了。重置成 None，下一条相对指令用实测角重新起算。
         self.gimbal_target = None
@@ -1651,6 +1692,8 @@ class MotionPlannerNode(Node):
             self._apply_align()
         elif kind == 'vision_pick':
             self._apply_vision_pick()
+        elif kind == 'vision_put':
+            self._apply_vision_result(self._proc_result or {}, 'vision_put')
         else:
             self._publish_state(f'程序结束（退出码 {code}）')
             self.phase = 'stepping'
@@ -1681,6 +1724,9 @@ class MotionPlannerNode(Node):
                 lines.append(self._proc_lines.get_nowait())
             except queue.Empty:
                 break
+        # 留最后几行给 _poll_proc 打日志：脚本没输出 JSON 时（argparse 报错、
+        # 摄像头打不开）这是唯一能看出原因的线索。
+        self._proc_tail = [line.strip() for line in lines if line.strip()][-5:]
         for line in reversed(lines):
             text = line.strip()
             if not text.startswith('{'):
@@ -1723,6 +1769,55 @@ class MotionPlannerNode(Node):
             f'视觉校准：修正 dx={dx:+.3f}m dy={dy:+.3f}m '
             f'dyaw={math.degrees(dyaw):+.1f}°，重新到位')
         self.phase = 'moving'
+
+    def _vision_put_argv(self, cmd: dict) -> list:
+        """拼 vision_put 的命令行：复用 vision_args 的相机参数，只把脚本换掉。
+
+        vision_args 里是 ".../vision/gimbal_track_pick.py"（也可能带
+        --cam-rotation / --device 之类），这里把文件名换成 vision_put_align.py，
+        其余参数原样保留 —— 摄像头的分辨率/旋转/设备只需要在 vehicle.yaml 配一处。
+        序列里显式写了 args 就用序列的，方便单独指定。
+        """
+        raw = str(cmd.get('args') or '').strip()
+        if raw:
+            return shlex.split(raw)
+        raw_args = shlex.split(str(self.get_parameter('vision_args').value or ''))
+        if not raw_args:
+            return []
+        # vision_args 是给 color_pick 的 gimbal_track_pick.py 配的，里面可能有
+        # 只有那个脚本认识的参数（比如 --roi-bottom）。vision_put_align.py 不认识
+        # 会在 argparse 阶段直接退出 —— 表现就是"点运行没反应、也没窗口"。
+        # 只转发两个脚本都支持的相机参数。
+        forward = {'--device', '--width', '--height', '--fps', '--cam-rotation'}
+        argv = [os.path.join(os.path.dirname(raw_args[0]), 'vision_put_align.py')]
+        i = 1
+        while i < len(raw_args):
+            token = raw_args[i]
+            name = token.split('=', 1)[0]
+            if name in forward:
+                argv.append(token)
+                if '=' not in token and i + 1 < len(raw_args) \
+                        and not raw_args[i + 1].startswith('--'):
+                    argv.append(raw_args[i + 1])
+                    i += 1
+            elif name != '--server':
+                self.get_logger().debug(
+                    f'vision_put 忽略 vision_args 里的 {name}（vision_put_align.py 不支持）')
+            i += 1
+        try:
+            ring = int(cmd.get('ring', 0) or 0)
+        except (TypeError, ValueError):
+            ring = 0
+        argv += ['--ring', str(ring)]
+        for key, flag in (('target_x', '--target-x'), ('target_y', '--target-y')):
+            value = cmd.get(key)
+            if value is None or value == '':
+                continue
+            try:
+                argv += [flag, str(float(value))]
+            except (TypeError, ValueError):
+                pass
+        return argv
 
     def _apply_vision_pick(self):
         """视觉定点抓取：把识别出的云台角度填进 pick 宏，插到当前指令后面执行。
@@ -1767,8 +1862,8 @@ class MotionPlannerNode(Node):
         self.commands[self.index + 1:self.index + 1] = expanded
         self.phase = 'stepping'
 
-    def _apply_vision_result(self, data: dict):
-        """color_pick 的结果：只报告 + 可选的对中后前伸，不自动抓取。
+    def _apply_vision_result(self, data: dict, label: str = 'color_pick'):
+        """视觉指令的结果：只报告 + 可选的对中后补偿，不自动抓取。
 
         但不能只看"有没有结果"就报成功——视觉超时/没找到物料/打不开摄像头时
         JSON 里是 ok:false，必须原样报到界面上，否则后续夹爪指令会在云台还停在
@@ -1776,81 +1871,49 @@ class MotionPlannerNode(Node):
         """
         if not data:
             self._publish_state(
-                'color_pick 视觉程序没有返回 JSON（看程序输出：摄像头/路径/'
+                f'{label} 视觉程序没有返回 JSON（看程序输出：摄像头/路径/'
                 'DISPLAY 问题）——继续执行后续指令')
             self.phase = 'stepping'
             return
         if not data.get('ok', True):
-            # 只有 ok:true 才带 yaw/ext 角度和补偿量（见 vision 的 track_color），
-            # ok:false 时没有可信的落点，补偿一律不做 —— 所以"追踪完了却没有
-            # 修正动作"第一件事就是看这行：失败（超时/被停/颜色没标定）时本来
-            # 就不会有修正动作。
+            # 只有 ok:true 才带 yaw/ext 角度；ok:false 时没有可信的落点，
+            # 云台停在原地，后续指令照常执行（夹爪可能抓空，先看这行日志）。
             self.get_logger().warning(
-                f'color_pick 失败：{data.get("reason", "未知原因")}'
-                f'（未执行对中补偿，云台留在原地）')
+                f'{label} 失败：{data.get("reason", "未知原因")}'
+                f'（云台留在原地）')
             self._publish_state(
-                f'color_pick 失败：{data.get("reason", "未知原因")}'
-                '——未执行对中补偿，继续执行后续指令')
+                f'{label} 失败：{data.get("reason", "未知原因")}'
+                '——云台留在原地，继续执行后续指令')
             self.phase = 'stepping'
             return
 
         # 视觉程序是自己在速度环上动云台的，状态机的目标镜像已经对不上了。
         # 重置成 None，后面 gimbal_yaw/lift/ext 这类相对指令改用实测角重新起算。
         self.gimbal_target = None
-        # 相机装在夹爪后面/侧面，画面里"对中"≠夹爪已经够到物料。
-        # 两个补偿量随摄像头安装位置变化，存在 track_pid.json 的 ext_offset_deg /
-        # yaw_offset_deg，由视觉程序随结果 JSON 回传；这里一起下发，序列里就不用
-        # 再手写 gimbal_ext / gimbal_yaw 补那一下。
-        try:
-            ext_off = float(data.get('ext_offset_deg', 0.0) or 0.0)
-        except (TypeError, ValueError):
-            ext_off = 0.0
-        try:
-            yaw_off = float(data.get('yaw_offset_deg', 0.0) or 0.0)
-        except (TypeError, ValueError):
-            yaw_off = 0.0
-        # 这一行是排查"有时候有修正动作、有时候没有"的入口：它和下面
-        # "已下发对中补偿"成对出现才说明补偿真的发出去了。只有这一行没有
-        # 下一行 = 视觉回传的补偿量是 0（track_pid.json 被写回旧值/被恢复默认）。
         self.get_logger().info(
-            f'color_pick {data.get("color", "?")} 完成：'
-            f'yaw={data.get("yaw_deg", 0):+.1f}° '
-            f'lift={data.get("lift_deg", 0):+.1f}° '
-            f'ext={data.get("extend_deg", 0):+.1f}° '
-            f'补偿 yaw={yaw_off:+.1f}° ext={ext_off:+.1f}°')
-        self._publish_state(
-            f'云台已跟随到物料上方（color_pick，不自动抓取）：'
+            f'{label} {data.get("color", data.get("ring", "?"))} 完成：'
             f'yaw={data.get("yaw_deg", 0):+.1f}° '
             f'lift={data.get("lift_deg", 0):+.1f}° '
             f'ext={data.get("extend_deg", 0):+.1f}°')
-        if abs(ext_off) > 1e-3 or abs(yaw_off) > 1e-3:
-            target = [float(data.get('yaw_deg', self.gimbal_actual[0])) + yaw_off,
-                      float(data.get('lift_deg', self.gimbal_actual[1])),
-                      float(data.get('extend_deg', self.gimbal_actual[2]))
-                      + ext_off]
-            a = Float32MultiArray()
-            a.data = list(target)
-            self._pub_gimbal.publish(a)
-            self.get_logger().info(
-                f'已下发对中补偿 → yaw={target[0]:+.1f}° lift={target[1]:+.1f}° '
-                f'ext={target[2]:+.1f}°（等三轴 ±{self.gimbal_tol_deg:.1f}°）')
-            self.gimbal_target = list(target)
-            self._gimbal_keepalive_deadline = (
-                self._now() + self.gimbal_keepalive_s)
-            # 三轴一起等：lift 的目标就是实测值不会动，yaw/ext 哪个补了就等哪个。
-            # （只盯 ext 的老写法在开了 yaw 补偿后会提前放行，夹爪还没转到位。）
-            self._gimbal_wait_all = True
-            self._gimbal_wait_lead = False
-            self._gimbal_wait_lead_s = None
-            self._gimbal_wait_targets = list(target)
-            self._gimbal_wait_tol = self.gimbal_tol_deg
-            self.gimbal_deadline = self._now() + self.gimbal_timeout_s
-            self._publish_state(
-                f'对中后自动补偿 yaw {yaw_off:+.1f}° / ext {ext_off:+.1f}° → '
-                f'yaw={target[0]:+.1f}° ext={target[2]:+.1f}°，'
-                f'等到位（±{self.gimbal_tol_deg:.1f}°）')
-            self.phase = 'gimbal'
-            return
+        self._publish_state(
+            f'{label} 完成（不自动抓取）：'
+            f'yaw={data.get("yaw_deg", 0):+.1f}° '
+            f'lift={data.get("lift_deg", 0):+.1f}° '
+            f'ext={data.get("extend_deg", 0):+.1f}°')
+
+        # vision_put 全程走速度模式，停手后只剩"速度 0"的保持。后面紧跟着夹爪
+        # 动作，把对中后的三轴角度重新下发成位置目标锁住更稳，也免得 F407 的
+        # 300ms 速度超时把云台放掉。目标就是实测值，不会再多走。
+        if label == 'vision_put' and 'yaw_deg' in data:
+            hold = [float(data.get('yaw_deg', self.gimbal_actual[0])),
+                    float(data.get('lift_deg', self.gimbal_actual[1])),
+                    float(data.get('extend_deg', self.gimbal_actual[2]))]
+            self._pub_gimbal.publish(Float32MultiArray(data=hold))
+            self.gimbal_target = list(hold)
+            self._gimbal_keepalive_deadline = self._now() + self.gimbal_keepalive_s
+        # 对中后不再做 yaw/ext 补偿：需要偏移时直接把视觉跟踪的目标像素
+        # （target_x / target_y，或 track_pid.json 里同名项）改到"夹爪正好
+        # 到位"的位置即可，对中结果本身就是最终落点。
         self.phase = 'stepping'
 
     # ---------------- 常驻视觉进程（color_pick open / N / close） ----------------

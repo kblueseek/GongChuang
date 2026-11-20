@@ -630,6 +630,11 @@
               <FilePath>..\ExHardware\Ops.c</FilePath>
             </File>
             <File>
+              <FileName>DMMotor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\ExHardware\DMMotor.c</FilePath>
+            </File>
+            <File>
               <FileName>Servo.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\ExHardware\Servo.c</FilePath>
