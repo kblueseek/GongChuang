@@ -36,6 +36,10 @@ class RingStationConfig:
     min_minor_axis_px: float
     max_major_axis_px: float
     min_ellipse_aspect: float
+    # 椭圆边缘内侧的平均饱和度上限。夹着的物料/夹爪颜色饱和度高，圆环工位
+    # 是黑白图案；用这个把"物料球/绿色夹爪被当成环"的误检排掉。
+    # >=255 表示不启用颜色过滤。
+    max_edge_saturation: float
     center_cluster_radius_px: float
     diameter_band_gap_px: float
     min_cluster_support: int
@@ -80,6 +84,19 @@ class RingStationDetection:
     processing_ms: float = 0.0
     detection_scope: str = "full"
     detail: str = "尚未识别"
+    # 缺环降级支持：夹爪伸出去时常被挡住/带出画面，只能看到 1~2 个环。
+    visible_ring_count: int = 0
+    ring_indices: tuple[int, ...] = ()      # 这几次观测对应参考环心里的哪几个
+    yaw_valid: bool = False                 # 只有 >=2 个环才谈得上航向
+    # 诊断用：椭圆观测数 / 聚类后的候选数 —— 现场判断"为什么只报 1 个环"就看这两个
+    ellipse_observation_count: int = 0
+    ring_candidate_count: int = 0
+    # 完整三环布局预测（长度 3，缺环的位置是推算出来的）。夹着物料时中间/目标环
+    # 常被挡住，vision_put 要按"意图环"而不是"随便看到的那个环"去对齐。
+    # 元素为 None 表示该环推不出来。
+    predicted_centers_px: tuple[tuple[float, float] | None, ...] = ()
+    layout_scale: float = 0.0       # 观测像素 / 参考像素 的尺度比
+    layout_source: str = ""         # observed / two_ring / one_ring / prior
 
 
 @dataclass
@@ -148,6 +165,8 @@ def load_ring_station_config(path: Path | str) -> RingStationConfig:
             min_minor_axis_px=float(detection["min_minor_axis_px"]),
             max_major_axis_px=float(detection["max_major_axis_px"]),
             min_ellipse_aspect=float(detection["min_ellipse_aspect"]),
+            max_edge_saturation=float(
+                detection.get("max_edge_saturation", 255.0)),
             center_cluster_radius_px=float(
                 detection["center_cluster_radius_px"]
             ),
@@ -204,6 +223,8 @@ def load_ring_station_config(path: Path | str) -> RingStationConfig:
         raise RingStationDetectionError("Canny 阈值无效")
     if not 0.0 < config.min_ellipse_aspect <= 1.0:
         raise RingStationDetectionError("椭圆长短轴比例无效")
+    if not 0.0 <= config.max_edge_saturation <= 255.0:
+        raise RingStationDetectionError("边缘饱和度上限无效（0~255）")
     if config.min_cluster_support < 2 or config.min_diameter_bands < 2:
         raise RingStationDetectionError("同心轮廓支持数门槛过低")
     if not 0.0 < config.minimum_confidence <= 1.0:
@@ -227,13 +248,16 @@ def _find(parent, index):
     return parent[index]
 
 
-def _extract_observations(image, config):
+def _extract_observations(image, config, border_margin_px=0.0):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
     edges = cv2.Canny(blurred, config.canny_low, config.canny_high)
     contours, _ = cv2.findContours(
         edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
     )
+    height, width = image.shape[:2]
+    hsv = (cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+           if config.max_edge_saturation < 255.0 else None)
     observations = []
     for contour in contours:
         if len(contour) < config.min_contour_points:
@@ -246,6 +270,33 @@ def _extract_observations(image, config):
             or minor / major < config.min_ellipse_aspect
         ):
             continue
+        # 颜色过滤：沿轮廓往椭圆中心收 12% 采样，看边缘内侧的饱和度。
+        # 黑白圆环饱和度低；夹着的物料球（红/黄/绿/蓝）和绿色夹爪饱和度高，
+        # 它们的外轮廓也会被 fitEllipse 拟合成圆，必须在这里排掉。
+        if hsv is not None:
+            step = max(1, len(contour) // 16)
+            saturations = []
+            for point in contour[::step]:
+                px = float(point[0][0])
+                py = float(point[0][1])
+                sx = center[0] + (px - center[0]) * 0.88
+                sy = center[1] + (py - center[1]) * 0.88
+                ix, iy = int(round(sx)), int(round(sy))
+                if 0 <= ix < width and 0 <= iy < height:
+                    saturations.append(float(hsv[iy, ix, 1]))
+            if (saturations
+                    and sum(saturations) / len(saturations)
+                    > config.max_edge_saturation):
+                continue
+        # 全图搜索时丢掉贴着画面边缘的椭圆：环心在边框附近说明椭圆至少缺了
+        # 一大半，fitEllipse 很容易把边角/物料边缘拟合成一个"环"，进而把
+        # 完整布局预测带偏（只在全图调用时启用；ROI 裁剪的边缘不能用它）。
+        if border_margin_px > 0:
+            if (center[0] < border_margin_px
+                    or center[0] > width - border_margin_px
+                    or center[1] < border_margin_px
+                    or center[1] > height - border_margin_px):
+                continue
         observations.append(_EllipseObservation(
             center=np.asarray(center, dtype=np.float64),
             axes=(float(axes[0]), float(axes[1])),
@@ -308,6 +359,172 @@ def _cluster_observations(observations, config):
     return candidates
 
 
+def _reference_spacings(config):
+    """三个参考环心两两之间的距离（像素），键为 (i, j) 且 i < j。"""
+    reference = config.reference_centers_px
+    spacings = {}
+    for i in range(3):
+        for j in range(i + 1, 3):
+            spacings[(i, j)] = math.dist(reference[i], reference[j])
+    return spacings
+
+
+def _assign_to_reference(centers, config, ellipses=None):
+    """把观测到的若干环心按顺序分配给参考环心，返回 (indices, 匹配代价)。
+
+    3 个环时只有 (0,1,2) 一种归属。
+
+    2 个环时**不能**拿参考像素坐标直接比：参考是标定距离下的像素，车一近一远，
+    同一对环的像素间距就变了。这里改用"间距归一化"——用观测到的环投影直径
+    估出像素/毫米，再和 150mm/300mm 的物理间距比，选出最像的那一对。
+    这个判据对距离不敏感，夹着物料在远近不同位置都成立。
+
+    1 个环时没有间距可交叉验证，只能退回"离参考位置最近"；调用方有上一帧
+    布局时优先走 _assign_with_prior，不要用这里的猜测。
+    """
+    ordered = sorted(centers, key=lambda point: point[0])
+    count = len(ordered)
+    if count == 0 or count > 3:
+        return None, math.inf
+    if count == 3:
+        return (0, 1, 2), 0.0
+
+    if count == 2 and ellipses:
+        try:
+            diameters = [float(max(ellipse[1])) for ellipse in ellipses]
+            diameter_px = float(np.median(diameters))
+        except (IndexError, KeyError, TypeError, ValueError):
+            diameter_px = 0.0
+        if diameter_px > 1e-6 and config.outer_diameter_mm > 0:
+            px_per_mm = diameter_px / config.outer_diameter_mm
+            span = float(math.dist(ordered[0], ordered[1]))
+            best = (None, math.inf)
+            for indices in combinations(range(3), 2):
+                spacing_mm = (indices[1] - indices[0]) * config.center_spacing_mm
+                expected_px = spacing_mm * px_per_mm
+                if expected_px <= 1e-6:
+                    continue
+                score = abs(math.log(span / expected_px))
+                if score < best[1]:
+                    best = (tuple(indices), float(score))
+            if best[0] is not None:
+                return best
+
+    best = (None, math.inf)
+    for indices in combinations(range(3), count):
+        total = sum(
+            math.dist(ordered[position], config.reference_centers_px[index])
+            for position, index in enumerate(indices)
+        )
+        if total < best[1]:
+            best = (tuple(indices), float(total))
+    return best
+
+
+def _assign_with_prior(centers, prior):
+    """用上一帧的完整布局给这一帧的 1~2 个环定身份（比参考像素更稳）。"""
+    if prior is None:
+        return None, math.inf
+    layout = prior[0]
+    if not layout or len(layout) != 3:
+        return None, math.inf
+    ordered = sorted(centers, key=lambda point: point[0])
+    count = len(ordered)
+    if count == 0 or count > 3:
+        return None, math.inf
+    best = (None, math.inf)
+    for indices in combinations(range(3), count):
+        if any(layout[index] is None for index in indices):
+            continue
+        total = sum(
+            math.dist(ordered[position], layout[index])
+            for position, index in enumerate(indices)
+        )
+        if total < best[1]:
+            best = (tuple(indices), float(total))
+    return best
+
+
+def _select_pair(candidates, image_width, config):
+    """从候选里挑一对共线圆环（任意两点都共线，所以靠"间距像不像参考"来筛）。"""
+
+    if len(candidates) < 2:
+        return None
+    reference = _reference_spacings(config)
+    best = None
+    for pair in combinations(candidates, 2):
+        points = np.asarray([item.center for item in pair])
+        span = float(np.linalg.norm(points[1] - points[0]))
+        if span <= 1.0:
+            # 只挡"两个候选几乎重合"的退化情况。不再按画面比例设下限：
+            # 只看到两个环时本来就该照画，间距小是车远，不是异常。
+            continue
+        # 用观测到的环直径估像素/毫米，再和物理间距（150 / 300mm）比。
+        # 不能直接和参考像素间距比：参考是标定距离下的尺度，车一近一远就偏。
+        diameter_px = float(np.mean([
+            item.effective_diameter_px for item in pair]))
+        if diameter_px > 1e-6 and config.outer_diameter_mm > 0:
+            px_per_mm = diameter_px / config.outer_diameter_mm
+            expected = [
+                config.center_spacing_mm * px_per_mm,
+                2.0 * config.center_spacing_mm * px_per_mm,
+            ]
+            scale_error = min(
+                abs(math.log(span / value)) for value in expected
+                if value > 1e-6
+            )
+        else:
+            scale_error = min(
+                abs(math.log(span / spacing)) for spacing in reference.values()
+            )
+        support = sum(item.support for item in pair)
+        score = 4.0 * scale_error - 0.015 * support
+        if best is None or score < best[0]:
+            best = (score, tuple(sorted(pair, key=lambda item: item.center[0])))
+    return None if best is None else (best[1], 0.0)
+
+
+def _select_group(candidates, image_width, config):
+    """按 3 -> 2 -> 1 的顺序退让，返回 (items, count, collinearity, 失败原因)。
+
+    3 个：沿用原有严格共线约束（中间点必须落在两端之间）。
+    2 个：任意两点共线，只要求间距接近某对参考间距。
+    1 个：取支持度最高的那个。
+    同一个候选子集里凑不出能用的一组时，失败原因会说明卡在哪一条约束上，
+    方便现场调阈值。
+    """
+
+    triple = _select_triple(candidates, image_width, config)
+    if triple is not None:
+        _, ordered, collinearity, _ = triple
+        return tuple(ordered), 3, collinearity, ""
+
+    span_floor = image_width * config.min_station_span_ratio
+    if not candidates:
+        return (), 0, 0.0, "画面里没有找到同心圆环（检查光照/Canny 阈值）"
+    if len(candidates) == 1:
+        return (candidates[0],), 1, 0.0, ""
+    if len(candidates) == 2:
+        pair = _select_pair(candidates, image_width, config)
+        if pair is not None:
+            ordered, collinearity = pair
+            return tuple(ordered), 2, collinearity, ""
+        span = float(math.dist(candidates[0].center, candidates[1].center))
+        return (), 0, 0.0, (f"只有 2 个候选，间距 {span:.0f}px 低于下限 "
+                            f"{span_floor * 0.5:.0f}px")
+
+    spans = [
+        float(math.dist(a.center, b.center))
+        for a, b in combinations(candidates, 2)
+    ]
+    widest = max(spans) if spans else 0.0
+    if widest < span_floor:
+        return (), 0, 0.0, (f"有 {len(candidates)} 个候选，但最大间距 {widest:.0f}px "
+                            f"低于三环跨度下限 {span_floor:.0f}px（车太远/环太小）")
+    return (), 0, 0.0, (f"有 {len(candidates)} 个候选，但没有一组满足共线约束"
+                        f"（共线误差需 <= {config.max_collinearity_error_ratio}）")
+
+
 def _select_triple(candidates, image_width, config):
     best = None
     for triple in combinations(candidates, 3):
@@ -323,7 +540,10 @@ def _select_triple(candidates, image_width, config):
         line = points[third_index] - points[first_index]
         offset = points[middle_index] - points[first_index]
         fraction = float(np.dot(offset, line) / (span * span))
-        perpendicular = abs(float(np.cross(line, offset))) / span
+        # 二维叉积的 z 分量。不能用 np.cross —— NumPy 2.x 对二维向量会直接抛
+        # ValueError("Both input arrays must be 3-dimensional vectors")。
+        cross_z = float(line[0] * offset[1] - line[1] * offset[0])
+        perpendicular = abs(cross_z) / span
         collinearity = perpendicular / span
         if not 0.2 < fraction < 0.8:
             continue
@@ -356,45 +576,9 @@ def _select_triple(candidates, image_width, config):
     return best
 
 
-def _raw_detection(image, config):
-    observations = _extract_observations(image, config)
-    candidates = _cluster_observations(observations, config)
-    selection = _select_triple(candidates, image.shape[1], config)
-    if selection is None:
-        # 不满足三环共线时**不丢弃**，各自报各自的环：把聚出来的候选全部输出，
-        # 按 x 升序（与参考环心顺序一致）。因为没有共线关系，方向无从计算，
-        # 所以 yaw / perspective / residual 全部留 None —— 下游据此知道不能判对准。
-        if not candidates:
-            return None
-        ordered = tuple(sorted(candidates, key=lambda item: item.center[0]))
-        support = min(item.support for item in ordered) / 10.0
-        bands = min(item.diameter_bands for item in ordered) / 6.0
-        return {
-            "centers": tuple(
-                tuple(float(v) for v in item.center) for item in ordered),
-            "ellipses": tuple((
-                tuple(float(v) for v in item.ellipse.center),
-                tuple(float(v) for v in item.ellipse.axes),
-                float(item.ellipse.angle_deg),
-            ) for item in ordered),
-            "confidence": min(
-                1.0, 0.55 * min(support, 1.0) + 0.30 * min(bands, 1.0)),
-            "yaw": None,
-            "perspective": None,
-            "residual": None,
-        }
-    _, ordered, collinearity, _ = selection
-    spacing_12 = float(np.linalg.norm(ordered[1].center - ordered[0].center))
-    spacing_23 = float(np.linalg.norm(ordered[2].center - ordered[1].center))
-    perspective = spacing_12 / spacing_23
-    geometry = math.exp(
-        -10.0 * collinearity - 0.5 * abs(math.log(perspective))
-    )
-    support = min(item.support for item in ordered) / 10.0
-    bands = min(item.diameter_bands for item in ordered) / 6.0
-    confidence = min(1.0, 0.55 * geometry + 0.25 * min(support, 1.0) + 0.20 * min(bands, 1.0))
+def _affine_residual(ordered, config):
+    """三环的局部仿射质量指标：用中环椭圆与三环中心距互校。"""
 
-    # 使用中间环椭圆和三环中心距建立与旧实现一致的局部仿射质量指标。
     image_x_per_mm = (
         ordered[2].center - ordered[0].center
     ) / (2.0 * config.center_spacing_mm)
@@ -414,28 +598,230 @@ def _raw_detection(image, config):
     )
     eigenvalues = np.linalg.eigvalsh((remaining + remaining.T) * 0.5)
     largest = max(float(eigenvalues[-1]), 0.0)
-    residual = (
-        abs(float(eigenvalues[0])) / largest if largest > 1e-9 else math.inf
+    return abs(float(eigenvalues[0])) / largest if largest > 1e-9 else math.inf
+
+
+def _raw_detection(image, config, border_margin_px=0.0):
+    observations = _extract_observations(image, config, border_margin_px)
+    candidates = _cluster_observations(observations, config)
+    ordered, count, collinearity, reject = _select_group(
+        candidates, image.shape[1], config
     )
+    diagnostics = {
+        "observations": len(observations),
+        "candidates": len(candidates),
+    }
+    if count == 0:
+        diagnostics["count"] = 0
+        diagnostics["reject"] = reject
+        return diagnostics
+
+    centers = tuple(tuple(float(v) for v in item.center) for item in ordered)
+    support = min(item.support for item in ordered) / 10.0
+    bands = min(item.diameter_bands for item in ordered) / 6.0
+
+    # 3 个环 -> 能算方向、透视比、仿射残差；
+    # 2 个环 -> 只能算方向（两点确定一条线）；
+    # 1 个环 -> 连方向都没有，只给位置。
+    yaw = None
+    if count >= 2:
+        first, last = ordered[0].center, ordered[-1].center
+        yaw = math.degrees(math.atan2(
+            float(last[1] - first[1]), float(last[0] - first[0])))
+
+    perspective = None
+    residual = None
+    if count == 3:
+        spacing_12 = float(np.linalg.norm(ordered[1].center - ordered[0].center))
+        spacing_23 = float(np.linalg.norm(ordered[2].center - ordered[1].center))
+        perspective = spacing_12 / spacing_23
+        geometry = math.exp(
+            -10.0 * collinearity - 0.5 * abs(math.log(perspective)))
+        residual = _affine_residual(ordered, config)
+        confidence = min(
+            1.0,
+            0.55 * geometry + 0.25 * min(support, 1.0) + 0.20 * min(bands, 1.0),
+        )
+    else:
+        # 缺环时共线性和透视比都无从评估，置信度只反映轮廓证据强度，
+        # 再乘一个缺环惩罚，让调用方一眼看出这是部分观测。
+        base = 0.45 * min(support, 1.0) + 0.35 * min(bands, 1.0)
+        confidence = min(1.0, base * (0.85 if count == 2 else 0.65))
+
     return {
-        "centers": tuple(tuple(float(v) for v in item.center) for item in ordered),
+        **diagnostics,
+        "centers": centers,
         "ellipses": tuple((
             tuple(float(v) for v in item.ellipse.center),
             tuple(float(v) for v in item.ellipse.axes),
             float(item.ellipse.angle_deg),
         ) for item in ordered),
         "confidence": float(confidence),
-        "yaw": math.degrees(math.atan2(
-            float(ordered[2].center[1] - ordered[0].center[1]),
-            float(ordered[2].center[0] - ordered[0].center[0]),
-        )),
-        "perspective": float(perspective),
-        "residual": float(residual),
+        "yaw": yaw,
+        "perspective": perspective,
+        "residual": residual,
+        "count": count,
     }
 
 
 def _normalize_angle(angle):
     return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def _locate_ring2(centers, indices, count, config):
+    """定位环 2 的像素位置（后续所有对位误差都以它为基准）。
+
+    - 3 环：中间那个就是环 2。
+    - 2 环：按匹配到的参考索引取对应那个；若看到的是 1、3 号，取两点中点。
+    - 1 环：只看到 1 个时无法确定朝向，按"无旋转误差"的假设用参考偏移推算。
+      这种结果 yaw_valid=False，调用方据此判断能不能用来收尾。
+    """
+
+    if not centers or not indices:
+        return None
+    if count >= 3:
+        return centers[1]
+    if count == 2:
+        if tuple(indices) == (0, 1):
+            return centers[1]
+        if tuple(indices) == (1, 2):
+            return centers[0]
+        return (0.5 * (centers[0][0] + centers[1][0]),
+                0.5 * (centers[0][1] + centers[1][1]))
+    index = indices[0]
+    reference = config.reference_centers_px
+    return (centers[0][0] + reference[1][0] - reference[index][0],
+            centers[0][1] + reference[1][1] - reference[index][1])
+
+
+def _predict_layout(centers, indices, ellipses, config, prior):
+    """用看到的 1~3 个环推出完整三环的像素位置。
+
+    返回 (predicted, scale, source)：
+      predicted 长度固定为 3，按参考环号 0/1/2 排列，推不出的位置是 None。
+      scale 是"观测像素 / 参考像素"的尺度比，给下一帧缺环时沿用。
+      source = observed / two_ring / one_ring / prior。
+
+    夹着物料时中间/目标环经常被挡住。只拿"看得见的那个环"去对目标像素，
+    会把隔壁环对进去（差 150mm）。这里用已知的 150mm 间距和已看到的环把
+    被挡住的环也推出来，vision_put 按"意图环"对齐才有意义。
+    """
+
+    ref = config.reference_centers_px
+    count = len(centers)
+    if count <= 0 or indices is None or len(indices) != count:
+        return (None, None, None), 0.0, ""
+
+    if count >= 3:
+        layout = [None, None, None]
+        for center, index in zip(centers, indices):
+            layout[int(index)] = (float(center[0]), float(center[1]))
+        # 3 环时直接用观测；尺度用最外侧那一对估，留给后面缺环的帧做先验。
+        i0, i2 = int(indices[0]), int(indices[-1])
+        span_ref = math.dist(ref[i0], ref[i2])
+        span_obs = math.dist(centers[0], centers[-1])
+        scale = (span_obs / span_ref) if span_ref > 1e-6 else 0.0
+        return tuple(layout), float(scale), "observed"
+
+    if count == 2:
+        i, j = int(indices[0]), int(indices[1])
+        ci = np.asarray(centers[0], dtype=float)
+        cj = np.asarray(centers[1], dtype=float)
+        ri = np.asarray(ref[i], dtype=float)
+        rj = np.asarray(ref[j], dtype=float)
+        v_ref, v_obs = rj - ri, cj - ci
+        n_ref = float(np.linalg.norm(v_ref))
+        n_obs = float(np.linalg.norm(v_obs))
+        if n_ref < 1e-6 or n_obs < 1e-6:
+            return (None, None, None), 0.0, ""
+        # 先用环的投影直径校验这对环的间距，别让两个假候选（物料边缘/画面
+        # 边角）生成一个错误的完整布局，进而污染后续所有帧的先验。
+        try:
+            diameter_px = float(np.mean([
+                max(ellipses[k][1]) for k in (0, 1)]))
+        except (IndexError, KeyError, TypeError, ValueError):
+            diameter_px = 0.0
+        if (diameter_px > 1e-6 and config.outer_diameter_mm > 0
+                and config.center_spacing_mm > 0):
+            expected_span = (
+                abs(j - i) * config.center_spacing_mm
+                * diameter_px / config.outer_diameter_mm
+            )
+            if expected_span > 1e-6:
+                ratio = n_obs / expected_span
+                if not 0.75 <= ratio <= 1.35:
+                    # 间距和环大小对不上：只回这两个观测点，不预测第三个，
+                    # 也不允许调用方把它存成先验。
+                    layout = [None, None, None]
+                    layout[i] = (float(ci[0]), float(ci[1]))
+                    layout[j] = (float(cj[0]), float(cj[1]))
+                    return tuple(layout), 0.0, "two_ring_partial"
+        scale = n_obs / n_ref
+        angle = math.atan2(v_obs[1], v_obs[0]) - math.atan2(v_ref[1], v_ref[0])
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        layout = []
+        for k in range(3):
+            d = np.asarray(ref[k], dtype=float) - ri
+            p = ci + scale * np.array([
+                cos_a * d[0] - sin_a * d[1],
+                sin_a * d[0] + cos_a * d[1],
+            ])
+            layout.append((float(p[0]), float(p[1])))
+        return tuple(layout), float(scale), "two_ring"
+
+    # 只剩 1 个环：优先沿用上一帧的完整布局，但先验证这个观测和先验是同一
+    # 个东西——位置不能跳太远，环的投影直径也不能和先验尺度矛盾。否则宁可
+    # 丢掉先验，也不要把一个错误布局一直平移下去。
+    i = int(indices[0])
+    ci = np.asarray(centers[0], dtype=float)
+    if prior is not None:
+        prior_layout, prior_scale, _ = prior
+        if (prior_scale > 0 and i < len(prior_layout)
+                and prior_layout[i] is not None):
+            spacing_px = prior_scale * math.dist(ref[0], ref[1])
+            jump = float(math.dist(ci, prior_layout[i]))
+            try:
+                diameter_px = float(max(ellipses[0][1]))
+            except (IndexError, KeyError, TypeError, ValueError):
+                diameter_px = 0.0
+            expected_diameter = (spacing_px * config.outer_diameter_mm
+                                 / config.center_spacing_mm
+                                 if config.center_spacing_mm > 0 else 0.0)
+            diameter_ok = (
+                diameter_px <= 1e-6 or expected_diameter <= 1e-6
+                or 0.5 <= diameter_px / expected_diameter <= 2.0
+            )
+            if jump <= max(40.0, 0.6 * spacing_px) and diameter_ok:
+                dx = ci[0] - prior_layout[i][0]
+                dy = ci[1] - prior_layout[i][1]
+                layout = [
+                    None if p is None else (float(p[0] + dx), float(p[1] + dy))
+                    for p in prior_layout
+                ]
+                return tuple(layout), float(prior_scale), "prior"
+
+    # 没有先验：用这个环的投影直径估间距（环外径 95mm、相邻环心距 150mm），
+    # 方向沿用参考布局的朝向。准度有限，但比"把隔壁环当目标"好。
+    try:
+        axes = ellipses[0][1]
+        diameter_px = float(max(axes))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return (None, None, None), 0.0, ""
+    if (diameter_px <= 1e-6 or config.outer_diameter_mm <= 0
+            or config.center_spacing_mm <= 0):
+        return (None, None, None), 0.0, ""
+    spacing_px = diameter_px * (
+        config.center_spacing_mm / config.outer_diameter_mm)
+    u = np.asarray(ref[2], dtype=float) - np.asarray(ref[0], dtype=float)
+    n = float(np.linalg.norm(u))
+    if n < 1e-6:
+        return (None, None, None), 0.0, ""
+    u /= n
+    layout = []
+    for k in range(3):
+        p = ci + u * spacing_px * (k - i)
+        layout.append((float(p[0]), float(p[1])))
+    return tuple(layout), 0.0, "one_ring"
 
 
 class RingStationDetector:
@@ -446,6 +832,9 @@ class RingStationDetector:
         self._samples = deque(maxlen=config.stable_frame_count)
         self._tracking_roi = None
         self._roi_failures = 0
+        # 上一帧推出来的完整三环布局：只剩 1 个环时沿用它（只平移），
+        # 比"拿一个环的直径硬估方向"稳。
+        self._last_layout = None
 
     def reset(self):
         """清除 ROI 和稳定窗口，防止跨模式使用旧坐标。"""
@@ -453,6 +842,7 @@ class RingStationDetector:
         self._samples.clear()
         self._tracking_roi = None
         self._roi_failures = 0
+        self._last_layout = None
 
     def _make_roi(self, raw, shape):
         points = np.asarray(raw["centers"])
@@ -470,8 +860,10 @@ class RingStationDetector:
 
     @staticmethod
     def _offset_raw(raw, x0, y0):
-        if raw is None:
-            return None
+        # 未检出时 _raw_detection 也会返回一个字典（只带观测数/候选数/失败原因），
+        # 里面没有 centers/ellipses —— 这里必须先判断，否则 ROI 路径会 KeyError。
+        if raw is None or "centers" not in raw:
+            return raw
         raw["centers"] = tuple(
             (x + x0, y + y0) for x, y in raw["centers"]
         )
@@ -483,54 +875,99 @@ class RingStationDetector:
 
     def _find(self, frame):
         if self._tracking_roi is None:
-            return _raw_detection(frame, self.config), "full"
+            return _raw_detection(frame, self.config,
+                                  border_margin_px=40.0), "full"
         x0, y0, x1, y1 = self._tracking_roi
+        # ROI 是裁剪图，边框紧贴环，不能用全图那套"边缘椭圆丢弃"。
         raw = _raw_detection(frame[y0:y1, x0:x1], self.config)
         raw = self._offset_raw(raw, x0, y0)
-        if raw is not None:
+        if raw is not None and int(raw.get("count", 0)) > 0:
             self._roi_failures = 0
             return raw, "roi"
         self._roi_failures += 1
         if self._roi_failures < self.config.roi_fallback_after_failures:
-            return None, "roi"
+            # 必须原样返回 raw：_raw_detection 现在总是返回字典（带观测数/候选数/
+            # 失败原因），调用方要靠它把"为什么没检到"打到画面上。
+            # 以前这里返回 None，新 detect 直接 raw.get() 会 AttributeError。
+            return raw, "roi"
         self._roi_failures = 0
-        return _raw_detection(frame, self.config), "full_fallback"
+        return _raw_detection(frame, self.config,
+                              border_margin_px=40.0), "full_fallback"
 
     def detect(self, frame, require_quality: bool = True) -> RingStationDetection:
-        """检测一帧，返回三环对位误差、纠偏量、质量和耗时。
+        """检测一帧，返回圆环对位误差、纠偏量、质量和耗时。
 
         require_quality=False 时，置信度/仿射残差/透视比只作为提示写进 detail，
-        不再拦掉这一帧：只要三个环稳定可见就继续算稳定窗口和纠偏量。
-        ring_fix 用这个模式，实现"视野里出现三个环就开始矫正"。
+        不再拦掉这一帧：只要圆环稳定可见就继续算稳定窗口和纠偏量。
+        ring_fix / vision_put 用这个模式，实现"视野里出现环就开始矫正"。
         """
 
         started = time.perf_counter()
         if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
             raise RingStationDetectionError("圆环检测要求 BGR 彩色图像")
-        # 1. 提取椭圆、合并同心轮廓、筛选三个共线圆环；有ROI时优先局部搜索。
+        # 1. 提取椭圆、合并同心轮廓、筛共线圆环；有ROI时优先局部搜索。
+        #    能看到 3 个最好，只看到 2 个或 1 个也照样输出（降级观测）。
         raw, scope = self._find(frame)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if raw is None:
+            # 兜底：任何路径返回 None 都不能让检测器抛异常，否则一帧失败就带崩
+            # 整个主循环（rclpy/串口那边的定时器同理）。
+            raw = {"count": 0, "observations": 0, "candidates": 0,
+                   "reject": "未返回检测结果"}
+        if int(raw.get("count", 0)) == 0:
             self._samples.clear()
             return RingStationDetection(
                 processing_ms=elapsed_ms,
                 detection_scope=scope,
-                detail="没有找到满足几何约束的三个圆环",
+                detail=(f"未检出（椭圆 {raw.get('observations', 0)} 个 -> "
+                        f"候选 {raw.get('candidates', 0)} 个）："
+                        f"{raw.get('reject', '没有找到圆环')}"),
+                ellipse_observation_count=int(raw.get("observations", 0)),
+                ring_candidate_count=int(raw.get("candidates", 0)),
             )
 
         config = self.config
-        count = len(raw["centers"])
-        # ⚠ 单环时**绝不能收窄 ROI**：ROI 一旦缩到那一个环周围，后续每帧就只搜那一小块，
-        #   另外两个环永远进不了搜索范围 —— 三环会被永久锁死成单环。
-        #   所以只有凑齐三环时才启用局部跟踪，单环仍然每帧全图搜索。
-        if count >= 3:
+        count = int(raw["count"])
+        # 环的归属必须在**偏移过 ROI 之后**的最终坐标上判断：
+        # 参考环心是全图坐标，拿裁剪后的局部坐标去匹配会全错。
+        # （3 个环时归属恒为 (0,1,2)，所以这个坑只在缺环时才暴露。）
+        indices = None
+        if count < 3 and self._last_layout is not None:
+            # 有上一帧的完整布局时，先按"离上一帧预测位置最近"定身份——
+            # 缺环时比拿参考像素硬比稳得多（车近车远参考像素尺度都对不上）。
+            indices, match_error = _assign_with_prior(
+                raw["centers"], self._last_layout)
+        if indices is None:
+            indices, match_error = _assign_to_reference(
+                raw["centers"], config, raw["ellipses"])
+        raw["indices"] = indices        # 存进 samples，稳定窗口靠它判断"看到的还是同样几个环"
+        # 用看到的环推出完整三环布局；缺环时调用方（vision_put）按意图环对齐。
+        predicted, layout_scale, layout_source = _predict_layout(
+            raw["centers"], indices, raw["ellipses"], config,
+            self._last_layout)
+        if layout_source in ("observed", "two_ring") and layout_scale > 0:
+            # 只有尺度可信的布局才配当先验。two_ring_partial（间距和环大小
+            # 对不上）和 one_ring（靠直径硬估方向）都不存，避免假布局一直
+            # 被平移、越传越偏。
+            self._last_layout = (predicted, layout_scale, layout_source)
+        elif count == 1 and layout_source == "prior":
+            # 单环沿用了上一帧布局：把平移后的结果存回去，让它继续跟着走。
+            self._last_layout = (predicted, layout_scale, layout_source)
+        elif count == 1 and layout_source == "one_ring":
+            # 先验被上面的跳变/直径校验拒了：清掉，别下一帧又拿它试。
+            self._last_layout = None
+        if count == 3:
             self._tracking_roi = self._make_roi(raw, frame.shape)
-        # 2. 只有**三环共线**这条路径才做完整质量门槛（置信度 / 仿射残差 / 透视比）。
-        #    不共线或单环时这三项都无从评估：置信度只能由 support/bands 得出（最高 0.85），
-        #    拿 0.9 的线去卡会每帧都被判"置信度不足"，稳定窗口永远填不满 ——
-        #    表现就是"能画出圆，但永远 STABLE=False"，等于白检。
+        else:
+            # 缺环时**不能**锁 ROI：_make_roi 是按"当前检到的环"算包围盒的，
+            # 只看到 1~2 个时 ROI 会收缩到它们周围，其余环永远落在窗口外，
+            # 下一帧更检不到 —— 自锁，再也恢复不了三环。缺环就退回全图搜索。
+            self._tracking_roi = None
+        # 2. 只有 3 个环才做完整的质量门槛（置信度 / 仿射残差 / 透视比）。
+        #    缺环时这三项都无从评估，改用聚类层面的证据（同心轮廓支持数、
+        #    直径波段数）把住，并由 visible_ring_count 告诉调用方这是部分观测。
         quality_detail = None
-        if raw["yaw"] is not None and count >= 3:
+        if count == 3:
             if raw["confidence"] < config.minimum_confidence:
                 quality_detail = "三圆环识别置信度不足"
             elif raw["residual"] > config.maximum_affine_residual:
@@ -541,6 +978,33 @@ class RingStationDetector:
                 <= config.perspective_ratio_range[1]
             ):
                 quality_detail = "圆环透视比超出标定适用范围"
+        elif count == 2:
+            # 用环的投影直径估像素/毫米，再和物理间距比。不能拿参考像素间距
+            # 直接比：参考是标定距离下的尺度，车一近一远比值就全偏了。
+            try:
+                diameter_px = float(np.median([
+                    max(ellipse[1]) for ellipse in raw["ellipses"]]))
+            except (IndexError, KeyError, TypeError, ValueError):
+                diameter_px = 0.0
+            observed_span = float(math.dist(raw["centers"][0], raw["centers"][1]))
+            if (indices is not None and len(indices) == 2
+                    and diameter_px > 1e-6 and config.outer_diameter_mm > 0):
+                px_per_mm = diameter_px / config.outer_diameter_mm
+                spacing_mm = (indices[1] - indices[0]) * config.center_spacing_mm
+                expected_px = spacing_mm * px_per_mm
+                if expected_px > 1e-6:
+                    ratio = observed_span / expected_px
+                    if not 0.75 <= ratio <= 1.35:
+                        quality_detail = "仅见 2 环，间距与所匹配的参考对不符"
+        # count == 1 不加任何闸。单环既没有间距可交叉验证、也没有第二个点定方向，
+        # "是哪一号环"只能靠离参考位置最近来猜；而这个猜测在车偏移超过约半个环距时
+        # 必然失效（那时这个环的位置恰好就像隔壁那号）。这是信息量的硬限制，
+        # 用匹配残差之类的判据拦不住（认错号时残差反而更小），加闸只会误杀
+        # 正常的远距离观测。调用方应当把 visible_ring_count==1 视为"位置可用、
+        # 但环号存疑、航向未知"，只在已经基本对准的前提下参考它。
+        # count == 1 不做置信度门槛：缺环时共线性/透视都无从评估，置信度被
+        # 系统性压低，按 3 环的标准卡会永远过不去。单环证据由聚类层面保证
+        # （min_cluster_support 个同心轮廓 + min_diameter_bands 个直径波段）。
 
         if quality_detail is not None and require_quality:
             self._samples.clear()
@@ -559,15 +1023,21 @@ class RingStationDetector:
                 processing_ms=elapsed_ms,
                 detection_scope=scope,
                 detail=quality_detail,
+                visible_ring_count=count,
+                ring_indices=indices,
+                yaw_valid=(count >= 2),
+                ellipse_observation_count=int(raw.get("observations", 0)),
+                ring_candidate_count=int(raw.get("candidates", 0)),
+                predicted_centers_px=predicted,
+                layout_scale=layout_scale,
+                layout_source=layout_source,
             )
 
-        # 可见环数一变，稳定窗口要重来（1 环和 3 环的中值不能混算）。
-        if self._samples and len(self._samples[-1]["centers"]) != count:
-            self._samples.clear()
-        # 共线状态变了也要重来：不共线的样本 yaw=None，和共线样本混在一起
-        # 算中值会 None - float 直接抛异常（会跳过整帧甚至打断控制）。
-        if self._samples and ((self._samples[-1]["yaw"] is None)
-                              != (raw["yaw"] is None)):
+        # 可见环的数量或"是哪几个"一变，稳定窗口必须重来（两者的中值不能混算）。
+        if self._samples and (
+            int(self._samples[-1]["count"]) != count
+            or tuple(self._samples[-1]["indices"] or ()) != tuple(indices)
+        ):
             self._samples.clear()
         self._samples.append(raw)
         # 连续帧中，每个圆心的X/Y分别取中值；坐标单位为原图像素。
@@ -588,56 +1058,44 @@ class RingStationDetector:
             len(self._samples) == config.stable_frame_count
             and maximum_jitter <= config.maximum_center_jitter_px
         )
-        # 单环没有方向可言：航向误差记 0 但不可信（within_tolerance 会因 count<2 恒为 False）。
-        if raw["yaw"] is None:
-            angle_error = 0.0
-            yaw = config.reference_yaw_deg
-        else:
-            # 防御：窗口里理论上已经保证全是带 yaw 的样本，这里再过滤一次
+
+        # 只看到 1 个环时没有方向可言：航向误差记 0 并标记 yaw_valid=False，
+        # 由调用方决定能不能拿它收尾（within_tolerance 会因此恒为 False）。
+        yaw_valid = bool(count >= 2)
+        if yaw_valid:
             yaw_errors = [
                 _normalize_angle(sample["yaw"] - config.reference_yaw_deg)
                 for sample in self._samples
-                if sample["yaw"] is not None
             ]
-            if not yaw_errors:
-                angle_error = 0.0
-            else:
-                angle_error = float(np.median(yaw_errors))
+            angle_error = float(np.median(yaw_errors))
             yaw = _normalize_angle(config.reference_yaw_deg + angle_error)
+        else:
+            angle_error = 0.0
+            yaw = config.reference_yaw_deg
 
         affine = np.asarray(config.image_to_station_affine)
         # 图像像素偏差乘2x2标定矩阵，得到工位平面上的毫米偏差。
-        # 三环共线时按顺序对参考环心（中间那个就是环 2）。
-        # 不共线 / 单环时不知道每个环是第几号，逐个按"离哪个参考环心最近"配对；
-        # error 取"最像环 2 的那个"，否则环 2 会被拿去和环 1 的参考比，平白差 150mm。
-        if raw["yaw"] is not None and count >= 3:
-            references = config.reference_centers_px
-            error_index = 1
-        else:
-            references = tuple(
-                config.reference_centers_px[int(np.argmin([
-                    float(np.linalg.norm(
-                        np.asarray(center) - np.asarray(reference)))
-                    for reference in config.reference_centers_px
-                ]))]
-                for center in centers
-            )
-            distances = [
-                float(np.linalg.norm(
-                    np.asarray(center) - np.asarray(config.reference_centers_px[1])))
-                for center in centers
-            ]
-            error_index = int(np.argmin(distances))
+        # 只对**看得见**的环算误差；看不见的没法检查，不能假装它是准的。
+        indices = tuple(indices)
         metric_errors = []
-        for center, reference in zip(centers, references):
-            pixel_error = np.asarray(center) - np.asarray(reference)
+        for center, index in zip(centers, indices):
+            pixel_error = np.asarray(center) - np.asarray(
+                config.reference_centers_px[index]
+            )
             metric_errors.append(affine @ pixel_error)
         metric_errors = tuple(metric_errors)
-        error_x, error_y = (float(v) for v in metric_errors[error_index])
-        position_error = max(float(np.linalg.norm(error)) for error in metric_errors)
+        # error_x/error_y 始终是"环 2 相对参考位"的偏差 —— 对准就是让环 2 到位。
+        ring2_center = _locate_ring2(centers, indices, count, config)
+        ring2_error = affine @ (
+            np.asarray(ring2_center)
+            - np.asarray(config.reference_centers_px[1])
+        )
+        error_x, error_y = float(ring2_error[0]), float(ring2_error[1])
+        position_error = (max(float(np.linalg.norm(error)) for error in metric_errors)
+                          if metric_errors else math.inf)
         within = bool(
             stable
-            and raw["yaw"] is not None   # 没有方向（不共线/单环）就不能判"对准"
+            and yaw_valid
             and position_error <= config.maximum_position_error_mm
             and abs(angle_error) <= config.maximum_angle_error_deg
         )
@@ -647,14 +1105,16 @@ class RingStationDetector:
             correction = np.asarray(config.chassis_image_to_motion) @ np.asarray(
                 (error_x, error_y, angle_error)
             )
+        scope_text = f"{count}环{indices if indices else ''}"
         if not stable:
-            detail = f"等待稳定观测（{len(self._samples)}/{config.stable_frame_count}）"
-        elif raw["yaw"] is None:
-            detail = f"见到 {count} 个环但不共线：位置可用，但航向未知，不能判对准"
+            detail = (f"{scope_text} 等待稳定观测"
+                      f"（{len(self._samples)}/{config.stable_frame_count}）")
+        elif not yaw_valid:
+            detail = f"{scope_text} 只见到 1 个环，航向未知，不能收尾"
         elif within:
-            detail = "工位视觉残差已达到验收精度"
+            detail = f"{scope_text} 工位视觉残差已达到验收精度"
         else:
-            detail = "工位偏差超出验收精度"
+            detail = f"{scope_text} 工位偏差超出验收精度"
         if quality_detail is not None:
             # require_quality=False：质量只提示，照常给纠偏量（车会先动起来）
             detail = f"{quality_detail}（仅提示，继续纠偏）；{detail}"
@@ -682,6 +1142,14 @@ class RingStationDetector:
             processing_ms=elapsed_ms,
             detection_scope=scope,
             detail=detail,
+            visible_ring_count=count,
+            ring_indices=indices,
+            yaw_valid=yaw_valid,
+            ellipse_observation_count=int(raw.get("observations", 0)),
+            ring_candidate_count=int(raw.get("candidates", 0)),
+            predicted_centers_px=predicted,
+            layout_scale=layout_scale,
+            layout_source=layout_source,
         )
 
 
@@ -694,45 +1162,54 @@ def draw_ring_station_detection(frame, result: RingStationDetection):
             cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 255), 2,
             cv2.LINE_AA,
         )
+        # 把"卡在哪一步"直接打出来：obs=提取到的椭圆数，cand=聚类后的环候选数。
+        # obs 为 0 是光照/Canny 问题；obs 有但 cand 为 0 是同心轮廓/直径波段不够。
+        cv2.putText(
+            frame,
+            f"obs={result.ellipse_observation_count}  "
+            f"cand={result.ring_candidate_count}",
+            (20, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 255), 2,
+            cv2.LINE_AA,
+        )
         return frame
     colors = ((0, 180, 255), (0, 255, 0), (255, 160, 0))
     points = []
-    for position, (center, ellipse) in enumerate(
-        zip(result.centers_px, result.ellipses)
+    for index, (center, ellipse, color) in enumerate(
+        zip(result.centers_px, result.ellipses, colors), start=1
     ):
-        color = colors[position] if position < len(colors) else (200, 200, 200)
         cv2.ellipse(frame, ellipse, color, 2, cv2.LINE_AA)
         point = tuple(int(round(value)) for value in center)
         points.append(point)
         cv2.drawMarker(frame, point, color, cv2.MARKER_CROSS, 24, 2)
-        # 只显示圆心坐标，**不标环号**（环号交给上层流程自己判定）。
-        # 标在环的正下方、水平居中，避免压在同心圆的白色线条上看不清。
-        label = f"({point[0]}, {point[1]})"
-        (text_w, _), _ = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
-        half_height = int(max(ellipse[1]) / 2) if len(ellipse) > 1 else 30
         cv2.putText(
-            frame, label,
-            (point[0] - text_w // 2, point[1] + half_height + 26),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2, cv2.LINE_AA,
+            frame, f"R{index}", (point[0] + 10, point[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA,
         )
-    cv2.polylines(frame, [np.asarray(points, np.int32)], False, (255, 0, 255), 2)
+    # 只有一个点时 cv2.polylines 会触发断言（要求至少两点），单独判断。
+    if len(points) >= 2:
+        cv2.polylines(frame, [np.asarray(points, np.int32)], False, (255, 0, 255), 2)
     cv2.rectangle(frame, (10, 65), (820, 145), (0, 0, 0), -1)
+    # 环数和"是哪几个"直接打在状态行前：夹爪伸出去挡住画面时一眼能看出
+    # 现在是靠几个环在算，少环时也知道是哪两个。
     cv2.putText(
         frame,
-        f"Rings={len(result.centers_px)}  "
+        f"Rings {result.visible_ring_count}/3 {tuple(result.ring_indices)}  "
         f"Ring: {'STABLE' if result.stable else 'WAITING'}  "
         f"dX={result.error_x_mm:+.2f}mm dY={result.error_y_mm:+.2f}mm "
         f"dYaw={result.angle_error_deg:+.2f}deg"
-        f"{'  (single ring: yaw n/a)' if len(result.centers_px) < 2 else ''}",
-        (20, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.66,
+        f"{'' if result.yaw_valid else '  (yaw unknown)'}",
+        (20, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
         (80, 255, 80) if result.within_tolerance else (255, 255, 255),
         2, cv2.LINE_AA,
     )
     cv2.putText(
         frame,
-        f"Confidence={result.confidence:.3f} residual={result.affine_residual:.3f} "
-        f"perspective={result.perspective_ratio:.3f} {result.processing_ms:.1f}ms",
+        f"obs={result.ellipse_observation_count} "
+        f"cand={result.ring_candidate_count}  "
+        f"Confidence={result.confidence:.3f} "
+        f"residual={'n/a' if not math.isfinite(result.affine_residual) else f'{result.affine_residual:.3f}'} "
+        f"perspective={'n/a' if not math.isfinite(result.perspective_ratio) else f'{result.perspective_ratio:.3f}'} "
+        f"{result.processing_ms:.1f}ms",
         (20, 132), cv2.FONT_HERSHEY_SIMPLEX, 0.60,
         (255, 255, 255), 2, cv2.LINE_AA,
     )

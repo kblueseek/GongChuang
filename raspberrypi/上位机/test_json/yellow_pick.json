@@ -2,7 +2,7 @@
   "commands": [
     {
       "cmd": "comment",
-      "text": "黄色物料：对中后 ext 前伸由 track_pid.json 的 ext_offset_deg 自动完成，这里不要再写 gimbal_ext"
+      "text": "黄色物料：对中后的偏移直接改 track_pid.json 的 target_x/target_y（不再做 ext/yaw 角度补偿），这里不要再写 gimbal_ext"
     },
     {
       "cmd": "gimbal",

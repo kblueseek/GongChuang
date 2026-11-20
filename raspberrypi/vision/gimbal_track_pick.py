@@ -18,15 +18,13 @@
      序列里后续的抓取/放置指令（你自己写死的 gimbal/gripper/tray 指令）。
 
 需要现场标定的量（改 config/track_pid.json，上位机也能直接改；轴方向反了就翻号）：
+  --target-x / --target-y         物料最后要停在哪（默认画面中心）。填成"夹爪降下去
+                                  正好夹住物料"时物料所在的像素后，收工即可直接夹；
+                                  需要偏移就改这个目标像素，不再做收工后的角度补偿
   --kp-yaw / --kp-extend          像素误差 → 角速度 °/s 的比例（越大跟得越猛，太大振荡）
   --yaw-sign / --ext-sign         轴方向（±1）
   --max-yaw-deg-s / --max-extend-deg-s  速度限幅
   --cam-rotation                  摄像头安装旋转角（180=倒装）
-  --ext-offset-deg                对中后再前伸多少度（相机→夹爪的机械偏移）。
-  --yaw-offset-deg                对中后再转 yaw 多少度（相机装在夹爪侧面的横向
-                                  偏移；主臂在正上方时为 0）。
-                                  两个补偿都只随结果 JSON 回传，由 motion_planner 在
-                                  color_pick 结束后一起执行；摄像头改装后只改这两个数。
 
 平面映射标定（--calib N，独立运行，不走 motion_planner）：
     python3 vision/gimbal_track_pick.py --calib 100 --color 1
@@ -324,9 +322,20 @@ def _apply_track_config(args, here: Path):
 _LIVE_TUNABLE = (
     'kp_yaw', 'ki_yaw', 'kd_yaw', 'kp_extend', 'ki_extend', 'kd_extend',
     'max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau',
-    'yaw_sign', 'ext_sign', 'ext_offset_deg', 'yaw_offset_deg', 'stable',
+    'yaw_sign', 'ext_sign', 'stable',
     'still_px',
+    # 目标像素也能热改：track_debug 里拖滑杆，十字线当场跟着动，
+    # 臂会跟着把物料重新对到新位置，看一眼就知道该填多少。
+    'target_x', 'target_y',
 )
+
+
+def _as_float(value, fallback):
+    """尽量转成 float；None/空串/非法值都退回 fallback。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _reload_live_config(args, here: Path):
@@ -373,10 +382,15 @@ def _prepare_frame_ctx(args) -> dict:
     else:
         frame_w, frame_h = args.width, args.height
     map1, map2 = build_undistort_maps(args.width, args.height)
+
+    # 跟随目标像素：默认画面中心；填了就用填的值。
+    # 这里是"物料最终要停在哪"——把它设成"夹爪降下去正好夹住物料"时物料所在的
+    # 像素，跟随收工时夹爪就已经对准物料，序列里不用再补 yaw/ext 偏移。
     return {
         'rotate': rotate, 'map1': map1, 'map2': map2,
         'frame_w': frame_w, 'frame_h': frame_h,
-        'cx': frame_w / 2.0, 'cy': frame_h / 2.0,
+        'cx': _as_float(args.target_x, frame_w / 2.0),
+        'cy': _as_float(args.target_y, frame_h / 2.0),
         'roi_y': int(frame_h * (1.0 - max(0.0, min(1.0, args.roi_bottom)))),
     }
 
@@ -457,6 +471,11 @@ def track_color(camera, node, args, color_doc, ctx, color,
             if ROTATE is not None:
                 frame = cv2.rotate(frame, ROTATE)
 
+            # 每帧重算目标像素：track_debug 里允许热改（拖滑杆 1 秒内生效），
+            # 十字线和误差都跟着走，方便现场找"夹爪能夹住物料"的那个位置。
+            cx_target = _as_float(args.target_x, frame_w / 2.0)
+            cy_target = _as_float(args.target_y, frame_h / 2.0)
+
             # ROI 在 detect_target 的缩放坐标系里：detect 内部 scale=processing_scale
             target = detect_target(frame, args.color, color_doc, args,
                                    min_cy=roi_y_scaled * args.processing_scale)
@@ -514,8 +533,6 @@ def track_color(camera, node, args, color_doc, ctx, color,
                                   'yaw_deg': round(node._gimbal[0], 2),
                                   'lift_deg': round(node._gimbal[1], 2),
                                   'extend_deg': round(node._gimbal[2], 2),
-                                  'ext_offset_deg': round(float(args.ext_offset_deg), 2),
-                                  'yaw_offset_deg': round(float(args.yaw_offset_deg), 2),
                                   # 收工瞬间的残余像素误差：标定用它判断这一组
                                   # 是"真的对中"还是"卡在死区边上"。
                                   'ex_px': round(ex, 2), 'ey_px': round(ey, 2)}
@@ -1489,15 +1506,16 @@ def main() -> int:
                         help='误差小于这个像素数就停（也算对准）')
     parser.add_argument('--deriv-tau', type=float, default=0.05,
                         help='微分低通时间常数 s，越大越平滑')
-    parser.add_argument('--ext-offset-deg', type=float, default=0.0,
-                        help='对中后自动前伸补偿 °（相机→夹爪机械偏移，0=不补偿）')
-    parser.add_argument('--yaw-offset-deg', type=float, default=0.0,
-                        help='对中后自动转 yaw 补偿 °（相机装在夹爪侧面时的'
-                             '横向偏移，0=不补偿）')
     parser.add_argument('--yaw-sign', type=float, default=1.0, choices=[1.0, -1.0],
                         help='yaw 速度方向反了改成 -1')
     parser.add_argument('--ext-sign', type=float, default=1.0, choices=[1.0, -1.0],
                         help='extend 速度方向反了改成 -1')
+    # —— 跟随目标像素 ——
+    parser.add_argument('--target-x', type=float, default=None,
+                        help='物料最终停下的像素 X（默认画面中心）。'
+                             '填"夹爪降下去正好夹住物料"时物料所在的像素')
+    parser.add_argument('--target-y', type=float, default=None,
+                        help='物料最终停下的像素 Y（默认画面中心）')
     # —— 画面约束 ——
     parser.add_argument('--roi-bottom', type=float, default=0.9,
                         help='只在画面下半这部分找物料：取值 0~1 = 从底部往上占画面比例'

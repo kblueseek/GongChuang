@@ -126,6 +126,11 @@ TUNE_PROFILE_PATH = os.path.join(HERE, "tune_profile.json")
 TRACK_PID_PATH = os.path.normpath(
     os.path.join(HERE, "..", "vision", "config", "track_pid.json"))
 
+# 视觉对环 PID（vision_put 用的云台速度环）：另一套参数，另一份 JSON。
+# vision_put_align.py 每次启动读它，所以改完、下次执行 vision_put 就生效。
+PUT_PID_PATH = os.path.normpath(
+    os.path.join(HERE, "..", "vision", "config", "vision_put.json"))
+
 # 舵机角度（夹爪 / 载物盘）：滑杆改动自动保存，下次开 GUI 恢复。
 # 直接发 /cmd_servo，由 f407_bridge 转发 F407，不经过 motion_planner。
 SERVO_PROFILE_PATH = os.path.join(HERE, "servo_profile.json")
@@ -211,6 +216,16 @@ COMMAND_TYPES = {
         'params': 'color',
         'hint': '纯调参：一直跟随该颜色（1~6），不判“对中完成”；到 PID 页拖滑块，'
                 '1 秒内生效，点■停止结束。可写第 2 个参数覆盖超时秒数（默认 600）'
+    },
+    'vision_put': {
+        'params': 'ring,target_x,target_y',
+        'hint': '盲放到大概位置之后的视觉对环（阻塞约 4~6s）：用圆环检测找到环心，'
+                '把环心推到画面固定像素——摄像头和夹爪相对位置固定，'
+                '"环心落到目标像素"就等于"夹爪正对环心"，不需要识别物料。'
+                'ring=0 取离目标像素最近的环（1~3 可指定左/中/右）；'
+                'target_x/target_y 留空 = 用「视觉对环 PID」页存的目标像素'
+                '（vision_put.json，当前默认 659/520），写了则只覆盖这一条动作。'
+                '例：0,659,520'
     },
     'number_put': {
         'params': 'number',
@@ -299,6 +314,12 @@ def cmd_to_text(cmd: dict) -> str:
         verb = '抓取' if name == 'pick' else '放置'
         return (f"{verb} yaw={cmd.get('yaw_deg', 0)}° lift={cmd.get('lift_deg', 0)}° "
                 f"ext={cmd.get('extend_deg', 0)}° 夹爪{cmd.get('gripper_close', 35)}°")
+    if name == 'vision_put':
+        ring = cmd.get('ring', 0)
+        tx, ty = cmd.get('target_x'), cmd.get('target_y')
+        where = ('PID 页默认像素' if tx in (None, '') and ty in (None, '')
+                 else f'像素({tx or "?"},{ty or "?"})')
+        return f"视觉对环 环={ring if ring not in (None, '') else '最近'} → {where}"
     if name == 'color_pick':
         color = str(cmd.get('color', '?')).strip().lower()
         if color == 'open':
@@ -406,6 +427,19 @@ def build_cmd(name: str, params_str: str) -> dict:
                 cmd['timeout_s'] = float(vals[3]) if vals[3] else 60.0
             except ValueError:
                 cmd['timeout_s'] = 60.0
+        return cmd
+
+    if name == 'vision_put':
+        # ring,target_x,target_y —— 后两个可以留空（=画面中心）
+        cmd = {'cmd': name}
+        try:
+            cmd['ring'] = int(float(parts[0])) if parts else 0
+        except ValueError:
+            cmd['ring'] = 0
+        if len(parts) > 1:
+            cmd['target_x'] = float(parts[1])
+        if len(parts) > 2:
+            cmd['target_y'] = float(parts[2])
         return cmd
 
     if name in ('color_pick', 'number_put', 'double_put'):
@@ -525,15 +559,12 @@ TRACK_PARAMS = [
     # 滑杆上限和调参页"云台最大速度"（0x14~0x16 的 2000）对齐，别在这里先卡死。
     ('max_yaw_deg_s',    'yaw速度限幅 °/s',        10.0, 2000.0, 5.0, 120.0, False),
     ('max_extend_deg_s', 'extend速度限幅 °/s',     10.0, 2000.0, 5.0, 300.0, False),
-    # 相机装在夹爪后方：画面"对中"之后还要再前伸一段才够到物料。
-    # 这段是纯机械偏移，随摄像头安装位置变——改装后只改这一项，序列里
-    # 不用再写 gimbal_ext。视觉程序随结果 JSON 回传，color_pick 结束时自动执行。
-    ('ext_offset_deg',   '对中后前伸补偿 °',       -500.0, 500.0, 1.0, 0.0, False),
-    # 相机装在夹爪侧面时，画面"对中"之后夹爪还在物料旁边，要再转一点 yaw。
-    # 同样是纯机械偏移，和 ext_offset_deg 一起在 color_pick 结束时下发。
-    ('yaw_offset_deg',   '对中后 yaw 补偿 °',      -60.0,  60.0, 1.0, 0.0, False),
     ('deadband_px',      '死区 (px)',              0.0, 100.0, 1.0, 10.0, False),
     ('deriv_tau',        '微分低通 τ (s)',         0.0,  0.5, 0.01, 0.05, False),
+    # 跟随目标像素：物料最后要停在哪。设成"夹爪降下去正好夹住物料"时物料所在的
+    # 像素，收工就是能直接夹的位置（对中后不再做角度补偿）。
+    ('target_x',         '目标像素 X',              0.0, 1280.0, 1.0, 640.0, False),
+    ('target_y',         '目标像素 Y',              0.0,  720.0, 1.0, 360.0, False),
     ('cam_rotation',     '摄像头旋转 °',           0,   270, 90,  180, True),
     ('yaw_sign',         'yaw 方向 (+1/-1)',       -1.0, 1.0, 2.0, 1.0, True),
     ('ext_sign',         'extend 方向 (+1/-1)',    -1.0, 1.0, 2.0, 1.0, True),
@@ -543,8 +574,50 @@ TRACK_GROUPS = [
     ('跟踪 yaw 环', ('kp_yaw', 'ki_yaw', 'kd_yaw')),
     ('跟踪 extend 环', ('kp_extend', 'ki_extend', 'kd_extend')),
     ('跟踪限幅 / 死区', ('max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau')),
-    ('抓取补偿（相机→夹爪）', ('yaw_offset_deg', 'ext_offset_deg')),
+    # 物料停在能夹的位置：对中后不再补 yaw/ext，偏移直接体现在目标像素上。
+    ('跟随目标像素（夹爪能夹住物料时物料所在位置）', ('target_x', 'target_y')),
     ('摄像头 / 方向', ('cam_rotation', 'yaw_sign', 'ext_sign')),
+]
+
+# 视觉对环 PID（vision_put_align.py 的速度环，存 vision/config/vision_put.json）。
+# 和上面的物料跟踪环是**两套独立参数**：同一个相机/云台，但任务不同——跟踪环是
+# "跟着物料跑"，对环环是"把环心推到固定像素后停住"。默认值照抄已经在用的
+# track_pid.json，方向和限幅也一致，所以第一次跑不用重标。
+PUT_PARAMS = [
+    ('kp_yaw',           '对环yaw Kp (px→°/s)',    0.0,  5.0, 0.01, 1.0, False),
+    ('ki_yaw',           '对环yaw Ki',             0.0,  2.0, 0.005, 0.01, False),
+    ('kd_yaw',           '对环yaw Kd',             0.0,  2.0, 0.005, 0.02, False),
+    ('kp_extend',        '对环extend Kp (px→°/s)', 0.0, 10.0, 0.01, 4.99, False),
+    ('ki_extend',        '对环extend Ki',          0.0,  2.0, 0.005, 0.01, False),
+    ('kd_extend',        '对环extend Kd',          0.0,  2.0, 0.005, 0.015, False),
+    ('max_yaw_deg_s',    'yaw速度限幅 °/s',        10.0, 2000.0, 5.0, 780.0, False),
+    ('max_extend_deg_s', 'extend速度限幅 °/s',     10.0, 2000.0, 5.0, 1155.0, False),
+    ('deadband_px',      '控制死区 (px)',          0.0, 100.0, 1.0, 8.0, False),
+    ('deriv_tau',        '微分低通 τ (s)',         0.0,  0.5, 0.01, 0.05, False),
+    ('tol_px',           '判定对环成功 (px)',      0.0, 100.0, 1.0, 10.0, False),
+    ('stable',           '连续成功帧数',            1,   30,  1,  6, True),
+    # 选定最近的那个环后只跟它：新观测离上次环心超过这个像素数就当作
+    # 该环丢失（原地等），不会切到旁边别的环导致云台乱晃。
+    ('lock_radius_px',   '锁定环最大偏移 (px)',    20.0, 400.0, 5.0, 150.0, False),
+    ('max_target_distance_px', '目标环最大偏离 (px)', 50.0, 800.0, 10.0, 300.0, False),
+    ('roi_fraction',     '只看中心区域比例',        0.3, 1.0, 0.05, 0.65, False),
+    ('yaw_sign',         'yaw 方向 (+1/-1)',       -1.0, 1.0, 2.0, -1.0, True),
+    ('ext_sign',         'extend 方向 (+1/-1)',    -1.0, 1.0, 2.0, -1.0, True),
+    # 夹爪正对环心时，环心落在画面的哪个像素。现场按实物摆正后读出来填这里。
+    ('target_x',         '目标像素 X',             0.0, 1280.0, 1.0, 640.0, False),
+    ('target_y',         '目标像素 Y',             0.0,  720.0, 1.0, 360.0, False),
+    # 角度多久不变就算"臂已到位"。不能设太大：视觉一开始发速度就会顶掉位置保持。
+    ('settle_stable_s',  '到位确认 (s)',           0.0,  2.0, 0.05, 0.2, False),
+]
+
+PUT_GROUPS = [
+    ('对环 yaw 环', ('kp_yaw', 'ki_yaw', 'kd_yaw')),
+    ('对环 extend 环', ('kp_extend', 'ki_extend', 'kd_extend')),
+    ('速度限幅 / 死区', ('max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau')),
+    ('判定成功', ('tol_px', 'stable')),
+    ('搜索范围 / 锁环', ('roi_fraction', 'lock_radius_px', 'max_target_distance_px')),
+    ('目标像素（夹爪正对环心时环心所在位置）', ('target_x', 'target_y')),
+    ('方向 / 到位确认', ('yaw_sign', 'ext_sign', 'settle_stable_s')),
 ]
 
 # 舵机角度（上位机直接下发 /cmd_servo）：(键名, 显示名, 最小, 最大, 步长, 默认值)
@@ -866,11 +939,20 @@ class App:
         self._track_after = None
         self._track_applying = False
         # 用户这次真正拖过的滑块。保存时只写这些键 —— 否则界面上这份（启动时
-        # 读的快照）会把运行中手改的 track_pid.json 全部覆盖回去：改完
-        # ext_offset_deg 再动一下 kp 滑块，补偿量就被悄悄写回启动时的旧值，
-        # 表现就是"这次 color_pick 有修正动作、下次又没了"。
+        # 读的快照）会把运行中手改的 track_pid.json 全部覆盖回去：比如手改
+        # target_x 后再动一下 kp 滑块，目标像素就被悄悄写回启动时的旧值。
         self._track_dirty = set()
         self.track_status = tk.StringVar(value='')
+
+        # ---------- 视觉对环 PID（vision_put 速度环，存 vision/config/vision_put.json） ----------
+        self.put_tune = {key: float(default)
+                         for (key, _label, _lo, _hi, _step, default, _is_int) in PUT_PARAMS}
+        self._load_put_profile()
+        self.put_scales = {}
+        self._put_after = None
+        self._put_applying = False
+        self._put_dirty = set()
+        self.put_status = tk.StringVar(value='')
 
         # ---------- 舵机角度（夹爪/载物盘，上位机直接 /cmd_servo） ----------
         self.servo_vals = {key: float(default)
@@ -1506,6 +1588,45 @@ class App:
         ttk.Label(track_box, textvariable=self.track_status, foreground='#2e7d32',
                   wraplength=310).pack(anchor='w')
 
+        # ---------- 视觉对环 PID（vision_put 用，和上面的跟踪环互不影响） ----------
+        put_box = ttk.LabelFrame(tab, text='视觉对环 PID（vision_put 用）', padding=4)
+        put_box.pack(fill=tk.X, pady=(6, 3))
+        ttk.Label(put_box, foreground='#666', wraplength=310,
+                  text='盲放后把圆环圆心推到固定像素的速度环，存在树莓派 '
+                       'vision/config/vision_put.json。和上面的物料跟踪 PID 是两套'
+                       '参数，改这里不影响 color_pick。拖完下次 vision_put 生效。'
+                  ).pack(anchor='w')
+
+        self._put_applying = True
+        for title, keys in PUT_GROUPS:
+            grp = ttk.LabelFrame(put_box, text=title, padding=2)
+            grp.pack(fill=tk.X, pady=2)
+            for key in keys:
+                spec = next(s for s in PUT_PARAMS if s[0] == key)
+                _k, label, vmin, vmax, step, default, is_int = spec
+                val = self.put_tune.get(key, float(default))
+                row = ttk.Frame(grp)
+                row.pack(fill=tk.X)
+                var = tk.StringVar(value=f'{val:g}')
+                scale = tk.Scale(
+                    row, from_=vmin, to=vmax, resolution=step, orient=tk.HORIZONTAL,
+                    length=220, showvalue=False, label=label, bd=0,
+                    highlightthickness=0,
+                    command=lambda v, k=key: self._on_put_slide(k, v))
+                scale.set(val)
+                scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Label(row, textvariable=var, width=7, anchor='e').pack(
+                    side=tk.LEFT, padx=(2, 0))
+                self.put_scales[key] = (scale, var, is_int)
+        self._put_applying = False
+
+        put_row = ttk.Frame(put_box)
+        put_row.pack(fill=tk.X, pady=(3, 0))
+        ttk.Button(put_row, text='恢复对环默认',
+                   command=self._restore_put_defaults).pack(side=tk.LEFT)
+        ttk.Label(put_box, textvariable=self.put_status, foreground='#2e7d32',
+                  wraplength=310).pack(anchor='w')
+
         # ---------- 舵机角度（夹爪 / 载物盘） ----------
         servo_box = ttk.LabelFrame(tab, text='舵机角度（夹爪 / 载物盘）', padding=4)
         servo_box.pack(fill=tk.X, pady=(6, 3))
@@ -1807,8 +1928,8 @@ class App:
         """把**这次拖过的**跟踪参数写回 JSON；文件里其它键原样保留。
 
         只写 dirty 键而不是整个 track_tune：界面上那份是启动时的快照，全量回写会
-        把运行中手改/其它程序改的 track_pid.json 覆盖回去（补偿量突然变回 0 就是
-        这么来的）。
+        把运行中手改/其它程序改的 track_pid.json 覆盖回去（目标像素突然变回旧值
+        就是这么来的）。
         """
         self._track_after = None
         data = {}
@@ -1847,6 +1968,77 @@ class App:
         # 恢复默认是有意全量覆盖（包括两个补偿量归 0），标成全 dirty 再存。
         self._track_dirty.update(self.track_tune)
         self._save_track_profile()
+
+    # ---------- 视觉对环 PID（vision_put 速度环，直接读写 JSON） ----------
+
+    def _on_put_slide(self, key, value):
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return
+        entry = self.put_scales.get(key)
+        if entry:
+            scale, var, is_int = entry
+            var.set(f'{fv:.0f}' if is_int else f'{fv:g}')
+        self.put_tune[key] = fv
+        if getattr(self, '_put_applying', False):
+            return
+        self._put_dirty.add(key)
+        if self._put_after is not None:
+            try:
+                self.root.after_cancel(self._put_after)
+            except Exception:  # noqa: BLE001
+                pass
+        self._put_after = self.root.after(150, self._save_put_profile)
+
+    def _load_put_profile(self):
+        """读 vision/config/vision_put.json（vision_put 实际用的对环参数）。"""
+        try:
+            with open(PUT_PID_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for key in self.put_tune:
+                if key in data:
+                    self.put_tune[key] = float(data[key])
+        except Exception:  # noqa: BLE001 - 文件不存在是正常情况
+            pass
+
+    def _save_put_profile(self):
+        """只把这次拖过的键写回 JSON；文件里其它键（含注释键）原样保留。"""
+        self._put_after = None
+        try:
+            with open(PUT_PID_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not self._put_dirty:
+            return
+        data.update({key: self.put_tune[key]
+                     for key in self._put_dirty if key in self.put_tune})
+        self._put_dirty.clear()
+        try:
+            os.makedirs(os.path.dirname(PUT_PID_PATH), exist_ok=True)
+            with open(PUT_PID_PATH, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.put_status.set(
+                '已保存到 vision/config/vision_put.json（下次 vision_put 生效）')
+        except Exception as e:  # noqa: BLE001
+            self.put_status.set(f'保存失败：{e}')
+
+    def _restore_put_defaults(self):
+        self._put_applying = True
+        try:
+            for key, _label, _lo, _hi, _step, default, _is_int in PUT_PARAMS:
+                self.put_tune[key] = float(default)
+                entry = self.put_scales.get(key)
+                if entry:
+                    scale, var, _ = entry
+                    scale.set(default)
+                    var.set(f'{default:g}')
+        finally:
+            self._put_applying = False
+        # 恢复默认是有意全量覆盖，标成全 dirty 再存。
+        self._put_dirty.update(self.put_tune)
+        self._save_put_profile()
 
     # ---------- 舵机角度（夹爪 / 载物盘） ----------
 

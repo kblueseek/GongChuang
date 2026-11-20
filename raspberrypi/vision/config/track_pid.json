@@ -1,4 +1,6 @@
 {
+  "target_x": 659.0,
+  "target_y": 520.0,
   "cam_rotation": 180.0,
   "kp_yaw": 1.0,
   "ki_yaw": 0.01,
@@ -11,7 +13,5 @@
   "deadband_px": 8.0,
   "deriv_tau": 0.05,
   "yaw_sign": -1.0,
-  "ext_sign": -1.0,
-  "ext_offset_deg": 181.0,
-  "yaw_offset_deg": 7.0
+  "ext_sign": -1.0
 }
