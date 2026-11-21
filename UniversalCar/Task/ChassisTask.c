@@ -166,6 +166,11 @@ static void Chassis_Disable(void)
     PID_Clear(&Chassis.PosPidX);
     PID_Clear(&Chassis.PosPidY);
     PiCommand.ReturnHome = 0;         /* 失能时取消未完成的回零 */
+    /* 失能边沿把位姿/航向目标一并作废：否则下次使能重新锁存航向时，
+       TargetYawValid 还是 1，会把"上一次 POSE 的目标角度"当成当前要去的
+       方向（手动转完再失能/使能，车会自己转回 yaw=0 就是这个原因）。 */
+    PiCommand.PosTarget.Valid = 0;
+    PiCommand.TargetYawValid = 0;
 #if CHASSIS_HEADING_ENABLE
     s_HeadingValid = 0;               /* 下次使能重新锁存当前朝向，不往回拧 */
 #endif

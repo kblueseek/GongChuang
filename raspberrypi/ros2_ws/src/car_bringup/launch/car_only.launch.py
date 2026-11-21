@@ -30,7 +30,9 @@ def generate_launch_description():
         car_node('motion_planner', 'motion_planner_node', 'motion_planner'),
         # 4. 统一视觉节点：一个进程独占摄像头，color_pick / vision_put / calibrate
         #    都是它下面的业务（见 vision_node/README.md）
-        car_node('vision_node', 'vision_node', 'vision_node'),
+        # respawn：预览/摄像头偶发被系统杀掉（OOM、窗口被强关）时自动拉起，
+        # 不用整车上电重来；心跳恢复后 motion_planner 就能继续发视觉动作。
+        car_node('vision_node', 'vision_node', 'vision_node', respawn=True),
         # 5. 扫码模块：UART3 读二维码任务码，校验锁存后发 /task_code(/decoded)
         car_node('qr_scanner', 'qr_scanner_node', 'qr_scanner'),
         # 6. 手柄驱动（USB 手柄 -> /joy，autorepeat 让摇杆按住时持续上报）

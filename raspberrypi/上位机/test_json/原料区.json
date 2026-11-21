@@ -3,7 +3,7 @@
     {
       "cmd": "gimbal",
       "yaw_deg": 0.0,
-      "lift_deg": 800.0,
+      "lift_deg": 713.0,
       "extend_deg": 200.0
     },
     {
@@ -29,8 +29,8 @@
     {
       "cmd": "place_tray",
       "yaw_deg": 722.0,
-      "lift_deg": 100.0,
-      "extend_deg": 318.0,
+      "lift_deg": 150.0,
+      "extend_deg": 380.0,
       "retract_deg": 100.0,
       "lead_deg": 50.0
     },
@@ -44,12 +44,12 @@
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": -100.0
+      "delta_deg": -190.0
     },
     {
       "cmd": "gimbal",
       "yaw_deg": 0.0,
-      "lift_deg": 800.0,
+      "lift_deg": 713.0,
       "extend_deg": 200.0
     },
     {
@@ -75,8 +75,8 @@
     {
       "cmd": "place_tray",
       "yaw_deg": 722.0,
-      "lift_deg": 100.0,
-      "extend_deg": 318.0,
+      "lift_deg": 150.0,
+      "extend_deg": 380.0,
       "retract_deg": 100.0,
       "lead_deg": 50.0
     },
@@ -90,12 +90,12 @@
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": -100.0
+      "delta_deg": -190.0
     },
     {
       "cmd": "gimbal",
       "yaw_deg": 0.0,
-      "lift_deg": 800.0,
+      "lift_deg": 713.0,
       "extend_deg": 200.0
     },
     {
@@ -121,8 +121,8 @@
     {
       "cmd": "place_tray",
       "yaw_deg": 722.0,
-      "lift_deg": 100.0,
-      "extend_deg": 318.0,
+      "lift_deg": 150.0,
+      "extend_deg": 380.0,
       "retract_deg": 100.0,
       "lead_deg": 50.0
     },
@@ -136,12 +136,12 @@
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": -100.0
+      "delta_deg": -190.0
     },
     {
       "cmd": "gimbal",
       "yaw_deg": 0.0,
-      "lift_deg": 800.0,
+      "lift_deg": 100.0,
       "extend_deg": 200.0
     },
     {

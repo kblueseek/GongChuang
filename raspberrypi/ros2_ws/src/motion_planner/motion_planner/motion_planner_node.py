@@ -1263,7 +1263,14 @@ class MotionPlannerNode(Node):
                 return
             self._fix_result = None
             self._vision_expected = 'calibrate'
-            self._vision_command('calibrate', {'x_m': rx, 'y_m': ry})
+            vargs = {'x_m': rx, 'y_m': ry}
+            # 可选：中间圆环的目标像素 / 单次超时。不写就用 calibrate.json 的默认值。
+            for key in ('target_x', 'target_y', 'timeout_s'):
+                if key in cmd and cmd[key] not in (None, ''):
+                    vargs[key] = cmd[key]
+            if isinstance(cmd.get('args'), dict):
+                vargs.update(cmd['args'])
+            self._vision_command('calibrate', vargs)
             self._fix_deadline = self._now() + self.calibrate_timeout_s
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] 圆环视觉矫正 → '

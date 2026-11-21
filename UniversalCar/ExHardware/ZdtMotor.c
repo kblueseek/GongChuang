@@ -234,7 +234,9 @@ static uint8_t ZdtMotor_AccFor(uint8_t addr)
 static uint8_t ZdtMotor_BuildSpeed(float rpm, uint8_t acc, uint8_t* out)
 {
     uint8_t dir = (rpm >= 0) ? 0 : 1;
-    uint16_t mag = (uint16_t)(fabsf(rpm));   /* RPM（整数，0~3000） */
+    /* 四舍五入而不是截断：0.8RPM 截断成 0 会让位置环的小误差永远推不动车
+       （1RPM ≈ 4.08mm/s，校准对位时经常只有 1~3mm/s 的输出）。 */
+    uint16_t mag = (uint16_t)(fabsf(rpm) + 0.5f);   /* RPM（整数，0~3000） */
 
     out[0] = 0xF6;
     out[1] = dir;

@@ -90,6 +90,14 @@ class VisionNode(Node):
         self.fps = float(self.get_parameter('fps').value)
         self.cam_rotation = int(self.get_parameter('cam_rotation').value)
         self.headless = bool(self.get_parameter('headless').value)
+        # 没有桌面还开着预览，OpenCV 的 Qt 后端会直接 abort 整个进程
+        # （不是 Python 异常，业务里的 try/except 拦不住）。这里提前降级。
+        if (not self.headless
+                and not os.environ.get('DISPLAY')
+                and not os.environ.get('WAYLAND_DISPLAY')):
+            self.headless = True
+            self.get_logger().warning(
+                '没有 DISPLAY/WAYLAND_DISPLAY：预览窗口已自动关闭（headless=true）')
         self._idle_period = 1.0 / max(1.0, float(
             self.get_parameter('idle_grab_hz').value))
         self._cam_retry_s = float(self.get_parameter('camera_retry_s').value)
@@ -212,7 +220,7 @@ class VisionNode(Node):
         if action in ('stop', 'close', 'quit', 'exit'):
             self._stop.set()
             self._pending = None        # 还没启动的业务也一并取消
-            if self._worker is None:
+            if not self._active and self._worker is None:
                 self._publish_result({'action': 'stop', 'ok': True})
             else:
                 self._publish_status({'stopping': self._active})
@@ -230,7 +238,8 @@ class VisionNode(Node):
         if not action:
             self._publish_result({'ok': False, 'reason': '缺少 action'})
             return
-        if self._worker is not None or self._pending is not None:
+        if (self._active or self._worker is not None
+                or self._pending is not None):
             busy = self._active or (self._pending[0] if self._pending else '')
             self._publish_result({'action': action, 'ok': False,
                                   'reason': f'忙：{busy}'})
@@ -252,16 +261,13 @@ class VisionNode(Node):
 
     def run(self):
         while rclpy.ok():
-            if self._worker is not None:
-                self._worker.join(timeout=0.05)
-                if not self._worker.is_alive():
-                    self._worker = None
+            if self._pending is not None:
+                action, args = self._pending
+                self._pending = None
+                self._run_action(action, args)
                 continue
 
             rclpy.spin_once(self, timeout_sec=0.02)
-            if self._pending is not None:
-                self._start_pending()
-                continue
             self._idle_tick()
 
     def _idle_tick(self):
@@ -293,10 +299,16 @@ class VisionNode(Node):
             self.get_logger().warning(f'摄像头打不开（{self.device}）：{error}')
         return self.camera
 
-    def _start_pending(self):
-        action, args = self._pending
-        self._pending = None
+    def _run_action(self, action: str, args: dict):
+        """在主线程里跑一个业务。
 
+        为什么不再放到 worker 线程：
+          · OpenCV/Qt 的窗口必须由同一个线程创建和刷新。以前每个业务都在新的
+            worker 里 new window，业务结束后窗口没人 waitKey，Qt 事件循环停住，
+            系统就把进程标成"无响应"，之后再开窗口/切业务就会卡死甚至被杀。
+          · 业务内部本来就会自己 spin_once（收 stop / gimbal_state / 定时器），
+            放在主线程不会出现两个 spinner。
+        """
         if self._ensure_camera() is None:
             self._publish_result({'action': action, 'ok': False,
                                   'reason': f'摄像头不可用（{self.device}）'})
@@ -326,30 +338,34 @@ class VisionNode(Node):
             cam_rotation=self.cam_rotation,
         )
 
-        def work():
-            result = {}
-            try:
-                result = business.run(ctx, args, self._stop) or {}
-                if not isinstance(result, dict):
-                    result = {'ok': False,
-                              'reason': f'{type(result).__name__} 返回的不是 dict'}
-            except Exception as error:  # noqa: BLE001 - 一次业务失败不能带走节点
-                traceback.print_exc()
+        result = {}
+        try:
+            result = business.run(ctx, args, self._stop) or {}
+            if not isinstance(result, dict):
                 result = {'ok': False,
-                          'reason': f'{type(error).__name__}: {error}'}
-            finally:
-                self._hold_stop.set()
-                if self._hold_thread is not None:
-                    self._hold_thread.join(timeout=1.0)
-                self.publish_active(False)
-                result.setdefault('action', action)
-                self._publish_result(result)
-                self.get_logger().info(f'业务 {action} 结束：{result}')
-                self._active = ''
-
-        self._worker = threading.Thread(
-            target=work, name=f'business-{action}', daemon=True)
-        self._worker.start()
+                          'reason': f'{type(result).__name__} 返回的不是 dict'}
+        except Exception as error:  # noqa: BLE001 - 一次业务失败不能带走节点
+            traceback.print_exc()
+            result = {'ok': False,
+                      'reason': f'{type(error).__name__}: {error}'}
+        finally:
+            self._hold_stop.set()
+            if self._hold_thread is not None:
+                self._hold_thread.join(timeout=1.0)
+            self.publish_active(False)
+            result.setdefault('action', action)
+            self._publish_result(result)
+            self.get_logger().info(f'业务 {action} 结束：{result}')
+            self._active = ''
+            # 业务退出时如果留下预览窗口，主线程这里统一收掉。
+            # 否则窗口留在那里没人 waitKey，Qt 事件循环停住 → 系统判定无响应。
+            if not self.headless:
+                try:
+                    import cv2
+                    cv2.destroyAllWindows()
+                    cv2.waitKey(1)
+                except Exception:  # noqa: BLE001 - 没有图形后端时忽略
+                    pass
 
     def _hold_loop(self):
         """业务运行期间 10Hz 发 /motion_active=True，让手柄让出云台。

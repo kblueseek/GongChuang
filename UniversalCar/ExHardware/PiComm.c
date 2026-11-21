@@ -183,6 +183,10 @@ static void PiComm_ParseFrame(const uint8_t* f, uint8_t len)
             PiCommand.Vel.Vy = (int16_t)((d[2] << 8) | d[3]) / 1000.f;
             PiCommand.Vel.Wz = (int16_t)((d[4] << 8) | d[5]) / 1000.f;    /* mrad/s → rad/s */
             PiCommand.PosTarget.Valid = 0;   /* 收到速度指令：退出位置闭环，回到手动速度模式 */
+            /* 航向目标也要一起作废：否则手动开一段后失能→使能，
+               s_HeadingValid 重新锁存时会拿"上一次 POSE 的航向"当目标，
+               车会自己转回那个方向（常见是 yaw=0）。 */
+            PiCommand.TargetYawValid = 0;
         }
         break;
     case PI_CMD_GIMBAL_TARGET:

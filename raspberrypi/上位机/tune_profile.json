@@ -11,14 +11,14 @@
  "head_kd": 0.0,
  "gim_yaw_kp": 11.5,
  "gim_yaw_ki": 0.0,
- "gim_yaw_kd": 0.2,
+ "gim_yaw_kd": 0.3,
  "gim_lift_kp": 8.5,
  "gim_lift_ki": 0.0,
  "gim_lift_kd": 0.1,
- "gim_ext_kp": 13.5,
+ "gim_ext_kp": 11.5,
  "gim_ext_ki": 0.0,
  "gim_ext_kd": 0.15,
- "gim_yaw_speed": 1435.0,
- "gim_lift_speed": 1740.0,
+ "gim_yaw_speed": 1610.0,
+ "gim_lift_speed": 1545.0,
  "gim_ext_speed": 1485.0
 }

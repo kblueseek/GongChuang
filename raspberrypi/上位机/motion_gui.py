@@ -646,6 +646,10 @@ CAL_PARAMS = [
     ('ctrl_kd_yaw',          '对位 yaw Kd',              0.0,  2.0, 0.005, 0.15, False),
     ('max_xy_speed_m_s',     '平移速度上限 m/s',          0.005, 0.3, 0.005, 0.06, False),
     ('max_yaw_speed_deg_s',  '转向速度上限 °/s',          1.0,  60.0, 1.0, 15.0, False),
+    # F407 轮速是整数 RPM（1RPM≈4.08mm/s），低于 1RPM 会被截成 0；
+    # 误差还在停车阈值外时给最小速度，避免"有指令但车不动"。
+    ('min_xy_speed_m_s',     '平移最小速度 m/s',          0.0,  0.05, 0.001, 0.008, False),
+    ('min_yaw_speed_deg_s',  '转向最小速度 °/s',          0.0,  10.0, 0.5, 2.0, False),
     ('ctrl_deadband_xy_mm',  'xy 死区 mm',               0.0,  20.0, 0.1, 0.5, False),
     ('ctrl_deadband_yaw_deg', 'yaw 死区 °',              0.0,  5.0, 0.01, 0.15, False),
     ('ctrl_deriv_tau',       '微分低通 τ (s)',           0.0,  0.5, 0.01, 0.1, False),
@@ -663,6 +667,9 @@ CAL_PARAMS = [
     ('timeout_s',            '单次矫正超时 s',            5.0, 120.0, 1.0, 45.0, False),
     ('align_offset_x_m',     '对准偏移 x m',            -0.2,  0.2, 0.001, 0.0, False),
     ('align_offset_y_m',     '对准偏移 y m',            -0.2,  0.2, 0.001, 0.0, False),
+    # 中间圆环要对到的画面像素；默认 = 检测器参考环心（不是画面中心）。
+    ('target_x',             '目标像素 X（中环）',        0.0, 1280.0, 1.0, 633.5, False),
+    ('target_y',             '目标像素 Y（中环）',        0.0, 720.0, 1.0, 321.59, False),
     ('require_quality',      '严格质量门控 (0/1)',        0,     1,   1,   0, True),
 ]
 
@@ -670,12 +677,14 @@ CAL_GROUPS = [
     ('底盘对位 xy 环', ('ctrl_kp_xy', 'ctrl_ki_xy', 'ctrl_kd_xy')),
     ('底盘对位 yaw 环', ('ctrl_kp_yaw', 'ctrl_ki_yaw', 'ctrl_kd_yaw')),
     ('速度限幅 / 死区 / 滤波', ('max_xy_speed_m_s', 'max_yaw_speed_deg_s',
+                              'min_xy_speed_m_s', 'min_yaw_speed_deg_s',
                               'ctrl_deadband_xy_mm', 'ctrl_deadband_yaw_deg',
                               'ctrl_deriv_tau', 'ctrl_filter_tau')),
     ('滞环 / 停车', ('ctrl_stop_xy_mm', 'ctrl_stop_yaw_deg', 'ctrl_settle_s')),
     ('位姿领先限幅（Kp 跟随调参页）', ('max_lead_xy_mm', 'max_lead_yaw_deg')),
     ('收敛 / 超时', ('converge_tol_xy_mm', 'converge_tol_yaw_deg',
                      'converge_hold_frames', 'timeout_s')),
+    ('目标像素（中间环心）', ('target_x', 'target_y')),
     ('对准偏移 / 质量', ('align_offset_x_m', 'align_offset_y_m', 'require_quality')),
 ]
 

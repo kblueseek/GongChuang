@@ -608,6 +608,11 @@ def track_color(camera, node, args, color_doc, ctx, color,
     finally:
         # 收工/异常退出：发一帧零速，云台立刻停住，别带着最后一拍速度漂。
         node.send_gimbal_vel(0.0, 0.0, 0.0)
+        # 预览窗口也要收掉：业务结束后没人再调 imshow/waitKey，窗口留着
+        # 会被系统判定"无响应"，下一次业务切窗口时就会卡死。
+        if not args.headless:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
 
     return result
 

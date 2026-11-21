@@ -11,10 +11,25 @@
 
 from __future__ import annotations
 
+import csv
+import dataclasses
 import json
 import math
+import os
 import time
 from pathlib import Path
+
+# 每次 calibrate 都把控制环的逐帧数据写到这个 CSV（覆盖上一次）。
+# 用 scripts/calibrate_pid_analyze.py 离线分析/出调参建议。
+# 设环境变量 CALIBRATE_CSV='' 可关闭。
+_CSV_PATH = os.environ.get('CALIBRATE_CSV', '/tmp/calibrate_last.csv')
+_CSV_HEADER = (
+    't', 'usable', 'stable', 'rings', 'hold', 'hold_need', 'moving',
+    'cx', 'cy', 'cyaw', 'fx', 'fy', 'fyaw',
+    'vx', 'vy', 'vyaw', 'lead_x', 'lead_y', 'lead_yaw',
+    'odom_x', 'odom_y', 'odom_yaw_deg',
+    'ix', 'iy', 'iyaw', 'dt', 'event',
+)
 
 from ..business import Business, register
 
@@ -29,6 +44,10 @@ DEFAULTS = {
     # 对准后车体相对中间圆环的偏移（里程计系，米）
     'align_offset_x_m': 0.0,
     'align_offset_y_m': 0.0,
+    # 中间圆环要对到的画面目标像素。None = 用 ring_station_detector.json 的
+    # 参考环心（reference_centers_px[1]），不再固定是画面中心。
+    'target_x': None,
+    'target_y': None,
     'align_yaw_deg': '',          # 空 = 只修位置，不修航向
     # 底盘对位 PID
     'ctrl_kp_xy': 1.0,
@@ -39,6 +58,11 @@ DEFAULTS = {
     'ctrl_kd_yaw': 0.15,
     'max_xy_speed_m_s': 0.06,
     'max_yaw_speed_deg_s': 15.0,
+    # F407 轮速帧是整数 RPM（1 RPM ≈ 4.08 mm/s），位置环输出低于 1 RPM 会被
+    # 截成 0，表现为"有目标但车不动"。误差还大于停车阈值时给一个最小速度，
+    # 保证轮子真的转起来；进停车阈值后会停，不会持续抖。
+    'min_xy_speed_m_s': 0.008,
+    'min_yaw_speed_deg_s': 2.0,
     'ctrl_deadband_xy_mm': 0.5,
     'ctrl_deadband_yaw_deg': 0.15,
     'ctrl_deriv_tau': 0.1,
@@ -108,6 +132,8 @@ class _Calibrator:
 
         self.max_xy_speed = abs(_f(p['max_xy_speed_m_s'], 0.06)) * 1000.0   # mm/s
         self.max_yaw_speed = abs(_f(p['max_yaw_speed_deg_s'], 15.0))        # °/s
+        self.min_xy_speed = abs(_f(p['min_xy_speed_m_s'], 0.008)) * 1000.0  # mm/s
+        self.min_yaw_speed = abs(_f(p['min_yaw_speed_deg_s'], 2.0))         # °/s
         self.deadband_xy = abs(_f(p['ctrl_deadband_xy_mm'], 0.5))
         self.deadband_yaw = abs(_f(p['ctrl_deadband_yaw_deg'], 0.15))
         self.filter_tau = max(0.0, _f(p['ctrl_filter_tau'], 0.15))
@@ -141,6 +167,19 @@ class _Calibrator:
         self.settle_until = 0.0
         self.last_diag_t = 0.0
 
+        # 最近一次 _control_step 的输出（日志用；没控制时保持 None）
+        self._last_v = None          # (vx, vy, vyaw)  mm/s, mm/s, °/s
+        self._last_lead = None       # (lead_x, lead_y, lead_yaw) mm, mm, °
+        self._last_dt = 0.0
+        self._csv = None
+        if _CSV_PATH:
+            try:
+                self._csv = open(_CSV_PATH, 'w', newline='', encoding='utf-8')
+                csv.writer(self._csv).writerow(_CSV_HEADER)
+                self._csv.flush()
+            except OSError:
+                self._csv = None
+
     # ---------------- 主循环 ----------------
 
     def run(self) -> dict:
@@ -149,11 +188,21 @@ class _Calibrator:
         while True:
             rclpy.spin_once(self.ctx.node, timeout_sec=0.0)
             if self.stop is not None and self.stop():
+                self._log_row(started, time.monotonic(), None, False,
+                              (None, None, None), 'stopped')
+                self._close_csv()
                 return {'ok': False, 'reason': 'stopped'}
             now = time.monotonic()
             if now - started > self.timeout:
+                self._log_row(started, now, None, False,
+                              (None, None, None), 'timeout')
+                self._close_csv()
                 return {'ok': False,
                         'reason': f'超时（{self.timeout:.0f}s 未对准）'}
+            # 本帧的控制输出先清空；_control_step 里执行了才填
+            self._last_v = None
+            self._last_lead = None
+            self._last_dt = 0.0
 
             ok, frame = self.ctx.camera.read()
             if not ok or frame is None:
@@ -167,10 +216,36 @@ class _Calibrator:
             except Exception:  # noqa: BLE001 - 单帧异常只跳过这一帧
                 continue
 
-            usable = (result.detected and result.stable
+            # 调试预览：调 calibrate 时也能看到检测框/环数和稳定帧进度。
+            # 没有桌面环境时 ctx.headless 已经是 True，不会走到这里。
+            if not self.ctx.headless:
+                try:
+                    from ring_station_detector import (
+                        draw_ring_station_detection,
+                    )
+                    vis = frame.copy()
+                    draw_ring_station_detection(vis, result)
+                    self._cv2.putText(
+                        vis,
+                        f"calibrate  rings={getattr(result, 'visible_ring_count', 0)}/3  "
+                        f"stable={result.stable}  hold={self.hold_frames}/{self.hold_need}",
+                        (16, 180), self._cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 255), 2, self._cv2.LINE_AA)
+                    self._cv2.imshow('calibrate', vis)
+                    self._cv2.waitKey(1)
+                except Exception:  # noqa: BLE001 - 预览失败不影响对位
+                    pass
+
+            # 控制量不再要求 result.stable：detect() 返回的 correction 本身
+            # 已经是最近 stable_frame_count 帧的中值，控制环后面还有一阶滤波 +
+            # 滞环。之前要求 stable 的代价是实测 52% 的时间在"车已停稳但凑不够
+            # 3 帧抖动<=1.5px"上空转，滤波器还被冻结，误差估计停在旧值。
+            # stable 只保留给最后的收敛确认（converged_frame），精度不降。
+            usable = (result.detected
                       and len(result.centers_px) == 3
                       and result.correction_body_x_mm is not None
                       and math.isfinite(result.affine_residual))
+            converged_frame = usable and result.stable
             if usable:
                 cx_mm = result.correction_body_x_mm
                 cy_mm = result.correction_body_y_mm
@@ -179,7 +254,8 @@ class _Calibrator:
                 fx, fy, fyaw = self._filter(now, cx_mm, cy_mm, cyaw)
                 self._update_motion(now, fx, fy, fyaw)
 
-                if (not self.moving
+                if (converged_frame
+                        and not self.moving
                         and now >= self.settle_until
                         and max(abs(fx), abs(fy)) <= self.tol_xy
                         and abs(fyaw) <= self.tol_yaw):
@@ -187,6 +263,9 @@ class _Calibrator:
                 else:
                     self.hold_frames = 0
                 if self.hold_frames >= self.hold_need:
+                    self._log_row(started, now, result, usable,
+                                  (fx, fy, fyaw), 'converged')
+                    self._close_csv()
                     return self._converge()
                 if self.moving:
                     self._control_step(now, fx, fy, fyaw)
@@ -202,6 +281,11 @@ class _Calibrator:
                     self.filt = None
                     self.moving = False
 
+            # 逐帧存控制环数据，供离线分析（见 scripts/calibrate_pid_analyze.py）
+            self._log_row(started, now, result, usable,
+                          (fx, fy, fyaw) if usable else (None, None, None),
+                          'frame')
+
             # F407 的位姿目标约 100ms 过期，每拍重发保持位姿
             if self.hold_pose is not None:
                 self.ctx.node.publish_pose(*self.hold_pose)
@@ -211,6 +295,56 @@ class _Calibrator:
                 detail = result.detail if result.detected else '未检测到三个圆环'
                 self.ctx.node.get_logger().info(
                     f'calibrate {detail} 稳定帧 {self.hold_frames}/{self.hold_need}')
+
+    # ---------------- 日志 ----------------
+
+    def _log_row(self, started, now, result, usable, filt, event):
+        """写一行逐帧数据；任何异常都不能影响对位本身。"""
+        if self._csv is None:
+            return
+        fx, fy, fyaw = filt
+        cx = cy = cyaw = None
+        rings = 0
+        stable = False
+        if result is not None:
+            rings = int(getattr(result, 'visible_ring_count', 0) or 0)
+            stable = bool(getattr(result, 'stable', False))
+            cx = getattr(result, 'correction_body_x_mm', None)
+            cy = getattr(result, 'correction_body_y_mm', None)
+            cyaw = getattr(result, 'correction_yaw_deg', None)
+        vx, vy, vyaw = self._last_v or (None, None, None)
+        lx, ly, lyaw = self._last_lead or (None, None, None)
+        odom = self.ctx.node.get_odom()[0]
+        ox, oy, oyaw = odom if odom is not None else (None, None, None)
+
+        def fnum(v):
+            return '' if v is None else f'{float(v):.4f}'
+
+        try:
+            csv.writer(self._csv).writerow((
+                f'{now - started:.4f}', int(bool(usable)), int(stable), rings,
+                self.hold_frames, self.hold_need, int(self.moving),
+                fnum(cx), fnum(cy), fnum(cyaw),
+                fnum(fx), fnum(fy), fnum(fyaw),
+                fnum(vx), fnum(vy), fnum(vyaw),
+                fnum(lx), fnum(ly), fnum(lyaw),
+                fnum(ox), fnum(oy),
+                fnum(None if oyaw is None else math.degrees(oyaw)),
+                fnum(self.pid_x.integral), fnum(self.pid_y.integral),
+                fnum(self.pid_yaw.integral), f'{self._last_dt:.4f}', event,
+            ))
+            self._csv.flush()
+        except OSError:
+            self._csv = None
+
+    def _close_csv(self):
+        if self._csv is not None:
+            try:
+                self._csv.flush()
+                self._csv.close()
+            except OSError:
+                pass
+            self._csv = None
 
     # ---------------- 伺服 ----------------
 
@@ -270,6 +404,20 @@ class _Calibrator:
             vy *= scale
         vyaw = max(-self.max_yaw_speed, min(self.max_yaw_speed, vyaw))
 
+        # 最小速度：F407 的轮速是整数 RPM（四舍五入到整数），低于 0.5 RPM
+        # 会被舍成 0，表现为"有目标但车不动"。但只在误差还明显大于死区时给
+        # 这一脚；误差已经在死区附近还给 4mm/s，就会冲过头、来回抖 —— 这正是
+        # 末端"原地哆嗦"的来源。阈值取 2 倍死区，让末端由自然 P 输出停车。
+        speed = math.hypot(vx, vy)
+        if (max(abs(ex), abs(ey)) > 2.0 * self.deadband_xy
+                and 1e-6 < speed < self.min_xy_speed):
+            scale = self.min_xy_speed / speed
+            vx *= scale
+            vy *= scale
+        if (abs(eyaw) > 2.0 * self.deadband_yaw
+                and 1e-6 < abs(vyaw) < self.min_yaw_speed):
+            vyaw = math.copysign(self.min_yaw_speed, vyaw)
+
         # 速度 → 位姿领先量：F407 位置环是纯 P，lead = v / Kp
         lead_x = vx / self.pos_kp
         lead_y = vy / self.pos_kp
@@ -287,6 +435,10 @@ class _Calibrator:
         ty = oy + (lead_x * s + lead_y * c) / 1000.0
         tyaw = oyaw + math.radians(lead_yaw)
         self.hold_pose = (tx, ty, tyaw)
+        # 日志用：本拍真正下发的速度/领先量
+        self._last_dt = dt
+        self._last_v = (vx, vy, vyaw)
+        self._last_lead = (lead_x, lead_y, lead_yaw)
 
     # ---------------- 结束 ----------------
 
@@ -368,8 +520,46 @@ class CalibrateBusiness(Business):
         params['chassis_heading_kp'] = ctx.node.get_tune(
             TUNE_HEAD_KP, params['chassis_heading_kp'])
 
+        # 中间圆环的目标像素：不填就用 detector 配置里的参考环心（不是画面中心）。
+        # 做法是把整组参考环心平移同样的量 —— 3 环对位时环号归属固定，
+        # 平移不会影响间距/共线判据，只是把"对准位置"从参考点挪到目标点。
+        ref = cfg.reference_centers_px
+        ref_mid = ref[1]
+        target_x = params.get('target_x')
+        target_y = params.get('target_y')
+        try:
+            target_x = (ref_mid[0] if target_x in (None, '')
+                        else float(target_x))
+            target_y = (ref_mid[1] if target_y in (None, '')
+                        else float(target_y))
+        except (TypeError, ValueError):
+            ctx.node.get_logger().warning(
+                f'calibrate target_x/target_y 无效（{target_x!r},{target_y!r}），'
+                '用参考环心')
+            target_x, target_y = ref_mid
+        dx = float(target_x) - ref_mid[0]
+        dy = float(target_y) - ref_mid[1]
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            cfg = dataclasses.replace(
+                cfg,
+                reference_centers_px=tuple(
+                    (float(x) + dx, float(y) + dy) for x, y in ref))
+            ctx.node.get_logger().info(
+                f'calibrate 目标像素（中间环）= ({target_x:.1f}, {target_y:.1f})，'
+                f'相对参考环心偏移 ({dx:+.1f}, {dy:+.1f}) px')
+
         detector = RingStationDetector(cfg)
         map1, map2 = vpa.build_undistort_maps(int(ctx.width), int(ctx.height))
 
-        return _Calibrator(ctx, params, detector, map1, map2,
-                           (rx, ry), stop, vpa.PID).run()
+        try:
+            return _Calibrator(ctx, params, detector, map1, map2,
+                               (rx, ry), stop.is_set, vpa.PID).run()
+        finally:
+            # 业务结束把预览窗口收掉，否则窗口没人 waitKey 会冻结。
+            if not ctx.headless:
+                try:
+                    import cv2
+                    cv2.destroyAllWindows()
+                    cv2.waitKey(1)
+                except Exception:  # noqa: BLE001
+                    pass
