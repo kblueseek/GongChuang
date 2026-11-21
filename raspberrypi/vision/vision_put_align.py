@@ -256,7 +256,7 @@ def _select_locked(centers, ring: int, target, locked, lock_radius_px: float,
     return index, center, center
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='vision_put 视觉端：圆环圆心对像素')
     parser.add_argument('--lock-radius-px', type=float, default=150.0,
                         help='锁定同一个环的最大像素偏移；超过就认为该环丢失并'
@@ -305,49 +305,42 @@ def main() -> int:
                         help='只看不动：打印检测到的环心像素（标定 target 用）')
     parser.add_argument('--headless', action='store_true', help='不开预览窗口')
     parser.add_argument('--roi-fraction', type=float, default=0.65,
-                        help='只看画面中心这么大比例的区域（0.65=中心65%%），'
-                             '外面涂黑不参与检测；1.0=全画面')
+                        help='旧的"中间矩形"模式：宽高同比例缩到中心这么大；'
+                             '左右/上下裁切参数全 0 时才生效')
+    # ---- 中间竖条：左右/上下按比例裁掉，保留中间区域 ----
+    parser.add_argument('--roi-left-crop', type=float, default=0.175,
+                        help='左侧裁掉占画面宽度的比例（0=不裁）')
+    parser.add_argument('--roi-right-crop', type=float, default=0.175,
+                        help='右侧裁掉占画面宽度的比例（0=不裁）')
+    parser.add_argument('--roi-top-crop', type=float, default=0.0,
+                        help='顶部裁掉占画面高度的比例（0=不裁，保留整幅高）')
+    parser.add_argument('--roi-bottom-crop', type=float, default=0.0,
+                        help='底部裁掉占画面高度的比例（0=不裁）')
     parser.add_argument('--save-frame', default='',
                         help='把第一帧识别画面（带观测/预测标记）存成图片，'
                              '用于夹着物料时远程排查；例：--save-frame /tmp/ring.jpg')
 
-    args = parser.parse_args()
-    # 只把命令行上真出现过的选项当作"已指定"，其余才让 profile 兜底
-    provided = {token.split('=')[0] for token in sys.argv[1:]
-                if token.startswith('--')}
-    args = _apply_config(args, provided)
+    return parser
 
+
+def build_args(argv=None):
+    """给别的程序（vision_node）复用同一套默认参数，不开摄像头、不初始化 ROS。"""
+    parser = build_parser()
+    argv = list(argv) if argv is not None else []
+    args = parser.parse_args(argv)
+    # 只把真的在命令行上出现过的选项当作"已指定"，其余才让 profile 兜底
+    provided = {token.split("=", 1)[0] for token in argv
+                if token.startswith("--")}
+    return _apply_config(args, provided)
+
+
+def run_align(camera, node, args, detector, stop=None) -> dict:
+    """对环主循环：摄像头和节点都由调用方提供（vision_node 共用）。
+
+    stop 是 threading.Event.is_set 之类的无参可调用对象；返回 True 时
+    发一帧零速并返回 {'ok': False, 'reason': 'stopped'}。
+    """
     import cv2
-
-    try:
-        config = load_ring_station_config(Path(args.config))
-    except Exception as error:  # noqa: BLE001
-        print(json.dumps({'ok': False,
-                          'reason': f'圆环配置无效：{error}'}, ensure_ascii=False),
-              flush=True)
-        return 1
-
-    rclpy.init()
-    node = PutAlignNode()
-    detector = RingStationDetector(config)
-
-    camera = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
-    if not camera.isOpened():
-        print(json.dumps({'ok': False, 'reason': f'打不开摄像头 {args.device}'},
-                         ensure_ascii=False), flush=True)
-        node.destroy_node()
-        rclpy.shutdown()
-        return 1
-    camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    camera.set(cv2.CAP_PROP_FPS, args.fps)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 4)
-    for _ in range(10):
-        ok, _frame = camera.read()
-        if ok:
-            break
-
     map1, map2 = build_undistort_maps(args.width, args.height)
     ROTATE = {0: None, 90: cv2.ROTATE_90_CLOCKWISE,
               180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
@@ -416,6 +409,9 @@ def main() -> int:
 
     try:
         while time.monotonic() - started < args.timeout:
+            if stop is not None and stop():
+                result = {'ok': False, 'reason': 'stopped'}
+                break
             rclpy.spin_once(node, timeout_sec=0.0)
             ok, frame = camera.read()
             if not ok or frame is None:
@@ -424,10 +420,25 @@ def main() -> int:
                 frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
             if ROTATE[args.cam_rotation] is not None:
                 frame = cv2.rotate(frame, ROTATE[args.cam_rotation])
-            # 只看画面中心一块：外面（车身、线束、其他工位）直接涂黑，不参与
-            # 检测。坐标保持全图不变，所以 target 像素/纠偏矩阵都不用改。
-            if 0.0 < args.roi_fraction < 1.0:
-                fh, fw = frame.shape[:2]
+            # ROI：保留中间区域，左右/上下分别按比例裁掉。
+            # 坐标保持全图不变（target 像素/纠偏矩阵不用改），只是把边缘涂黑。
+            # 默认左右各裁 0.175 → 中间 65% 宽、整幅高；上下 0 = 不裁。
+            # 旧的 roi_fraction（宽高同比例的中心矩形）仅在新参数全 0 时生效。
+            fh, fw = frame.shape[:2]
+            lx = int(round(fw * min(1.0, max(0.0, args.roi_left_crop))))
+            rx = int(round(fw * min(1.0, max(0.0, args.roi_right_crop))))
+            ty = int(round(fh * min(1.0, max(0.0, args.roi_top_crop))))
+            by = int(round(fh * min(1.0, max(0.0, args.roi_bottom_crop))))
+            if lx > 0 or rx > 0 or ty > 0 or by > 0:
+                if lx > 0:
+                    frame[:, :lx] = 0
+                if rx > 0:
+                    frame[:, fw - rx:] = 0
+                if ty > 0:
+                    frame[:ty, :] = 0
+                if by > 0:
+                    frame[fh - by:, :] = 0
+            elif 0.0 < args.roi_fraction < 1.0:
                 mx = int(round(fw * (1.0 - args.roi_fraction) / 2.0))
                 my = int(round(fh * (1.0 - args.roi_fraction) / 2.0))
                 frame[:my, :] = 0
@@ -551,11 +562,8 @@ def main() -> int:
                 break
     finally:
         node.send_gimbal_vel(0.0, 0.0, 0.0)
-        camera.release()
         if not args.headless:
             cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
 
     if args.dry_run:
         # 标定用：把"云台停在这个姿态时环心在哪"原样报出来，
@@ -570,8 +578,50 @@ def main() -> int:
                   'target_x': target_x, 'target_y': target_y,
                   'frames': frames}
 
+    return result
+
+
+def main() -> int:
+    args = build_args(sys.argv[1:])
+    import cv2
+
+    try:
+        config = load_ring_station_config(Path(args.config))
+    except Exception as error:  # noqa: BLE001
+        print(json.dumps({'ok': False,
+                          'reason': f'圆环配置无效：{error}'}, ensure_ascii=False),
+              flush=True)
+        return 1
+
+    rclpy.init()
+    node = PutAlignNode()
+    detector = RingStationDetector(config)
+
+    camera = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
+    if not camera.isOpened():
+        print(json.dumps({'ok': False, 'reason': f'打不开摄像头 {args.device}'},
+                         ensure_ascii=False), flush=True)
+        node.destroy_node()
+        rclpy.shutdown()
+        return 1
+    camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    camera.set(cv2.CAP_PROP_FPS, args.fps)
+    camera.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+    for _ in range(10):
+        ok, _frame = camera.read()
+        if ok:
+            break
+
+    try:
+        result = run_align(camera, node, args, detector)
+    finally:
+        camera.release()
+        node.destroy_node()
+        rclpy.shutdown()
     print(json.dumps(result, ensure_ascii=False), flush=True)
-    return 0 if result.get('ok') else 1
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == '__main__':

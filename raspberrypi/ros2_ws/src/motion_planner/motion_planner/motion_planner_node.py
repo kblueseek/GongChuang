@@ -43,7 +43,7 @@
   enable   {"cmd":"enable", "en":true}         使能/失能电机
   delay    {"cmd":"delay",  "ms":1000}         原地等多少毫秒
   calibrate{"cmd":"calibrate","x_m":-2.169,"y_m":1.061}
-           圆环工位视觉矫正：ring_fix 节点开摄像头识别三圆环，小步驱动底盘把
+           圆环工位视觉矫正：vision_node 的 calibrate 业务识别三圆环，小步驱动底盘把
            中间环对到标定基准，对准后通过 /set_odom 把里程计重置到"圆环坐标
            (+对准偏移)"——清除累计里程计误差。x_m/y_m 是中间圆环的里程计坐标
            （米）。失败/超时就跳过这一条，不中断任务。
@@ -295,9 +295,10 @@ class MotionPlannerNode(Node):
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)          # 里程计：判断到位
         self.create_subscription(String, '/motion_load', self._cb_load, 10)     # 上位机下发序列
         self.create_subscription(Bool, '/motion_stop', self._cb_stop, 10)       # 上位机叫停
-        # 圆环视觉矫正（calibrate 指令）：把目标发给 ring_fix 节点，等它回结果
-        self._pub_ring_target = self.create_publisher(Pose2D, '/ring_fix/target', 10)
-        self.create_subscription(String, '/ring_fix/result', self._cb_ring_fix, 10)
+        # 统一视觉节点：calibrate / color_pick / vision_put 都走这条命令通道
+        self._pub_vision_cmd = self.create_publisher(String, '/vision/command', 10)
+        self.create_subscription(String, '/vision/result', self._cb_vision_result, 10)
+        self.create_subscription(String, '/vision/status', self._cb_vision_status, 10)
         # 任务码（qr_scanner 节点）：指令里的 $b1c1$ 等占位符在执行时用它的值替换
         self.create_subscription(String, '/task_code_decoded',
                                  self._cb_task_code, 10)
@@ -322,7 +323,7 @@ class MotionPlannerNode(Node):
         self.move_deadline = 0.0    # 当前阶段（走/停稳/转）的超时时间
 
         # 圆环视觉矫正（calibrate 指令）等待状态
-        self._fix_result = None     # ring_fix 节点回传的 JSON（/ring_fix/result）
+        self._fix_result = None     # vision_node calibrate 业务回传的 JSON
         self._fix_deadline = 0.0    # 矫正超时时刻
 
         # 任务码占位符表：{'b1c1': 4, 'b1p1': 3, ...}，来自 /task_code_decoded
@@ -391,17 +392,16 @@ class MotionPlannerNode(Node):
         self._proc_result = None       # 从 stdout / result_file 解析出的 JSON
         self._proc_thread = None       # stdout 读取线程
 
-        # ---- 常驻视觉进程（color_pick open / close / N）----
-        # 每次 color_pick 都新起一个进程的话，摄像头打开 + 预热 + 畸变映射要
-        # 三四秒，连着抓两种颜色就白等两次。这里让视觉程序用 --server 常驻，
-        # open 时预热点火（不阻塞），N 时只往它 stdin 写一行请求，close 才收掉。
-        self._vision = None            # subprocess.Popen（常驻视觉进程）
-        self._vision_in = None         # 它的 stdin（一行一个 JSON 请求）
-        self._vision_lines = None      # 后台线程读 stdout 塞进队列
-        self._vision_thread = None
-        self._vision_deadline = 0.0    # 当前这次 pick 的等待截止
-        self._vision_color = None      # 正在等的颜色（只用于提示）
-        self._vision_debug = False     # 当前是 track_debug（纯调参）而不是 color_pick
+        # ---- 统一视觉节点（vision_node）----
+        # 摄像头由 vision_node 常驻持有；这里只发业务命令、收结果。
+        self._vision_node_in = queue.Queue()   # /vision/result 解析后的消息
+        self._vision_node_ok = False           # 收到过 /vision/status
+        self._vision_node_t = 0.0
+        self._vision_expected = ''             # 当前等待的 action（过滤迟到的旧结果）
+        self._vision_label = 'color_pick'      # 结果交给 _apply_vision_result 时用的标签
+        self._vision_deadline = 0.0            # 当前这次业务的等待截止
+        self._vision_color = None              # 正在等的颜色（只用于提示）
+        self._vision_debug = False             # 当前是 track_debug（纯调参）
         # 每条指令的动作探针（见 _probe_start/_probe_sample/_probe_finish）：
         # 记录该指令耗时、各轴行程和"反向次数"，用于排查某轴来回震荡。
         self._probe = None
@@ -482,13 +482,29 @@ class MotionPlannerNode(Node):
             if self.odom is not None:
                 self._publish_pose(self.odom[0], self.odom[1], self.odom[2])
 
-    def _cb_ring_fix(self, msg: String):
-        """ring_fix 节点的圆环矫正结果（JSON 字符串），_tick 里消费。"""
+    def _cb_vision_result(self, msg: String):
+        """统一视觉节点 /vision/result。
+
+        calibrate 的结果走原来的 _fix_result/fixing 流程；color_pick / vision_put
+        走 'vision' 流程。_vision_expected 用来丢掉上一条动作迟到的结果。
+        """
         try:
             data = json.loads(msg.data)
         except Exception:  # noqa: BLE001
-            data = {'ok': False, 'reason': f'结果不是合法 JSON：{msg.data[:80]}'}
-        self._fix_result = data if isinstance(data, dict) else {'ok': False}
+            return
+        if not isinstance(data, dict):
+            return
+        action = str(data.get('action') or '')
+        if self._vision_expected and action and action != self._vision_expected:
+            return
+        if action == 'calibrate':
+            self._fix_result = data
+            return
+        self._vision_node_in.put(data)
+
+    def _cb_vision_status(self, msg: String):
+        self._vision_node_ok = True
+        self._vision_node_t = self._now()
 
     def _cb_task_code(self, msg: String):
         """qr_scanner 的任务码：展开成 {b1c1: 颜色, b1p1: 位置, ...} 平铺表。"""
@@ -733,11 +749,6 @@ class MotionPlannerNode(Node):
 
         if self.phase == 'idle':
             return
-        # 常驻视觉进程在 open 之后、第一次 pick 之前会输出 ready / 打不开摄像头，
-        # 这些行放在队列里没人看，趁不在等 pick 的时候转成 ROS 日志（phase
-        # == 'vision' 时由 _tick 的 vision 分支自己消费，别抢先取走）。
-        if self._vision_lines is not None and self.phase != 'vision':
-            self._vision_report_last('')
         if self.phase == 'proc':
             # 等子程序跑完。完成时 _poll_proc 会把 phase 改成 stepping（继续）
             # 或 moving（视觉校准后重新下发目标，等车到位）。
@@ -746,9 +757,10 @@ class MotionPlannerNode(Node):
             if self.phase != 'stepping':
                 return
         if self.phase == 'fixing':
-            # 等 ring_fix 节点完成圆环对位 + 里程计重置
+            # 等 vision_node 完成圆环对位 + 里程计重置
             if self._fix_result is None:
                 if self._now() > self._fix_deadline:
+                    self._vision_stop()      # 超时：取消这轮 calibrate 业务
                     self._publish_state(
                         f'[{self.index+1}/{len(self.commands)}] 视觉矫正超时'
                         f'（{self.calibrate_timeout_s:.0f}s），跳过（里程计未重置）')
@@ -757,7 +769,7 @@ class MotionPlannerNode(Node):
             result = self._fix_result
             self._fix_result = None
             if result.get('ok'):
-                # 里程计已被 ring_fix 重置；目标位姿同步到矫正后的真实位姿，
+                # 里程计已被 vision_node 重置；目标位姿同步到矫正后的真实位姿，
                 # 后续指令自动活在修正坐标系里（f407_bridge 负责双向换算）。
                 self.tx = float(result.get('x_m', self.tx))
                 self.ty = float(result.get('y_m', self.ty))
@@ -974,23 +986,18 @@ class MotionPlannerNode(Node):
             while message is not None and 'ok' not in message:
                 message = self._vision_take_message()
             if message is None:
-                if self._vision is None or self._vision.poll() is not None:
-                    last = self._vision_drain_last()
-                    self._vision_stop()
-                    reason = f'（{last}）' if last else ''
-                    self._publish_state(
-                        f'[{self.index+1}/{len(self.commands)}] 视觉进程意外退出'
-                        f'{reason}，color_pick 跳过——继续执行后续指令')
-                elif self._now() > self._vision_deadline:
+                if self._now() > self._vision_deadline:
                     self._vision_stop()
                     self._publish_state(
-                        f'[{self.index+1}/{len(self.commands)}] color_pick 等待超时，'
-                        '已关闭视觉进程——继续执行后续指令')
+                        f'[{self.index+1}/{len(self.commands)}] 视觉等待超时'
+                        '（已取消当前业务）——继续执行后续指令')
                 else:
                     return
                 self.phase = 'stepping'
             else:
                 debug = self._vision_debug
+                label = self._vision_label
+                self._vision_label = 'color_pick'
                 self._vision_color = None
                 self._vision_debug = False
                 if debug:
@@ -1001,7 +1008,7 @@ class MotionPlannerNode(Node):
                         f'（{message.get("reason", "ok")}）')
                     self.phase = 'stepping'
                 else:
-                    self._apply_vision_result(message)
+                    self._apply_vision_result(message, label)
 
         # 连续执行：不阻塞的指令（舵机/云台/注释…）一条接一条，遇到阻塞的（走/转/延时）就停下等
         while self.phase == 'stepping':
@@ -1245,7 +1252,7 @@ class MotionPlannerNode(Node):
             b.data = bool(cmd.get('en', True))
             self._pub_enable.publish(b)
             self._publish_state(f'[{self.index+1}/{len(self.commands)}] 使能={b.data}')
-        elif name == 'calibrate':     # 圆环工位视觉矫正（ring_fix 节点执行）
+        elif name == 'calibrate':     # 圆环工位视觉矫正（统一视觉节点执行）
             try:
                 rx = float(cmd.get('x_m'))
                 ry = float(cmd.get('y_m'))
@@ -1254,12 +1261,9 @@ class MotionPlannerNode(Node):
                     f'[{self.index+1}/{len(self.commands)}] calibrate 需要圆环里程计坐标 '
                     f'x_m,y_m，参数缺失，跳过')
                 return
-            target = Pose2D()
-            target.x = rx
-            target.y = ry
-            target.theta = 0.0
-            self._pub_ring_target.publish(target)
             self._fix_result = None
+            self._vision_expected = 'calibrate'
+            self._vision_command('calibrate', {'x_m': rx, 'y_m': ry})
             self._fix_deadline = self._now() + self.calibrate_timeout_s
             self._publish_state(
                 f'[{self.index+1}/{len(self.commands)}] 圆环视觉矫正 → '
@@ -1270,24 +1274,15 @@ class MotionPlannerNode(Node):
             token = str(raw).strip().lower() if raw is not None else ''
             if token in ('open', 'close'):
                 if token == 'open':
-                    # 不阻塞：只是把进程和摄像头点起来。车还没到工位时先跑这一条，
-                    # 后面第一条 color_pick N 就不用再等三四秒的启动时间。
-                    if self._vision_start():
-                        self._publish_state(
-                            f'[{self.index+1}/{len(self.commands)}] 视觉进程已启动，'
-                            '摄像头预热中（不阻塞；约 2~3 秒后预览窗口出画面，'
-                            '后续 color_pick N 直接用）')
-                    else:
-                        self._publish_state(
-                            f'[{self.index+1}/{len(self.commands)}] 视觉进程没启动起来，'
-                            '检查 vision_program / vision_args')
-                elif self._vision is None:
+                    # 摄像头由 vision_node 开机预热，这里只确认节点在线。
+                    self._vision_start()
                     self._publish_state(
-                        f'[{self.index+1}/{len(self.commands)}] 视觉进程没开，无需关闭')
+                        f'[{self.index+1}/{len(self.commands)}] 视觉节点就绪，'
+                        '摄像头常开（不阻塞）')
                 else:
                     self._vision_stop()
                     self._publish_state(
-                        f'[{self.index+1}/{len(self.commands)}] 视觉进程已关闭（摄像头已释放）')
+                        f'[{self.index+1}/{len(self.commands)}] 已停止当前视觉业务')
                 return
 
             try:
@@ -1320,6 +1315,8 @@ class MotionPlannerNode(Node):
                         self.get_parameter('vision_still_time_s').value)
                 except Exception:  # noqa: BLE001 - 参数缺失就用视觉端默认值
                     pass
+            self._vision_expected = 'color_pick'
+            self._vision_label = 'color_pick'
             if not self._vision_send(request):
                 self._publish_state(
                     f'[{self.index+1}/{len(self.commands)}] color_pick：'
@@ -1361,6 +1358,8 @@ class MotionPlannerNode(Node):
                 request['still_time'] = float(cmd['still_time'])
             except (KeyError, TypeError, ValueError):
                 pass
+            self._vision_expected = 'track_debug'
+            self._vision_label = 'track_debug'
             if not self._vision_send(request):
                 self._publish_state(
                     f'[{self.index+1}/{len(self.commands)}] track_debug：'
@@ -1375,30 +1374,30 @@ class MotionPlannerNode(Node):
                 '点■停止结束')
             self.phase = 'vision'
         elif name == 'vision_put':     # 盲放之后：用圆环做视觉闭环，把环心对到固定像素
-            argv = self._vision_put_argv(cmd)
-            if not argv:
-                self._publish_state(
-                    f'[{self.index+1}/{len(self.commands)}] vision_put：'
-                    '没配置视觉程序（vision_args），跳过')
-                return
             try:
                 timeout = float(cmd.get('timeout_s', 45.0))
             except (TypeError, ValueError):
                 timeout = 45.0
-            vp = {'cmd': 'vision_put',
-                  'program': (cmd.get('program')
-                              or self.get_parameter('vision_program').value or ''),
-                  'args': argv,
-                  'timeout_s': timeout}
-            if self._start_proc(vp, 'vision_put'):
-                self._publish_state(
-                    f'[{self.index+1}/{len(self.commands)}] vision_put：'
-                    '等云台停稳 → 圆环对到目标像素…')
-                self.phase = 'proc'
-            else:
-                self._publish_state(
-                    f'[{self.index+1}/{len(self.commands)}] vision_put：'
-                    '视觉程序没启动起来，跳过')
+            vargs = {}
+            for key in ('ring', 'target_x', 'target_y', 'dry_run'):
+                if key in cmd and cmd[key] is not None:
+                    vargs[key] = cmd[key]
+            if isinstance(cmd.get('args'), dict):
+                vargs.update(cmd['args'])
+            # 序列里显式写了 timeout_s 才覆盖；否则用 vision_put.json 的 timeout，
+            # 和独立运行 vision_put_align.py 的行为保持一致。
+            if 'timeout_s' in cmd:
+                vargs['timeout_s'] = timeout
+            self._vision_expected = 'vision_put'
+            self._vision_label = 'vision_put'
+            self._vision_command('vision_put', vargs)
+            self._vision_color = None
+            self._vision_debug = False
+            self._vision_deadline = self._now() + timeout + 10.0
+            self._publish_state(
+                f'[{self.index+1}/{len(self.commands)}] vision_put：'
+                '等云台停稳 → 圆环对到目标像素…')
+            self.phase = 'vision'
         elif name in ('number_put', 'double_put'):   # 按环号放置 / 叠放
             try:
                 number = int(self._resolve_token(cmd.get('number'), 'number'))
@@ -1770,55 +1769,6 @@ class MotionPlannerNode(Node):
             f'dyaw={math.degrees(dyaw):+.1f}°，重新到位')
         self.phase = 'moving'
 
-    def _vision_put_argv(self, cmd: dict) -> list:
-        """拼 vision_put 的命令行：复用 vision_args 的相机参数，只把脚本换掉。
-
-        vision_args 里是 ".../vision/gimbal_track_pick.py"（也可能带
-        --cam-rotation / --device 之类），这里把文件名换成 vision_put_align.py，
-        其余参数原样保留 —— 摄像头的分辨率/旋转/设备只需要在 vehicle.yaml 配一处。
-        序列里显式写了 args 就用序列的，方便单独指定。
-        """
-        raw = str(cmd.get('args') or '').strip()
-        if raw:
-            return shlex.split(raw)
-        raw_args = shlex.split(str(self.get_parameter('vision_args').value or ''))
-        if not raw_args:
-            return []
-        # vision_args 是给 color_pick 的 gimbal_track_pick.py 配的，里面可能有
-        # 只有那个脚本认识的参数（比如 --roi-bottom）。vision_put_align.py 不认识
-        # 会在 argparse 阶段直接退出 —— 表现就是"点运行没反应、也没窗口"。
-        # 只转发两个脚本都支持的相机参数。
-        forward = {'--device', '--width', '--height', '--fps', '--cam-rotation'}
-        argv = [os.path.join(os.path.dirname(raw_args[0]), 'vision_put_align.py')]
-        i = 1
-        while i < len(raw_args):
-            token = raw_args[i]
-            name = token.split('=', 1)[0]
-            if name in forward:
-                argv.append(token)
-                if '=' not in token and i + 1 < len(raw_args) \
-                        and not raw_args[i + 1].startswith('--'):
-                    argv.append(raw_args[i + 1])
-                    i += 1
-            elif name != '--server':
-                self.get_logger().debug(
-                    f'vision_put 忽略 vision_args 里的 {name}（vision_put_align.py 不支持）')
-            i += 1
-        try:
-            ring = int(cmd.get('ring', 0) or 0)
-        except (TypeError, ValueError):
-            ring = 0
-        argv += ['--ring', str(ring)]
-        for key, flag in (('target_x', '--target-x'), ('target_y', '--target-y')):
-            value = cmd.get(key)
-            if value is None or value == '':
-                continue
-            try:
-                argv += [flag, str(float(value))]
-            except (TypeError, ValueError):
-                pass
-        return argv
-
     def _apply_vision_pick(self):
         """视觉定点抓取：把识别出的云台角度填进 pick 宏，插到当前指令后面执行。
 
@@ -1916,162 +1866,49 @@ class MotionPlannerNode(Node):
         # 到位"的位置即可，对中结果本身就是最终落点。
         self.phase = 'stepping'
 
-    # ---------------- 常驻视觉进程（color_pick open / N / close） ----------------
+    # ---------------- 统一视觉节点（/vision/command ↔ /vision/result） ----------------
 
     def _vision_start(self) -> bool:
-        """启动（或复用）常驻视觉进程。返回 False = 没起来。"""
-        if self._vision is not None and self._vision.poll() is None:
-            return True
-        if self._vision is not None:
-            # 上一个常驻进程已经死了，把它的临终遗言打出来。
-            # 摄像头被占用时服务端会回 {"ok":false,"reason":"打不开摄像头"}，
-            # 不在这里报出去，用户只会看到后面的 color_pick "莫名跳过"。
-            self._vision_report_last('已退出')
-            self._vision = None
-            self._vision_in = None
-
-        program = str(self.get_parameter('vision_program').value or '').strip()
-        if not program:
-            self.get_logger().warning('color_pick: 没配置 vision_program')
-            return False
-        argv = shlex.split(str(self.get_parameter('vision_args').value or ''))
-        if argv:                       # 第一个参数是脚本路径，允许写 ~ / $HOME
-            argv[0] = os.path.expandvars(os.path.expanduser(argv[0]))
-        if '--server' not in argv:
-            argv.append('--server')
-
-        env = os.environ.copy()
-        env.setdefault('PYTHONUNBUFFERED', '1')
-        try:
-            proc = subprocess.Popen(
-                [program, *argv], env=env,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1,
-            )
-        except Exception as error:  # noqa: BLE001 - 路径错/没权限不该拖垮状态机
-            self.get_logger().error(f'color_pick: 启动视觉进程失败：{error}')
-            return False
-
-        self._vision = proc
-        self._vision_in = proc.stdin
-        self._vision_lines = queue.Queue()
-        self._vision_thread = threading.Thread(
-            target=self._read_proc, args=(proc, self._vision_lines),
-            daemon=True, name='vision-server-reader')
-        self._vision_thread.start()
-        self.get_logger().info(f'视觉进程已启动：{program} {" ".join(argv)}')
+        """确认统一视觉节点在线。摄像头由它常驻持有，这里不需要启动进程。"""
+        if not self._vision_node_ok or self._now() - self._vision_node_t > 5.0:
+            self.get_logger().warning(
+                '还没收到 /vision/status（或心跳超时）：确认 vision_node 已启动')
         return True
 
     def _vision_stop(self, wait_s: float = 3.0):
-        """给常驻视觉进程发 close 并等它退出（关摄像头）。幂等。"""
-        if self._vision is None:
-            return
-        # 关之前把还没来得及读的输出报出来：camera 打不开、预览取帧失败之类
-        # 都在这里面，否则用户只看到 color_pick "莫名其妙跳过"。
-        self._vision_report_last('')
-        proc, self._vision = self._vision, None
-        stream, self._vision_in = self._vision_in, None
-        if proc is None:
-            return
+        """取消当前视觉业务。摄像头保持打开，供下一次业务立即使用。"""
         self._vision_debug = False
-        try:
-            if stream is not None:
-                stream.write(json.dumps({'cmd': 'close'}) + '\n')
-                stream.flush()
-        except Exception:  # noqa: BLE001 - 管道已经断了就直接杀
-            pass
-        try:
-            proc.wait(timeout=max(0.1, wait_s))
-        except Exception:  # noqa: BLE001
-            try:
-                proc.terminate()
-                proc.wait(timeout=1.0)
-            except Exception:  # noqa: BLE001
+        self._vision_command('stop', {})
+
+    def _vision_command(self, action: str, args: dict) -> None:
+        """给统一视觉节点发一条业务命令。
+
+        发新业务前先丢掉上一条业务迟到的结果，避免状态机把旧结果当成这次的结果。
+        """
+        if action != 'stop':
+            while True:
                 try:
-                    proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
-        thread, self._vision_thread = self._vision_thread, None
-        self._vision_lines = None
-        if thread is not None:
-            thread.join(timeout=1.0)
-        self.get_logger().info('视觉进程已关闭')
+                    self._vision_node_in.get_nowait()
+                except queue.Empty:
+                    break
+        payload = {'action': action, 'args': args or {}}
+        self._pub_vision_cmd.publish(
+            String(data=json.dumps(payload, ensure_ascii=False)))
 
     def _vision_send(self, request: dict) -> bool:
-        """往视觉进程 stdin 写一行 JSON 请求。"""
-        if self._vision is None or self._vision.poll() is not None:
-            return False
-        try:
-            self._vision_in.write(json.dumps(request, ensure_ascii=False) + '\n')
-            self._vision_in.flush()
-            return True
-        except Exception as error:  # noqa: BLE001
-            self.get_logger().warning(f'视觉进程写请求失败：{error}')
-            return False
+        """把内部请求转成 /vision/command。"""
+        action = str(request.get('cmd') or request.get('action') or '').strip().lower()
+        action = {'pick': 'color_pick', 'debug': 'track_debug'}.get(action, action)
+        args = {k: v for k, v in request.items() if k not in ('cmd', 'action')}
+        self._vision_command(action, args)
+        return True
 
     def _vision_take_message(self):
-        """非阻塞取一条 JSON 消息；普通日志行转去 ROS 日志。没有就返回 None。"""
-        if self._vision_lines is None:
+        """非阻塞取一条 /vision/result；没有就返回 None。"""
+        try:
+            return self._vision_node_in.get_nowait()
+        except queue.Empty:
             return None
-        while True:
-            try:
-                line = self._vision_lines.get_nowait()
-            except queue.Empty:
-                return None
-            text = line.strip()
-            if not text:
-                continue
-            if not text.startswith('{'):
-                self.get_logger().info(f'vision: {text}')
-                continue
-            try:
-                data = json.loads(text)
-            except Exception:  # noqa: BLE001
-                continue
-            if isinstance(data, dict):
-                return data
-
-    def _vision_drain_last(self):
-        """把常驻视觉进程队列里剩下的行全部取出来，返回最后一条非空输出。
-
-        进程已经退出时用它说明死因（打不开摄像头 / 没有图形界面 …），
-        否则这些行会随着队列被新进程替换而丢掉。
-        """
-        lines = self._vision_lines
-        if lines is None:
-            return None
-        last = None
-        while True:
-            try:
-                line = lines.get_nowait()
-            except queue.Empty:
-                break
-            text = str(line).strip()
-            if text:
-                last = text
-        return last
-
-    def _vision_report_last(self, tag: str):
-        """把视觉进程最后一条输出翻译成 ROS 日志（ok:false 报警告）。"""
-        last = self._vision_drain_last()
-        if not last:
-            return
-        if last.startswith('{'):
-            try:
-                data = json.loads(last)
-            except Exception:  # noqa: BLE001
-                data = None
-            if isinstance(data, dict):
-                if data.get('ok') is False:
-                    self.get_logger().warning(
-                        f'视觉进程{tag}：{data.get("reason", "ok=false")}')
-                    return
-                if data.get('ready'):
-                    self.get_logger().info(f'视觉进程{tag}：摄像头已就绪')
-                    return
-                if data.get('closed'):
-                    return
-        self.get_logger().info(f'视觉进程{tag}：{last}')
 
     def _kill_proc(self):
         """立即结束正在跑的子程序（停止 / 超时 / 任务结束）。"""

@@ -1,8 +1,8 @@
-# setup.py：告诉 colcon 怎么安装 ring_fix 包。结构和 motion_planner 完全一致。
+# setup.py：告诉 colcon 怎么安装 vision_node 包。结构参照 ring_fix / motion_planner。
 
 from setuptools import find_packages, setup
 
-package_name = 'ring_fix'
+package_name = 'vision_node'
 
 setup(
     name=package_name,
@@ -16,12 +16,12 @@ setup(
     zip_safe=True,
     maintainer='kblue',
     maintainer_email='kblueseek@users.noreply.github.com',
-    description='圆环工位视觉对位 + 里程计重置',
+    description='统一视觉节点：单摄像头、多业务（color_pick / vision_put / calibrate）',
     license='MIT',
     entry_points={
         'console_scripts': [
-            # 命令名 ring_fix_node -> 调用 ring_fix.ring_fix_node 里的 main()
-            'ring_fix_node = ring_fix.ring_fix_node:main',
+            # 命令名 vision_node -> 调用 vision_node.node 里的 main()
+            'vision_node = vision_node.node:main',
         ],
     },
 )

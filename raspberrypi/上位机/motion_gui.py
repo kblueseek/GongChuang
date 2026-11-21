@@ -122,14 +122,19 @@ NODES_PATH = os.path.join(HERE, "nodes.json")
 TUNE_PROFILE_PATH = os.path.join(HERE, "tune_profile.json")
 
 # 视觉跟踪 PID（color_pick 用的云台速度环）：直接读写这个 JSON，不走 407 调参通道。
-# gimbal_track_pick.py 每次启动都会读它，所以改完、下次执行 color_pick 就生效。
+# vision_node 的 color_pick 业务每次开始都会读它，所以改完、下次执行 color_pick 就生效。
 TRACK_PID_PATH = os.path.normpath(
     os.path.join(HERE, "..", "vision", "config", "track_pid.json"))
 
 # 视觉对环 PID（vision_put 用的云台速度环）：另一套参数，另一份 JSON。
-# vision_put_align.py 每次启动读它，所以改完、下次执行 vision_put 就生效。
+# vision_node 的 vision_put 业务每次开始读它，所以改完、下次执行 vision_put 就生效。
 PUT_PID_PATH = os.path.normpath(
     os.path.join(HERE, "..", "vision", "config", "vision_put.json"))
+
+# 视觉矫正参数（calibrate 用的底盘对位 PID / 滞环 / 收敛）：又一份 JSON。
+# vision_node 的 calibrate 业务每次开始读它，所以改完、下次执行 calibrate 就生效。
+CAL_PID_PATH = os.path.normpath(
+    os.path.join(HERE, "..", "vision", "config", "calibrate.json"))
 
 # 舵机角度（夹爪 / 载物盘）：滑杆改动自动保存，下次开 GUI 恢复。
 # 直接发 /cmd_servo，由 f407_bridge 转发 F407，不经过 motion_planner。
@@ -173,9 +178,10 @@ COMMAND_TYPES = {
     'enable':    {'params': 'en', 'hint': 'true=使能 / false=失能'},
     'delay':     {'params': 'ms', 'hint': '原地等待毫秒数'},
     'calibrate': {'params': 'x_m,y_m', 'hint': '圆环工位视觉矫正：中间圆环的里程计坐标(米)，'
-                 '例：-2.169,1.061。执行时开摄像头识别三个圆环，小步动车把中间环对到'
-                 '画面标定基准，然后把 407 里程计重置到对准位置，清除累计误差。'
-                 '失败/超时会跳过这一条。触发前确保 vision/main.py 没占用摄像头'},
+                 '例：-2.169,1.061。由 vision_node 的 calibrate 业务用共享摄像头识别三个圆环，'
+                 '小步动车把中间环对到画面标定基准，然后把 407 里程计重置到对准位置，'
+                 '清除累计误差。失败/超时会跳过这一条。'
+                 '不要再同时跑旧的 vision/main.py（会抢摄像头）'},
     'comment':   {'params': 'text', 'hint': '注释文本(可含逗号)'},
 
     # ---- 复杂动作（motion_planner 里实现）----
@@ -209,8 +215,8 @@ COMMAND_TYPES = {
         'params': 'color',
         'hint': '云台跟随到指定颜色物料上方，只跟随不抓取（阻塞，等到位才走下一句）。'
                 'color=1~6 或占位符，例：$b1c1$；也可写 open / close：'
-                'open=提前把视觉进程和摄像头点起来（不阻塞，车没到工位时先跑），'
-                'close=关闭进程释放摄像头。连着抓多种颜色时 open 一次能省掉每次三四秒启动。'
+                'open=确认 vision_node 在线（摄像头常开，不阻塞），close=停止当前视觉业务'
+                '（摄像头不关）。动作由 vision_node 的 color_pick 业务执行。'
     },
     'track_debug': {
         'params': 'color',
@@ -219,7 +225,8 @@ COMMAND_TYPES = {
     },
     'vision_put': {
         'params': 'ring,target_x,target_y',
-        'hint': '盲放到大概位置之后的视觉对环（阻塞约 4~6s）：用圆环检测找到环心，'
+        'hint': '盲放到大概位置之后的视觉对环（阻塞约 4~6s，由 vision_node 的 vision_put 业务执行）：'
+                '用圆环检测找到环心，'
                 '把环心推到画面固定像素——摄像头和夹爪相对位置固定，'
                 '"环心落到目标像素"就等于"夹爪正对环心"，不需要识别物料。'
                 'ring=0 取离目标像素最近的环（1~3 可指定左/中/右）；'
@@ -323,9 +330,9 @@ def cmd_to_text(cmd: dict) -> str:
     if name == 'color_pick':
         color = str(cmd.get('color', '?')).strip().lower()
         if color == 'open':
-            return '打开视觉进程（预热摄像头，不阻塞）'
+            return '确认视觉节点在线（摄像头常开，不阻塞）'
         if color == 'close':
-            return '关闭视觉进程（释放摄像头）'
+            return '停止当前视觉业务（摄像头不关）'
         return f"云台跟随物料 颜色={cmd.get('color', '?')}"
     if name == 'track_debug':
         text = f"跟踪调试 颜色={cmd.get('color', '?')}（一直跟，■停止）"
@@ -600,7 +607,12 @@ PUT_PARAMS = [
     # 该环丢失（原地等），不会切到旁边别的环导致云台乱晃。
     ('lock_radius_px',   '锁定环最大偏移 (px)',    20.0, 400.0, 5.0, 150.0, False),
     ('max_target_distance_px', '目标环最大偏离 (px)', 50.0, 800.0, 10.0, 300.0, False),
-    ('roi_fraction',     '只看中心区域比例',        0.3, 1.0, 0.05, 0.65, False),
+    # 中间区域：左右/上下分别裁掉多少比例；高度不跟着宽度等比例裁。
+    # 默认左右各 0.175 = 中间 65% 宽，上下 0 = 整幅高。
+    ('roi_left_crop',    '左侧裁掉比例',            0.0, 1.0, 0.05, 0.175, False),
+    ('roi_right_crop',   '右侧裁掉比例',            0.0, 1.0, 0.05, 0.175, False),
+    ('roi_top_crop',     '顶部裁掉比例',            0.0, 1.0, 0.05, 0.0, False),
+    ('roi_bottom_crop',  '底部裁掉比例',            0.0, 1.0, 0.05, 0.0, False),
     ('yaw_sign',         'yaw 方向 (+1/-1)',       -1.0, 1.0, 2.0, -1.0, True),
     ('ext_sign',         'extend 方向 (+1/-1)',    -1.0, 1.0, 2.0, -1.0, True),
     # 夹爪正对环心时，环心落在画面的哪个像素。现场按实物摆正后读出来填这里。
@@ -615,9 +627,56 @@ PUT_GROUPS = [
     ('对环 extend 环', ('kp_extend', 'ki_extend', 'kd_extend')),
     ('速度限幅 / 死区', ('max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau')),
     ('判定成功', ('tol_px', 'stable')),
-    ('搜索范围 / 锁环', ('roi_fraction', 'lock_radius_px', 'max_target_distance_px')),
+    ('搜索范围 / 锁环', ('lock_radius_px', 'max_target_distance_px')),
+    ('中间区域（裁掉左右/上下）', ('roi_left_crop', 'roi_right_crop',
+                                  'roi_top_crop', 'roi_bottom_crop')),
     ('目标像素（夹爪正对环心时环心所在位置）', ('target_x', 'target_y')),
     ('方向 / 到位确认', ('yaw_sign', 'ext_sign', 'settle_stable_s')),
+]
+
+# 视觉矫正参数（vision_node 的 calibrate 业务，存 vision/config/calibrate.json）。
+# 和上面两套云台速度环不同：这里控制的是底盘 /cmd_pose，单位是 mm、mm、度。
+# (键名, 显示名, 最小, 最大, 步长, 默认值, 是否整数)
+CAL_PARAMS = [
+    ('ctrl_kp_xy',           '对位 xy Kp (mm/s per mm)', 0.0,  5.0, 0.01, 1.0, False),
+    ('ctrl_ki_xy',           '对位 xy Ki',               0.0,  2.0, 0.005, 0.02, False),
+    ('ctrl_kd_xy',           '对位 xy Kd',               0.0,  2.0, 0.005, 0.15, False),
+    ('ctrl_kp_yaw',          '对位 yaw Kp (°/s per °)',  0.0,  5.0, 0.01, 1.0, False),
+    ('ctrl_ki_yaw',          '对位 yaw Ki',              0.0,  2.0, 0.005, 0.0, False),
+    ('ctrl_kd_yaw',          '对位 yaw Kd',              0.0,  2.0, 0.005, 0.15, False),
+    ('max_xy_speed_m_s',     '平移速度上限 m/s',          0.005, 0.3, 0.005, 0.06, False),
+    ('max_yaw_speed_deg_s',  '转向速度上限 °/s',          1.0,  60.0, 1.0, 15.0, False),
+    ('ctrl_deadband_xy_mm',  'xy 死区 mm',               0.0,  20.0, 0.1, 0.5, False),
+    ('ctrl_deadband_yaw_deg', 'yaw 死区 °',              0.0,  5.0, 0.01, 0.15, False),
+    ('ctrl_deriv_tau',       '微分低通 τ (s)',           0.0,  0.5, 0.01, 0.1, False),
+    ('ctrl_filter_tau',      '视觉低通 τ (s)',           0.0,  1.0, 0.01, 0.15, False),
+    ('ctrl_stop_xy_mm',      '停车阈值 xy mm',           0.0,  20.0, 0.1, 1.0, False),
+    ('ctrl_stop_yaw_deg',    '停车阈值 yaw °',           0.0,  5.0, 0.01, 0.35, False),
+    ('ctrl_settle_s',        '停车后等待 s',             0.0,  2.0, 0.05, 0.2, False),
+    # 位置环 / 航向环 Kp 不在这里重复调：calibrate 自动取 F407 调参页
+    # 经 /tune_state 回传的 0x05 / 0x08。这里只留领先量限幅。
+    ('max_lead_xy_mm',       '单拍领先量上限 mm',         0.0, 200.0, 5.0, 80.0, False),
+    ('max_lead_yaw_deg',     '单拍航向领先上限 °',        0.0,  30.0, 0.5, 8.0, False),
+    ('converge_tol_xy_mm',   '验收容差 xy mm',           0.0,  20.0, 0.5, 2.0, False),
+    ('converge_tol_yaw_deg', '验收容差 yaw °',           0.0,  5.0, 0.1, 0.8, False),
+    ('converge_hold_frames', '连续收敛帧数',              1,    30,  1,   5, True),
+    ('timeout_s',            '单次矫正超时 s',            5.0, 120.0, 1.0, 45.0, False),
+    ('align_offset_x_m',     '对准偏移 x m',            -0.2,  0.2, 0.001, 0.0, False),
+    ('align_offset_y_m',     '对准偏移 y m',            -0.2,  0.2, 0.001, 0.0, False),
+    ('require_quality',      '严格质量门控 (0/1)',        0,     1,   1,   0, True),
+]
+
+CAL_GROUPS = [
+    ('底盘对位 xy 环', ('ctrl_kp_xy', 'ctrl_ki_xy', 'ctrl_kd_xy')),
+    ('底盘对位 yaw 环', ('ctrl_kp_yaw', 'ctrl_ki_yaw', 'ctrl_kd_yaw')),
+    ('速度限幅 / 死区 / 滤波', ('max_xy_speed_m_s', 'max_yaw_speed_deg_s',
+                              'ctrl_deadband_xy_mm', 'ctrl_deadband_yaw_deg',
+                              'ctrl_deriv_tau', 'ctrl_filter_tau')),
+    ('滞环 / 停车', ('ctrl_stop_xy_mm', 'ctrl_stop_yaw_deg', 'ctrl_settle_s')),
+    ('位姿领先限幅（Kp 跟随调参页）', ('max_lead_xy_mm', 'max_lead_yaw_deg')),
+    ('收敛 / 超时', ('converge_tol_xy_mm', 'converge_tol_yaw_deg',
+                     'converge_hold_frames', 'timeout_s')),
+    ('对准偏移 / 质量', ('align_offset_x_m', 'align_offset_y_m', 'require_quality')),
 ]
 
 # 舵机角度（上位机直接下发 /cmd_servo）：(键名, 显示名, 最小, 最大, 步长, 默认值)
@@ -953,6 +1012,16 @@ class App:
         self._put_applying = False
         self._put_dirty = set()
         self.put_status = tk.StringVar(value='')
+
+        # ---------- 视觉矫正参数（calibrate 用，存 vision/config/calibrate.json） ----------
+        self.cal_tune = {key: float(default)
+                         for (key, _label, _lo, _hi, _step, default, _is_int) in CAL_PARAMS}
+        self._load_cal_profile()
+        self.cal_scales = {}
+        self._cal_after = None
+        self._cal_applying = False
+        self._cal_dirty = set()
+        self.cal_status = tk.StringVar(value='')
 
         # ---------- 舵机角度（夹爪/载物盘，上位机直接 /cmd_servo） ----------
         self.servo_vals = {key: float(default)
@@ -1595,6 +1664,9 @@ class App:
                   text='盲放后把圆环圆心推到固定像素的速度环，存在树莓派 '
                        'vision/config/vision_put.json。和上面的物料跟踪 PID 是两套'
                        '参数，改这里不影响 color_pick。拖完下次 vision_put 生效。'
+                       '「中间区域」左右/上下分别裁掉，保留中间一条；'
+                       '默认左右各裁 0.175（中间 65% 宽），上下不裁（整幅高）。'
+                       '四个比例都设 0 = 不裁（全画面）。'
                   ).pack(anchor='w')
 
         self._put_applying = True
@@ -1625,6 +1697,47 @@ class App:
         ttk.Button(put_row, text='恢复对环默认',
                    command=self._restore_put_defaults).pack(side=tk.LEFT)
         ttk.Label(put_box, textvariable=self.put_status, foreground='#2e7d32',
+                  wraplength=310).pack(anchor='w')
+
+        # ---------- 视觉矫正参数（calibrate 用，和上面两个云台环互不影响） ----------
+        cal_box = ttk.LabelFrame(tab, text='视觉矫正 PID（calibrate 用）', padding=4)
+        cal_box.pack(fill=tk.X, pady=(6, 3))
+        ttk.Label(cal_box, foreground='#666', wraplength=310,
+                  text='圆环工位对位的底盘 PID / 滞环 / 收敛参数，存在树莓派 '
+                       'vision/config/calibrate.json。控制的是底盘 /cmd_pose，'
+                       '和上面两个云台速度环是两套参数。改完下次 calibrate 生效。'
+                       '位置/航向环 Kp 直接跟随 F407 调参页（/tune_state），'
+                       '这里不再重复调。'
+                  ).pack(anchor='w')
+
+        self._cal_applying = True
+        for title, keys in CAL_GROUPS:
+            grp = ttk.LabelFrame(cal_box, text=title, padding=2)
+            grp.pack(fill=tk.X, pady=2)
+            for key in keys:
+                spec = next(s for s in CAL_PARAMS if s[0] == key)
+                _k, label, vmin, vmax, step, default, is_int = spec
+                val = self.cal_tune.get(key, float(default))
+                row = ttk.Frame(grp)
+                row.pack(fill=tk.X)
+                var = tk.StringVar(value=f'{val:g}')
+                scale = tk.Scale(
+                    row, from_=vmin, to=vmax, resolution=step, orient=tk.HORIZONTAL,
+                    length=220, showvalue=False, label=label, bd=0,
+                    highlightthickness=0,
+                    command=lambda v, k=key: self._on_cal_slide(k, v))
+                scale.set(val)
+                scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Label(row, textvariable=var, width=7, anchor='e').pack(
+                    side=tk.LEFT, padx=(2, 0))
+                self.cal_scales[key] = (scale, var, is_int)
+        self._cal_applying = False
+
+        cal_row = ttk.Frame(cal_box)
+        cal_row.pack(fill=tk.X, pady=(3, 0))
+        ttk.Button(cal_row, text='恢复矫正默认',
+                   command=self._restore_cal_defaults).pack(side=tk.LEFT)
+        ttk.Label(cal_box, textvariable=self.cal_status, foreground='#2e7d32',
                   wraplength=310).pack(anchor='w')
 
         # ---------- 舵机角度（夹爪 / 载物盘） ----------
@@ -2039,6 +2152,77 @@ class App:
         # 恢复默认是有意全量覆盖，标成全 dirty 再存。
         self._put_dirty.update(self.put_tune)
         self._save_put_profile()
+
+    # ---------- 视觉矫正参数（calibrate 用，直接读写 JSON） ----------
+
+    def _on_cal_slide(self, key, value):
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return
+        entry = self.cal_scales.get(key)
+        if entry:
+            scale, var, is_int = entry
+            var.set(f'{fv:.0f}' if is_int else f'{fv:g}')
+        self.cal_tune[key] = fv
+        if getattr(self, '_cal_applying', False):
+            return
+        self._cal_dirty.add(key)
+        if self._cal_after is not None:
+            try:
+                self.root.after_cancel(self._cal_after)
+            except Exception:  # noqa: BLE001
+                pass
+        self._cal_after = self.root.after(150, self._save_cal_profile)
+
+    def _load_cal_profile(self):
+        """读 vision/config/calibrate.json（calibrate 实际用的对位参数）。"""
+        try:
+            with open(CAL_PID_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for key in self.cal_tune:
+                if key in data:
+                    self.cal_tune[key] = float(data[key])
+        except Exception:  # noqa: BLE001 - 文件不存在是正常情况
+            pass
+
+    def _save_cal_profile(self):
+        """只把这次拖过的键写回 JSON；文件里其它键（注释、align_yaw_deg）原样保留。"""
+        self._cal_after = None
+        try:
+            with open(CAL_PID_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not self._cal_dirty:
+            return
+        data.update({key: self.cal_tune[key]
+                     for key in self._cal_dirty if key in self.cal_tune})
+        self._cal_dirty.clear()
+        try:
+            os.makedirs(os.path.dirname(CAL_PID_PATH), exist_ok=True)
+            with open(CAL_PID_PATH, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.cal_status.set(
+                '已保存到 vision/config/calibrate.json（下次 calibrate 生效）')
+        except Exception as e:  # noqa: BLE001
+            self.cal_status.set(f'保存失败：{e}')
+
+    def _restore_cal_defaults(self):
+        self._cal_applying = True
+        try:
+            for key, _label, _lo, _hi, _step, default, _is_int in CAL_PARAMS:
+                self.cal_tune[key] = float(default)
+                entry = self.cal_scales.get(key)
+                if entry:
+                    scale, var, _ = entry
+                    scale.set(default)
+                    var.set(f'{default:g}')
+        finally:
+            self._cal_applying = False
+        # 恢复默认是有意全量覆盖，标成全 dirty 再存。
+        self._cal_dirty.update(self.cal_tune)
+        self._save_cal_profile()
 
     # ---------- 舵机角度（夹爪 / 载物盘） ----------
 
@@ -4332,8 +4516,9 @@ class App:
         默认（face 不写）：机械臂侧朝工位外法线 —— 机械臂在车头逆时针 90°
         （车体 +y，车左），所以车头 = 外法线 − 90°：
             外法线   0°(东) → 车头 270°(南) → 车左朝东 ✓
-        例外：face="scan"（扫码区）—— 扫码模块在机械臂对侧（车右），要让车右
-        朝工位，车头 = 外法线 + 90°，正好和默认差 180°。
+        例外：face="scan"（需要扫码模块侧朝工位时）—— 扫码模块在机械臂对侧（车右），
+        要让车右朝工位，车头 = 外法线 + 90°，正好和默认差 180°。
+        扫码区目前用默认 arm（云台侧朝工位），见 field.json 的 work_zones。
 
         xy 不是 work_zones 的 approach 点（或就在场心）就返回 None，不加朝向约束。
         """

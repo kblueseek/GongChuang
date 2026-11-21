@@ -103,50 +103,25 @@ motion_planner:
     # ---- calibrate（圆环视觉矫正）等待上限 ----
     calibrate_timeout_s: 1000.0
 
-ring_fix:
+vision_node:
   ros__parameters:
-    # 圆环工位视觉矫正：触发时才开摄像头
-    camera_device: '/dev/video0'
-    # 对准后车体相对中间环的偏移（odom 系，米）：默认 0 = 对准位置即输入坐标。
-    # 标定：手动对准后读 odom 减去圆环坐标填入；align_yaw_deg 留空 = 只修位置不修航向
-    align_offset_x_m: 0.0
-    align_offset_y_m: 0.0
-    align_yaw_deg: ''
-    timeout_s: 45.0
-    # false = 三个环稳定可见就开始纠偏；置信度/仿射残差/透视比只写日志不拦截
-    require_quality: false
-    # ---- 底盘对位 PID（和 vision/config/track_pid.json 一个思路）----
-    # 输入是视觉纠偏量（mm、mm、度），输出是底盘速度（mm/s、°/s），再按 20Hz
-    # 积分成 /cmd_pose 小步。以前是每 0.3s 直接走 100% 纠偏量（Kp=1、无阻尼），
-    # 相机延迟 ~100ms，所以震荡；这里 Kp/Kd 调阻尼，速度上限兜底。
-    ctrl_kp_xy: 1.0
-    ctrl_ki_xy: 0.02
-    ctrl_kd_xy: 0.15
-    ctrl_kp_yaw: 1.0
-    ctrl_ki_yaw: 0.0
-    ctrl_kd_yaw: 0.15
-    max_xy_speed_m_s: 0.06      # 平移速度上限（m/s）
-    max_yaw_speed_deg_s: 15.0   # 转向速度上限（°/s）
-    ctrl_deadband_xy_mm: 0.5
-    ctrl_deadband_yaw_deg: 0.15
-    ctrl_deriv_tau: 0.1         # 微分低通，压视觉噪声
-    # 视觉误差一阶低通（秒）。检测本身有 ±0.5~1mm 抖动，滤波后再进 PID，
-    # 否则车会在目标附近来回蹭；0 = 不滤波。
-    ctrl_filter_tau: 0.15
-    # 滞环防抖：误差进到 stop 以内就完全停车并"保持当前位姿"；超过验收容差
-    # （converge_tol_*）才重新起步。两值之间不再发小速度，避免原地抖。
-    ctrl_stop_xy_mm: 1.0
-    ctrl_stop_yaw_deg: 0.35
-    ctrl_settle_s: 0.2          # 停车后等这么久再开始计收敛帧
-    # F407 内环增益（填调参页上的 pos_kp / head_kp）：PID 输出速度，靠
-    # "目标领先当前位姿 速度/增益" 实现。填错只会让实际速度有偏差，视觉外环兜底。
-    chassis_pos_kp: 1.5
-    chassis_heading_kp: 2.4
-    max_lead_xy_mm: 80.0        # 单拍领先量上限，防标定异常时目标飞出去
-    max_lead_yaw_deg: 8.0
-    converge_tol_xy_mm: 2.0
-    converge_tol_yaw_deg: 0.8
-    converge_hold_frames: 5
+    # 统一视觉节点：一个进程独占摄像头，color_pick / vision_put / calibrate
+    # 都是它下面的业务（见 ros2_ws/src/vision_node/README.md）。
+    # 空 = 自动从源码树向上找 vision/；colcon 不用 --symlink-install 时
+    # 找不到会自动回退到 $HOME/GongChuang/raspberrypi/vision。
+    vision_dir: ''
+    device: '/dev/video0'
+    width: 1280
+    height: 720
+    fps: 30.0
+    # 摄像头安装旋转角：倒装 180、正装 0、侧装 90/270
+    cam_rotation: 180
+    # 比赛时 true：不弹预览窗口（省 CPU，SSH 也没有 DISPLAY）
+    headless: true
+    # 空闲时排空摄像头缓冲的频率（Hz）
+    idle_grab_hz: 10.0
+    # calibrate 业务的对位 PID / 偏移在 vision_node/businesses/calibrate.py 的 DEFAULTS，
+    # 或在动作序列的 calibrate args 里逐项覆盖。
 
 qr_scanner:
   ros__parameters:

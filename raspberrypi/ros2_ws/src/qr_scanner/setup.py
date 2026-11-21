@@ -1,4 +1,4 @@
-# setup.py：告诉 colcon 怎么安装 qr_scanner 包。结构和 ring_fix 完全一致。
+# setup.py：告诉 colcon 怎么安装 qr_scanner 包。结构和 vision_node / motion_planner 一致。
 
 from setuptools import find_packages, setup
 

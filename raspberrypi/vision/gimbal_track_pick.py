@@ -101,7 +101,7 @@ class PID:
 
 
 def build_undistort_maps(width: int, height: int):
-    """与 vision/main.py / ring_fix 同一套：camera_processing.json + 标定 yaml。"""
+    """与 vision/main.py / vision_put_align 同一套：camera_processing.json + 标定 yaml。"""
     import cv2
     proc = json.loads((HERE / 'config' / 'camera_processing.json').read_text(encoding='utf-8'))
     if not proc.get('undistort_enabled'):
@@ -446,11 +446,17 @@ def track_color(camera, node, args, color_doc, ctx, color,
     try:
         while time.monotonic() - started < args.timeout:
             rclpy.spin_once(node, timeout_sec=0.0)
-            if debug:
-                if should_stop is not None and should_stop():
+            # 统一节点里 stop 是"取消当前业务"；旧的一次性调用没传 should_stop，
+            # 行为不变。debug 模式沿用原来的 reason，方便上位机区分。
+            if should_stop is not None and should_stop():
+                if debug:
                     result = {'ok': True, 'color': args.color,
                               'debug': True, 'reason': 'stopped'}
-                    break
+                else:
+                    result = {'ok': False, 'color': args.color,
+                              'reason': 'stopped'}
+                break
+            if debug:
                 if time.monotonic() >= next_cfg:
                     # 上位机拖完滑块后 1 秒内生效，不用重跑序列
                     next_cfg = time.monotonic() + 1.0
@@ -1458,7 +1464,7 @@ def _run_server(args, camera, node, color_doc, ctx) -> int:
     return 0
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='云台跟随颜色物料（color_pick 视觉端）')
     parser.add_argument('--color', type=int, default=None,
                         help='颜色编号 1~6（--server 模式下由 stdin 下发，可不填）')
@@ -1571,6 +1577,21 @@ def main() -> int:
     parser.add_argument('--calib-no-dialog', action='store_true',
                         help='每组结束不弹确认框（改成等画面里物料被挪走再自动继续）')
 
+    return parser
+
+
+def build_args(argv=None):
+    """给别的程序（vision_node）复用同一套默认参数。
+
+    不打开摄像头、不初始化 ROS，只把命令行默认值和 track_pid.json 合并好。
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv if argv is not None else [])
+    return _apply_track_config(args, HERE)
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     args = _apply_track_config(args, HERE)   # 上位机可改 config/track_pid.json 调 PID/方向/旋转
 

@@ -35,8 +35,9 @@ def generate_launch_description():
         car_node('f407_bridge', 'f407_bridge_node', 'f407_bridge'),
         # 4. 运动规划节点（任务状态机）
         car_node('motion_planner', 'motion_planner_node', 'motion_planner'),
-        # 5. 圆环工位视觉矫正（calibrate 指令的执行者，触发时才开摄像头）
-        car_node('ring_fix', 'ring_fix_node', 'ring_fix'),
+        # 5. 统一视觉节点：一个进程独占摄像头，color_pick / vision_put / calibrate
+        #    都是它下面的业务（见 vision_node/README.md）
+        car_node('vision_node', 'vision_node', 'vision_node'),
         # 6. 扫码模块：UART3 读二维码任务码，校验锁存后发 /task_code(/decoded)
         car_node('qr_scanner', 'qr_scanner_node', 'qr_scanner'),
         # 7. 手柄驱动（USB 手柄 -> /joy）
