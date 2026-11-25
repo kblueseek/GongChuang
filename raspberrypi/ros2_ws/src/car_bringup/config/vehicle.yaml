@@ -115,7 +115,7 @@ vision_node:
     height: 720
     fps: 30.0
     # 摄像头安装旋转角：倒装 180、正装 0、侧装 90/270
-    cam_rotation: 180
+    cam_rotation: 0
     # 比赛时 true：不弹预览窗口（省 CPU，SSH 也没有 DISPLAY）
     headless: false
     # 空闲时排空摄像头缓冲的频率（Hz）

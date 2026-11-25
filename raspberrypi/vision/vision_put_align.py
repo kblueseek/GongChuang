@@ -38,8 +38,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -54,6 +56,16 @@ from ring_station_detector import (    # noqa: E402
     RingStationDetectionError,
     RingStationDetector,
     load_ring_station_config,
+)
+
+# 每次 vision_put 的逐帧检测数据（覆盖上一次），用来查误判/漏检。
+# 设环境变量 VISION_PUT_CSV='' 可关闭。
+_VP_CSV = os.environ.get('VISION_PUT_CSV', '/tmp/vision_put_last.csv')
+_VP_HEADER = (
+    't', 'found', 'ring_idx', 'cx', 'cy', 'ex_raw', 'ey_raw', 'fex', 'fey',
+    'yaw_vel', 'ext_vel', 'centers', 'radii', 'predicted', 'conf', 'persp',
+    'resid', 'layout', 'locked_ref', 'ring_arg', 'target_x', 'target_y',
+    'status', 'event',
 )
 
 
@@ -256,6 +268,18 @@ def _select_locked(centers, ring: int, target, locked, lock_radius_px: float,
     return index, center, center
 
 
+def _ellipse_radius_px(ellipse) -> float | None:
+    """由 fitEllipse 的 ((cx, cy), (axis1, axis2), angle) 算半径（像素）。
+
+    注意 cv2.fitEllipse 的 axes 是整条轴长（直径），不是半径，所以取长轴的一半。
+    检测器内部（直径波段、outer_diameter_mm 换算）也是按整条轴长用的。
+    """
+    try:
+        return max(float(value) for value in ellipse[1]) * 0.5
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='vision_put 视觉端：圆环圆心对像素')
     parser.add_argument('--lock-radius-px', type=float, default=150.0,
@@ -267,6 +291,19 @@ def build_parser() -> argparse.ArgumentParser:
                              '误锁会直接跑偏）')
     parser.add_argument('--ring', type=int, default=0,
                         help='要对的环号 1~3（左到右）；0=取离目标像素最近的')
+    parser.add_argument('--use-predicted-layout', action='store_true',
+                        help='启用三环布局预测来选环。默认关闭：只用当前帧真实'
+                             '观测到的环心，避免锁到 P1/P2/P3 这些推算出来的虚拟环')
+    parser.add_argument('--min-confidence', type=float, default=0.0,
+                        help='选中环的检测置信度低于它就不控制（0=不检查）。'
+                             '建议 0.8 左右；单环置信度天然比三环低，别设 0.9')
+    parser.add_argument('--max-residual', type=float, default=0.0,
+                        help='三环仿射残差超过它就不控制（0=不检查；单环不适用）')
+    parser.add_argument('--min-radius-px', type=float, default=0.0,
+                        help='目标环在画面里的最小半径（像素，长轴/2）；0=不检查')
+    parser.add_argument('--max-radius-px', type=float, default=0.0,
+                        help='目标环在画面里的最大半径（像素，长轴/2）；0=不检查。'
+                             '超出范围的候选不参与选环，用来排掉物料边/支架等误检')
     parser.add_argument('--target-x', type=float, default=None,
                         help='目标像素 x，默认画面中心')
     parser.add_argument('--target-y', type=float, default=None,
@@ -278,10 +315,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--cam-rotation', type=int, default=180,
                         choices=[0, 90, 180, 270])
     parser.add_argument('--timeout', type=float, default=30.0, help='总超时 s')
-    parser.add_argument('--tol-px', type=float, default=10.0, help='对准容差（像素）')
+    parser.add_argument('--tol-px', type=float, default=10.0,
+                        help='判定“真的到位”的像素容差（同时看原始误差和滤波后误差）')
     parser.add_argument('--deadband-px', type=float, default=8.0,
-                        help='误差小于它就停（控制死区）')
-    parser.add_argument('--stable', type=int, default=6, help='连续多少帧进死区算成功')
+                        help='控制死区：误差小于它就不再给速度；要严格到位就设得比 tol_px 小')
+    parser.add_argument('--stable', type=int, default=6,
+                        help='连续多少帧满足 tol_px 且云台角度不动，才判成功')
+    parser.add_argument('--filter-tau', type=float, default=0.0,
+                        help='视觉误差一阶低通时间常数（秒）。0=不滤波；'
+                             '0.10~0.20 可压住环心跳变，代价是约 tau 的滞后')
+    parser.add_argument('--max-jump-px', type=float, default=0.0,
+                        help='单帧误差相对滤波值的最大变化（像素）。超出的部分先'
+                             '钳住再进低通，挡掉一帧几十像素的误检跳变。0=不钳')
+    parser.add_argument('--success-move-deg', type=float, default=0.0,
+                        help='判成功前云台 yaw/ext 实测角在相邻帧的最大变化（°）。'
+                             '0=不检查；0.5~1.0 可防止“云台还在动就收工”')
     # ---- 速度环：默认值和已经在用的 color_pick 跟踪环（track_pid.json）一致 ----
     parser.add_argument('--kp-yaw', type=float, default=1.0)
     parser.add_argument('--ki-yaw', type=float, default=0.01)
@@ -319,6 +367,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--save-frame', default='',
                         help='把第一帧识别画面（带观测/预测标记）存成图片，'
                              '用于夹着物料时远程排查；例：--save-frame /tmp/ring.jpg')
+    parser.add_argument('--show-all-centers', action='store_true',
+                        help='预览里画出本轮所有候选环（完整椭圆 + 直径）。'
+                             '默认只画选中的那个（黄色）；打开后干扰候选是绿色，'
+                             '可以直接看它的形状/大小判断是什么东西。CSV 始终记录全部 centers')
 
     return parser
 
@@ -353,23 +405,48 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
 
     def _draw_overlay(img, det, centers, index, locked_ref, status):
         """把观测环、完整布局预测、目标像素和状态画到图上（预览/存图共用）。"""
+        ellipses = getattr(det, 'ellipses', ()) or ()
         for i, c in enumerate(centers):
-            color = (0, 255, 255) if i == index else (0, 255, 0)
-            cv2.circle(img, (int(c[0]), int(c[1])), 8, color, 2)
-            cv2.putText(img, str(i + 1), (int(c[0]) + 10, int(c[1]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        # 红色 = 当前锁定/对齐的意图环；蓝色 = 推算出来的其他环
-        for pi, p in enumerate(getattr(det, 'predicted_centers_px', ())):
-            if p is None:
+            # 默认只画选中的那个环（黄色）；show_all_centers=true 时把同帧
+            # 其它候选也画出来（绿色）。画完整椭圆而不是只画圆心，才能看清
+            # 干扰项到底是什么形状/多大——假环的椭圆通常明显不对。
+            if i != index and not args.show_all_centers:
                 continue
-            pc = (int(round(p[0])), int(round(p[1])))
-            is_target = locked_ref is not None and pi == locked_ref
-            col = (0, 0, 255) if is_target else (200, 120, 0)
-            cv2.drawMarker(img, pc, col, cv2.MARKER_TILTED_CROSS,
-                           18 if is_target else 14, 2)
-            cv2.putText(img, f"P{pi + 1}", (pc[0] + 8, pc[1] + 20),
+            if i == index:
+                color = (0, 255, 255)          # 选中的目标环
+            elif radius_filter and not _radius_ok(i):
+                color = (255, 0, 255)          # 半径不在范围内，已被剔除
+            else:
+                color = (0, 255, 0)            # 同帧其它候选
+            if i < len(ellipses):
+                try:
+                    # ellipses[i] 就是 ((cx, cy), (MA, ma), angle)，
+                    # 和 ring_station_detector 自己的调试绘制格式一致。
+                    cv2.ellipse(img, ellipses[i], color, 2, cv2.LINE_AA)
+                except cv2.error:
+                    pass
+            cv2.circle(img, (int(c[0]), int(c[1])), 6, color, 2)
+            radius = radii[i] if i < len(radii) else None
+            label = (f'R{i + 1}' if i == index else f'#{i + 1}')
+            if radius is not None:
+                label += f' r={radius:.0f}'
+            cv2.putText(img, label, (int(c[0]) + 10, int(c[1]) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55 if is_target else 0.45, col, 1)
+                        0.6 if i == index else 0.5, color, 2)
+        # 红色 = 当前锁定/对齐的意图环；蓝色 = 推算出来的其他环。
+        # 默认不画/不用预测布局：单环场景下 P1/P2/P3 是虚拟点，看起来像误判。
+        if args.use_predicted_layout:
+            for pi, p in enumerate(getattr(det, 'predicted_centers_px', ())):
+                if p is None:
+                    continue
+                pc = (int(round(p[0])), int(round(p[1])))
+                is_target = locked_ref is not None and pi == locked_ref
+                col = (0, 0, 255) if is_target else (200, 120, 0)
+                cv2.drawMarker(img, pc, col, cv2.MARKER_TILTED_CROSS,
+                               18 if is_target else 14, 2)
+                cv2.putText(img, f"P{pi + 1}", (pc[0] + 8, pc[1] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55 if is_target else 0.45, col, 1)
         cv2.drawMarker(img, (int(target_x), int(target_y)),
                        (255, 255, 255), cv2.MARKER_CROSS, 30, 2)
         state = getattr(det, 'layout_source', '?')
@@ -400,12 +477,64 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
     phase = 'settle' if (args.settle_stable_s > 0.0 and not args.dry_run) else 'servo'
     result = {'ok': False, 'reason': 'timeout'}
     frames = 0
+    found_frames = 0
     last_centers = []
     last_predicted = ()
     last_layout_source = ''
     saved_frame = False
     locked_center = None          # 旧路径：按观测环心锁定（没有布局预测时用）
     locked_ref = None             # 新路径：锁定的参考环号（0/1/2），按预测布局对齐
+    # 视觉误差滤波状态：fex/fey 是送进 PID 的滤波值，raw 只用来判"真的到位"。
+    # 锁定目标变了（切环/丢环重捕）就重置，不能拿上一个环的滤波值去跟新环。
+    filt_ex = filt_ey = None
+    sel_key = None
+    last_gimbal = None            # 上一帧云台实测角，用来判"云台还在不在动"
+
+    # 逐帧 CSV：查误判/漏检用。每次 vision_put 覆盖 /tmp/vision_put_last.csv。
+    csv_file = None
+    csv_writer = None
+    if _VP_CSV:
+        try:
+            csv_file = open(_VP_CSV, 'w', newline='', encoding='utf-8')
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(_VP_HEADER)
+            csv_file.flush()
+        except OSError:
+            csv_file = None
+            csv_writer = None
+
+    def _log_vp(t, det, centers, center, index, ex_raw, ey_raw, fex, fey,
+                radii, yaw_vel, ext_vel, status, event='frame'):
+        if csv_writer is None:
+            return
+        conf = getattr(det, 'confidence', None) if det is not None else None
+        persp = getattr(det, 'perspective_ratio', None) if det is not None else None
+        resid = getattr(det, 'affine_residual', None) if det is not None else None
+        layout = getattr(det, 'layout_source', '') if det is not None else ''
+        predicted = getattr(det, 'predicted_centers_px', ()) if det is not None else ()
+        found = 1 if center is not None else 0
+        try:
+            csv_writer.writerow((
+                f'{t:.4f}', found,
+                (index + 1) if center is not None else '',
+                '' if center is None else f'{center[0]:.1f}',
+                '' if center is None else f'{center[1]:.1f}',
+                f'{ex_raw:.1f}', f'{ey_raw:.1f}',
+                '' if fex is None else f'{fex:.1f}',
+                '' if fey is None else f'{fey:.1f}',
+                f'{yaw_vel:.1f}', f'{ext_vel:.1f}',
+                len(centers or ()),
+                ' '.join('?' if r is None else f'{r:.0f}' for r in (radii or ())),
+                len(predicted or ()),
+                '' if conf is None else f'{float(conf):.3f}',
+                '' if persp is None else f'{float(persp):.3f}',
+                '' if resid is None else f'{float(resid):.3f}',
+                layout, '' if locked_ref is None else locked_ref,
+                args.ring, f'{target_x:.1f}', f'{target_y:.1f}', status, event,
+            ))
+            csv_file.flush()
+        except OSError:
+            pass
 
     try:
         while time.monotonic() - started < args.timeout:
@@ -481,46 +610,172 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
                 continue
 
             centers = det.centers_px
-            if locked_ref is None and 1 <= args.ring <= 3:
-                locked_ref = args.ring - 1
-            ref_index, center, locked_ref = _select_predicted(
-                getattr(det, 'predicted_centers_px', ()),
-                (target_x, target_y), locked_ref,
-                args.max_target_distance_px)
-            if center is not None:
-                index = ref_index
-                locked_center = None
-            else:
-                # 旧检测器/布局推不出来：退回"按观测环心锁定"的老逻辑
-                index, center, locked_center = _select_locked(
-                    centers, args.ring, (target_x, target_y),
-                    locked_center, args.lock_radius_px,
-                    args.max_target_distance_px)
+            ellipses = getattr(det, 'ellipses', ()) or ()
+            radii = [_ellipse_radius_px(ellipse) for ellipse in ellipses]
+            radius_filter = (args.min_radius_px > 0.0
+                             or args.max_radius_px > 0.0)
 
+            def _radius_ok(ring_index):
+                """这个候选环的半径是否在目标范围内。"""
+                if not radius_filter:
+                    return True
+                radius = (radii[ring_index]
+                          if 0 <= ring_index < len(radii) else None)
+                if radius is None:
+                    return False
+                if (args.min_radius_px > 0.0
+                        and radius < args.min_radius_px):
+                    return False
+                if (args.max_radius_px > 0.0
+                        and radius > args.max_radius_px):
+                    return False
+                return True
+
+            # 半径不在范围内的候选根本不参与选环。否则它会因为"离目标像素更近"
+            # 先被选中、随后才被剔除，真正的目标环反而轮不到。
+            selectable = ([i for i in range(len(centers)) if _radius_ok(i)]
+                          if radius_filter else list(range(len(centers))))
+            radius_msg = None
+            if (radius_filter and centers and not selectable
+                    and not args.use_predicted_layout):
+                shown = '/'.join('?' if r is None else f'{r:.0f}' for r in radii)
+                radius_msg = (f'RADIUS 候选半径都不在 '
+                              f'{args.min_radius_px:.0f}~{args.max_radius_px:.0f}px'
+                              f'（{shown}）')
+            center = None
+            index = -1
+            if args.use_predicted_layout:
+                if locked_ref is None and 1 <= args.ring <= 3:
+                    locked_ref = args.ring - 1
+                ref_index, center, locked_ref = _select_predicted(
+                    getattr(det, 'predicted_centers_px', ()),
+                    (target_x, target_y), locked_ref,
+                    args.max_target_distance_px)
+                if center is not None:
+                    index = ref_index
+                    locked_center = None
+            if center is None:
+                # 默认/预测布局不可用：只按当前帧真实观测到的环心锁定。
+                # 只在半径合格的候选里选，选完再把下标映射回所有候选，
+                # 预览/日志里仍然能看到被半径条件剔除的干扰项。
+                index, center, locked_center = _select_locked(
+                    [centers[i] for i in selectable], args.ring,
+                    (target_x, target_y), locked_center,
+                    args.lock_radius_px, args.max_target_distance_px)
+                if center is None:
+                    index = -1
+                else:
+                    index = selectable[index]
+
+            # 质量门槛：T 检测器 require_quality=False 时质量只作提示，这里
+            # 用它来挡误判。单环的 confidence 天生比三环低，所以只对 confidence
+            # 用较低阈值；残差/透视只在三环时检查。
+            quality_msg = None
+            if center is not None:
+                conf = float(getattr(det, 'confidence', 0.0) or 0.0)
+                resid = getattr(det, 'affine_residual', None)
+                if args.min_confidence > 0.0 and conf < args.min_confidence:
+                    quality_msg = f'LOW CONF {conf:.2f}'
+                elif (args.max_residual > 0.0 and len(centers) >= 3
+                      and isinstance(resid, (int, float))
+                      and math.isfinite(resid) and resid > args.max_residual):
+                    quality_msg = f'HIGH RESID {resid:.2f}'
+                if quality_msg is not None:
+                    center = None
+
+            ex_raw = ey_raw = 0.0
             ex = ey = 0.0
             yaw_vel = ext_vel = 0.0
             if center is not None:
-                ex = center[0] - target_x
-                ey = center[1] - target_y
-                if abs(ex) <= args.deadband_px and abs(ey) <= args.deadband_px:
+                ex_raw = center[0] - target_x
+                ey_raw = center[1] - target_y
+
+                # 锁定目标变了（切环/丢环重捕）就重置滤波和 PID，
+                # 不能拿上一个环的滤波值去跟新环。
+                key = (locked_ref, index)
+                if key != sel_key:
+                    sel_key = key
+                    filt_ex = filt_ey = None
+                    stable = 0
+                    pid_yaw.reset()
+                    pid_ext.reset()
+
+                # 低通 + 单帧跳变钳位：先钳住相对上一滤波值的大跳变，再做
+                # 一阶低通。filter_tau=0 时等同于直接取原始误差。
+                if filt_ex is None:
+                    filt_ex, filt_ey = ex_raw, ey_raw
+                else:
+                    if args.max_jump_px > 0.0:
+                        lim = args.max_jump_px
+                        src_x = min(max(ex_raw, filt_ex - lim), filt_ex + lim)
+                        src_y = min(max(ey_raw, filt_ey - lim), filt_ey + lim)
+                    else:
+                        src_x, src_y = ex_raw, ey_raw
+                    alpha = (1.0 if args.filter_tau <= 0.0
+                             else dt / (args.filter_tau + dt))
+                    filt_ex += alpha * (src_x - filt_ex)
+                    filt_ey += alpha * (src_y - filt_ey)
+                ex, ey = filt_ex, filt_ey
+
+                # 云台实测角在相邻帧还动不动：动就说明臂还在走或在收残速，
+                # 这时即使画面已进容差也不能收工。
+                gimbal_still = True
+                if args.success_move_deg > 0.0:
+                    if not node._gimbal_ok or last_gimbal is None:
+                        gimbal_still = False
+                    else:
+                        gimbal_still = max(
+                            abs(node._gimbal[0] - last_gimbal[0]),
+                            abs(node._gimbal[2] - last_gimbal[2]),
+                        ) <= args.success_move_deg
+                last_gimbal = list(node._gimbal) if node._gimbal_ok else None
+
+                # 判到位同时看：滤波值 <= tol、原始值 <= 1.5*tol、云台不再动。
+                # 滤波有滞后，单看它会"看着到位其实没到"，所以原始值再兜一道。
+                tol = args.tol_px
+                if (abs(ex) <= tol and abs(ey) <= tol
+                        and abs(ex_raw) <= tol * 1.5
+                        and abs(ey_raw) <= tol * 1.5
+                        and gimbal_still):
                     stable += 1
                     pid_yaw.reset()
                     pid_ext.reset()
                 else:
                     stable = 0
-                    yaw_vel = args.yaw_sign * pid_yaw.update(ex, dt)
-                    ext_vel = args.ext_sign * pid_ext.update(ey, dt)
-                status = (f'ring{index + 1} ex={ex:+.1f} ey={ey:+.1f} '
+                    # 控制死区要小于 tol：死区一停 PID 就不再补速度，
+                    # 死区若等于/大于 tol，就会出现"还差一点却停了"。
+                    if abs(ex) > args.deadband_px or abs(ey) > args.deadband_px:
+                        yaw_vel = args.yaw_sign * pid_yaw.update(ex, dt)
+                        ext_vel = args.ext_sign * pid_ext.update(ey, dt)
+                    else:
+                        pid_yaw.reset()
+                        pid_ext.reset()
+                status = (f'ring{index + 1} ex={ex_raw:+.1f} ey={ey_raw:+.1f} '
+                          f'fex={ex:+.1f} fey={ey:+.1f} '
                           f'yaw={yaw_vel:+.1f}°/s ext={ext_vel:+.1f}°/s '
-                          f'stable={stable}/{args.stable}')
+                          f'stable={stable}/{args.stable}'
+                          f'{"" if gimbal_still else " MOVING"}')
             else:
                 stable = 0
+                filt_ex = filt_ey = None
+                sel_key = None
                 pid_yaw.reset()
                 pid_ext.reset()
-                if locked_center is not None:
+                if quality_msg is not None:
+                    status = (f'{quality_msg}：检测质量不过，不控制'
+                              f'（centers={len(centers)}）')
+                elif radius_msg is not None:
+                    status = radius_msg
+                elif locked_center is not None:
                     status = 'LOCK LOST：锁定环暂时看不到，原地等它回来（不乱切别的环）'
                 else:
                     status = 'SEARCH 没找到圆环'
+
+            if center is not None:
+                found_frames += 1
+            _log_vp(now - started, det, centers, center, index,
+                    ex_raw, ey_raw, filt_ex, filt_ey, radii,
+                    yaw_vel, ext_vel, status)
 
             if args.dry_run and det.detected:
                 # 只看不动：记录最后一帧"有检出"的环心和完整布局，方便标定/排错。
@@ -553,7 +808,7 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
 
             if (not args.dry_run) and stable >= args.stable and node._gimbal_ok:
                 result = {'ok': True, 'ring': index + 1,
-                          'dx_px': round(ex, 1), 'dy_px': round(ey, 1),
+                          'dx_px': round(ex_raw, 1), 'dy_px': round(ey_raw, 1),
                           'yaw_deg': round(node._gimbal[0], 2),
                           'lift_deg': round(node._gimbal[1], 2),
                           'extend_deg': round(node._gimbal[2], 2),
@@ -562,6 +817,12 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
                 break
     finally:
         node.send_gimbal_vel(0.0, 0.0, 0.0)
+        if csv_file is not None:
+            try:
+                csv_file.flush()
+                csv_file.close()
+            except OSError:
+                pass
         if not args.headless:
             cv2.destroyAllWindows()
 

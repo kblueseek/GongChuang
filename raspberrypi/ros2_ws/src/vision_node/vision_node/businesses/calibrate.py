@@ -28,7 +28,8 @@ _CSV_HEADER = (
     'cx', 'cy', 'cyaw', 'fx', 'fy', 'fyaw',
     'vx', 'vy', 'vyaw', 'lead_x', 'lead_y', 'lead_yaw',
     'odom_x', 'odom_y', 'odom_yaw_deg',
-    'ix', 'iy', 'iyaw', 'dt', 'event',
+    'ix', 'iy', 'iyaw', 'dt', 'persp', 'conf', 'resid',
+    'remap_ms', 'proc_ms', 'event',
 )
 
 from ..business import Business, register
@@ -48,6 +49,11 @@ DEFAULTS = {
     # 参考环心（reference_centers_px[1]），不再固定是画面中心。
     'target_x': None,
     'target_y': None,
+    # calibrate 自己的画面旋转角（None/空 = 跟随 vision_node 的 cam_rotation）。
+    # 旧标定是在摄像头倒装时做的（当时 calibrate 不转图，看的是原始倒像）；
+    # 现在摄像头物理转正、color_pick 用 0，但参考环心/纠偏矩阵还是倒像那套，
+    # 所以 calibrate 这里要单独填 180 才能和旧标定对齐。和 color_pick 无关。
+    'cam_rotation': None,
     'align_yaw_deg': '',          # 空 = 只修位置，不修航向
     # 底盘对位 PID
     'ctrl_kp_xy': 1.0,
@@ -111,13 +117,22 @@ class _Calibrator:
     """一次圆环矫正的完整状态机（对应 ring_fix 的 _tick / _control_step）。"""
 
     def __init__(self, ctx, params: dict, detector, map1, map2,
-                 ring_target, stop, pid_cls):
+                 ring_target, stop, pid_cls, cam_rotation: int = 0):
         import cv2
         self._cv2 = cv2
         self.ctx = ctx
         self.detector = detector
         self.map1 = map1
         self.map2 = map2
+        # 和 color_pick / vision_put 一样：先畸变矫正，再按安装角旋转。
+        # 不旋转的话，倒装相机的画面是倒的，ring_station_* 的参考环心/
+        # 仿射/透视比全部对不上，表现就是"能看到环但怎么也 STABLE=False"。
+        self._rotate = {
+            0: None,
+            90: cv2.ROTATE_90_CLOCKWISE,
+            180: cv2.ROTATE_180,
+            270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        }.get(int(cam_rotation))
         self.ring_target = ring_target
         self.stop = stop
 
@@ -166,11 +181,17 @@ class _Calibrator:
         self.anchor_pose = None
         self.settle_until = 0.0
         self.last_diag_t = 0.0
+        # 方向保护：起步 1 秒后误差反而变大 50% → 判定纠偏方向反了，立即停车。
+        self._move_start_t = 0.0
+        self._move_start_mag = 0.0
+        self._move_guard_done = False
 
         # 最近一次 _control_step 的输出（日志用；没控制时保持 None）
         self._last_v = None          # (vx, vy, vyaw)  mm/s, mm/s, °/s
         self._last_lead = None       # (lead_x, lead_y, lead_yaw) mm, mm, °
         self._last_dt = 0.0
+        self._last_remap_ms = 0.0    # 畸变矫正+旋转耗时
+        self._last_proc_ms = 0.0     # 检测耗时
         self._csv = None
         if _CSV_PATH:
             try:
@@ -207,27 +228,37 @@ class _Calibrator:
             ok, frame = self.ctx.camera.read()
             if not ok or frame is None:
                 continue
+            t_remap = time.monotonic()
             if self.map1 is not None:
                 frame = self._cv2.remap(frame, self.map1, self.map2,
                                         self._cv2.INTER_LINEAR)
+            if self._rotate is not None:
+                frame = self._cv2.rotate(frame, self._rotate)
+            t_det = time.monotonic()
             try:
+                # calibrate.json 的 require_quality=false：置信度/残差/透视比
+                # 只作提示，不拦帧（现场视角固定时透视比可能长期超范围，
+                # 但三环几何是好的；旧版 calibrate 也是这么跑的）。
                 result = self.detector.detect(
                     frame, require_quality=self.require_quality)
             except Exception:  # noqa: BLE001 - 单帧异常只跳过这一帧
                 continue
+            t_after = time.monotonic()
+            self._last_remap_ms = (t_det - t_remap) * 1000.0
+            self._last_proc_ms = (t_after - t_det) * 1000.0
 
             # 调试预览：调 calibrate 时也能看到检测框/环数和稳定帧进度。
             # 没有桌面环境时 ctx.headless 已经是 True，不会走到这里。
             if not self.ctx.headless:
                 try:
-                    from ring_station_detector import (
+                    from ring_station_classic import (
                         draw_ring_station_detection,
                     )
                     vis = frame.copy()
                     draw_ring_station_detection(vis, result)
                     self._cv2.putText(
                         vis,
-                        f"calibrate  rings={getattr(result, 'visible_ring_count', 0)}/3  "
+                        f"calibrate  rings={len(result.centers_px)}/3  "
                         f"stable={result.stable}  hold={self.hold_frames}/{self.hold_need}",
                         (16, 180), self._cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 255), 2, self._cv2.LINE_AA)
@@ -236,16 +267,15 @@ class _Calibrator:
                 except Exception:  # noqa: BLE001 - 预览失败不影响对位
                     pass
 
-            # 控制量不再要求 result.stable：detect() 返回的 correction 本身
-            # 已经是最近 stable_frame_count 帧的中值，控制环后面还有一阶滤波 +
-            # 滞环。之前要求 stable 的代价是实测 52% 的时间在"车已停稳但凑不够
-            # 3 帧抖动<=1.5px"上空转，滤波器还被冻结，误差估计停在旧值。
-            # stable 只保留给最后的收敛确认（converged_frame），精度不降。
-            usable = (result.detected
+            # 控制量要求 result.stable：旧版 calibrate 就是只用稳定帧，车不抖。
+            # （之前为了绕开旧 T 检测器"凑不够 stable"的问题把这里放开了，
+            #   但换成 classic + legacy 配置后 stable=6 帧/抖动 6px 很容易满足，
+            #   放开反而让单帧噪声直接进 PID —— 就是现在车身来回抖的来源。）
+            usable = (result.detected and result.stable
                       and len(result.centers_px) == 3
                       and result.correction_body_x_mm is not None
                       and math.isfinite(result.affine_residual))
-            converged_frame = usable and result.stable
+            converged_frame = usable
             if usable:
                 cx_mm = result.correction_body_x_mm
                 cy_mm = result.correction_body_y_mm
@@ -253,6 +283,28 @@ class _Calibrator:
                 self.last_usable_t = now
                 fx, fy, fyaw = self._filter(now, cx_mm, cy_mm, cyaw)
                 self._update_motion(now, fx, fy, fyaw)
+
+                # 方向保护：起步 1s 后误差反而比起步时大 50% = 纠偏方向反了。
+                # 实测反号时 1s 内会从 55mm 涨到 110mm 以上；正常收敛只会变小。
+                # 触发时把当前位姿锁成目标并结束本组，避免车一直往外走。
+                if (self.moving and not self._move_guard_done
+                        and now - self._move_start_t >= 1.0):
+                    self._move_guard_done = True
+                    mag_now = max(abs(fx), abs(fy))
+                    if (self._move_start_mag > 10.0
+                            and mag_now > self._move_start_mag * 1.5):
+                        odom, _t = self.ctx.node.get_odom()
+                        if odom is not None:
+                            self.ctx.node.publish_pose(*odom)
+                        self.ctx.node.get_logger().error(
+                            f'calibrate 纠偏不收敛：误差 '
+                            f'{self._move_start_mag:.1f}→{mag_now:.1f}mm，'
+                            '疑似方向反了，已停车')
+                        self._log_row(started, now, result, usable,
+                                      (fx, fy, fyaw), 'reverse_guard')
+                        self._close_csv()
+                        return {'ok': False,
+                                'reason': '纠偏方向相反/不收敛，已停车'}
 
                 if (converged_frame
                         and not self.moving
@@ -293,6 +345,11 @@ class _Calibrator:
             if now - self.last_diag_t >= 1.0:
                 self.last_diag_t = now
                 detail = result.detail if result.detected else '未检测到三个圆环'
+                if result.detected:
+                    persp = getattr(result, 'perspective_ratio', None)
+                    conf = getattr(result, 'confidence', None)
+                    detail += (f' [透视 {persp:.2f} 置信 {conf:.2f}]'
+                               if persp is not None and conf is not None else '')
                 self.ctx.node.get_logger().info(
                     f'calibrate {detail} 稳定帧 {self.hold_frames}/{self.hold_need}')
 
@@ -304,14 +361,22 @@ class _Calibrator:
             return
         fx, fy, fyaw = filt
         cx = cy = cyaw = None
+        persp = conf = resid = None
         rings = 0
         stable = False
         if result is not None:
-            rings = int(getattr(result, 'visible_ring_count', 0) or 0)
+            # classic 版没有 visible_ring_count，用实际检到的圆心数
+            rings = getattr(result, 'visible_ring_count', None)
+            if rings is None:
+                rings = len(getattr(result, 'centers_px', ()) or ())
+            rings = int(rings)
             stable = bool(getattr(result, 'stable', False))
             cx = getattr(result, 'correction_body_x_mm', None)
             cy = getattr(result, 'correction_body_y_mm', None)
             cyaw = getattr(result, 'correction_yaw_deg', None)
+            persp = getattr(result, 'perspective_ratio', None)
+            conf = getattr(result, 'confidence', None)
+            resid = getattr(result, 'affine_residual', None)
         vx, vy, vyaw = self._last_v or (None, None, None)
         lx, ly, lyaw = self._last_lead or (None, None, None)
         odom = self.ctx.node.get_odom()[0]
@@ -331,7 +396,9 @@ class _Calibrator:
                 fnum(ox), fnum(oy),
                 fnum(None if oyaw is None else math.degrees(oyaw)),
                 fnum(self.pid_x.integral), fnum(self.pid_y.integral),
-                fnum(self.pid_yaw.integral), f'{self._last_dt:.4f}', event,
+                fnum(self.pid_yaw.integral), f'{self._last_dt:.4f}',
+                fnum(persp), fnum(conf), fnum(resid),
+                f'{self._last_remap_ms:.2f}', f'{self._last_proc_ms:.2f}', event,
             ))
             self._csv.flush()
         except OSError:
@@ -374,6 +441,9 @@ class _Calibrator:
             self.moving = True
             self.anchor_pose = None
             self.last_ctrl_t = 0.0
+            self._move_start_t = now
+            self._move_start_mag = mag
+            self._move_guard_done = False
             for pid in (self.pid_x, self.pid_y, self.pid_yaw):
                 pid.reset()
 
@@ -477,21 +547,24 @@ class CalibrateBusiness(Business):
             return {'ok': False,
                     'reason': 'calibrate 需要 x_m / y_m（中间圆环的里程计坐标）'}
 
-        from ring_station_detector import (
+        # calibrate 需要"三环共线"：用队友的 ring_station_classic（旧版 800 行），
+        # 默认配 ring_station_legacy.json（Y 的宽松参数，允许物料遮挡）。
+        # 不能再用 ring_station_detector.py —— 那份现在是 T 的单环版。
+        from ring_station_classic import (
             RingStationDetector, load_ring_station_config,
         )
         import vision_put_align as vpa
 
         config_path = Path(args.get('config') or
                            (ctx.vision_dir / 'config' /
-                            'ring_station_detector.json'))
+                            'calibrate_ring_station.json'))
         try:
             cfg = load_ring_station_config(config_path)
         except Exception as error:  # noqa: BLE001
             return {'ok': False, 'reason': f'圆环配置无效：{error}'}
         if getattr(cfg, 'chassis_image_to_motion', None) is None:
             return {'ok': False,
-                    'reason': 'ring_station_detector.json 缺少纠偏矩阵，无法计算底盘纠偏量'}
+                    'reason': f'{config_path.name} 缺少纠偏矩阵，无法计算底盘纠偏量'}
 
         params = dict(DEFAULTS)
         # 上位机『视觉矫正 PID』页写这份文件；每次 calibrate 开始前读一次。
@@ -551,9 +624,18 @@ class CalibrateBusiness(Business):
         detector = RingStationDetector(cfg)
         map1, map2 = vpa.build_undistort_maps(int(ctx.width), int(ctx.height))
 
+        # calibrate 的画面旋转角：默认跟随 vision_node 的 cam_rotation；
+        # 现场换了摄像头方向但不想动 color_pick 时，在 calibrate.json 里单独填。
+        rot = params.get('cam_rotation')
+        try:
+            rot = int(ctx.cam_rotation if rot in (None, '') else rot)
+        except (TypeError, ValueError):
+            rot = int(ctx.cam_rotation)
+
         try:
             return _Calibrator(ctx, params, detector, map1, map2,
-                               (rx, ry), stop.is_set, vpa.PID).run()
+                               (rx, ry), stop.is_set, vpa.PID,
+                               cam_rotation=rot).run()
         finally:
             # 业务结束把预览窗口收掉，否则窗口没人 waitKey 会冻结。
             if not ctx.headless:

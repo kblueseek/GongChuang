@@ -519,28 +519,28 @@ def wrap_deg(a: float) -> float:
 # (参数编号, 键名, 显示名, 最小, 最大, 步长, 默认值, 是否整数)
 # 编号必须和 F407 的 PiComm.h / pi_comm.py 一致。
 TUNE_PARAMS = [
-    (0x01, 'max_vx',    '前进最大速度 (m/s)',    0.0, 3.0, 0.01, 1.0, False),
+    (0x01, 'max_vx',    '前进最大速度 (m/s)',    0.0, 3.0, 0.01, 1.5, False),
     (0x02, 'max_vy',    '平移最大速度 (m/s)',    0.0, 3.0, 0.01, 1.0, False),
-    (0x03, 'max_wz',    '转向最大角速度 (rad/s)', 0.0, 8.0, 0.05, 3.0, False),
-    (0x04, 'max_rpm',   '单轮最大转速 (RPM)',    0,   600, 5,    300, True),
-    (0x05, 'pos_kp',    '位置环 Kp',             0.0,  8.0, 0.01, 1.5, False),
-    (0x06, 'pos_ki',    '位置环 Ki',             0.0,  5.0, 0.01, 0.3, False),
-    (0x07, 'pos_kd',    '位置环 Kd',             0.0,  5.0, 0.01, 0.2, False),
-    (0x08, 'head_kp',   '转向环 Kp',             0.0, 20.0, 0.05, 4.0, False),
-    (0x09, 'head_ki',   '转向环 Ki',             0.0, 10.0, 0.01, 0.0, False),
+    (0x03, 'max_wz',    '转向最大角速度 (rad/s)', 0.0, 8.0, 0.05, 2.65, False),
+    (0x04, 'max_rpm',   '单轮最大转速 (RPM)',    0,   600, 5,    400, True),
+    (0x05, 'pos_kp',    '位置环 Kp',             0.0,  8.0, 0.01, 1.74, False),
+    (0x06, 'pos_ki',    '位置环 Ki',             0.0,  5.0, 0.01, 0.0, False),
+    (0x07, 'pos_kd',    '位置环 Kd',             0.0,  5.0, 0.01, 0.0, False),
+    (0x08, 'head_kp',   '转向环 Kp',             0.0, 20.0, 0.05, 2.15, False),
+    (0x09, 'head_ki',   '转向环 Ki',             0.0, 10.0, 0.01, 0.01, False),
     (0x0A, 'head_kd',   '转向环 Kd',             0.0, 10.0, 0.01, 0.0, False),
-    (0x0B, 'gim_yaw_kp',  '云台yaw环 Kp',         0.0, 100.0, 0.5, 20.0, False),
+    (0x0B, 'gim_yaw_kp',  '云台yaw环 Kp',         0.0, 100.0, 0.5, 10.0, False),
     (0x0C, 'gim_yaw_ki',  '云台yaw环 Ki',         0.0, 20.0, 0.05, 0.0, False),
-    (0x0D, 'gim_yaw_kd',  '云台yaw环 Kd',         0.0, 10.0, 0.05, 0.0, False),
-    (0x0E, 'gim_lift_kp', '云台lift环 Kp',        0.0, 100.0, 0.5, 20.0, False),
+    (0x0D, 'gim_yaw_kd',  '云台yaw环 Kd',         0.0, 10.0, 0.05, 0.35, False),
+    (0x0E, 'gim_lift_kp', '云台lift环 Kp',        0.0, 100.0, 0.5, 8.5, False),
     (0x0F, 'gim_lift_ki', '云台lift环 Ki',        0.0, 20.0, 0.05, 0.0, False),
-    (0x10, 'gim_lift_kd', '云台lift环 Kd',        0.0, 10.0, 0.05, 0.0, False),
-    (0x11, 'gim_ext_kp',  '云台extend环 Kp',      0.0, 100.0, 0.5, 20.0, False),
+    (0x10, 'gim_lift_kd', '云台lift环 Kd',        0.0, 10.0, 0.05, 0.2, False),
+    (0x11, 'gim_ext_kp',  '云台extend环 Kp',      0.0, 100.0, 0.5, 11.5, False),
     (0x12, 'gim_ext_ki',  '云台extend环 Ki',      0.0, 20.0, 0.05, 0.0, False),
-    (0x13, 'gim_ext_kd',  '云台extend环 Kd',      0.0, 10.0, 0.05, 0.0, False),
-    (0x14, 'gim_yaw_speed',  '云台yaw最大速度 °/s',   0.0, 2000.0, 5.0, 120.0, False),
-    (0x15, 'gim_lift_speed', '云台lift最大速度 °/s',  0.0, 2000.0, 5.0, 400.0, False),
-    (0x16, 'gim_ext_speed',  '云台extend最大速度 °/s', 0.0, 2000.0, 5.0, 300.0, False),
+    (0x13, 'gim_ext_kd',  '云台extend环 Kd',      0.0, 10.0, 0.05, 0.15, False),
+    (0x14, 'gim_yaw_speed',  '云台yaw最大速度 °/s',   0.0, 2000.0, 5.0, 1615.0, False),
+    (0x15, 'gim_lift_speed', '云台lift最大速度 °/s',  0.0, 2000.0, 5.0, 1545.0, False),
+    (0x16, 'gim_ext_speed',  '云台extend最大速度 °/s', 0.0, 2000.0, 5.0, 1485.0, False),
 ]
 
 TUNE_GROUPS = [
@@ -599,10 +599,13 @@ PUT_PARAMS = [
     ('kd_extend',        '对环extend Kd',          0.0,  2.0, 0.005, 0.015, False),
     ('max_yaw_deg_s',    'yaw速度限幅 °/s',        10.0, 2000.0, 5.0, 780.0, False),
     ('max_extend_deg_s', 'extend速度限幅 °/s',     10.0, 2000.0, 5.0, 1155.0, False),
-    ('deadband_px',      '控制死区 (px)',          0.0, 100.0, 1.0, 8.0, False),
+    ('deadband_px',      '控制死区 (px)',          0.0, 100.0, 1.0, 2.0, False),
     ('deriv_tau',        '微分低通 τ (s)',         0.0,  0.5, 0.01, 0.05, False),
-    ('tol_px',           '判定对环成功 (px)',      0.0, 100.0, 1.0, 10.0, False),
-    ('stable',           '连续成功帧数',            1,   30,  1,  6, True),
+    # 视觉误差一阶低通：越大圆心抖动传进云台越少，但滞后越大（约等于 τ）。
+    # 换环/丢环重捕时 vision_put 会自动重置滤波器。
+    ('filter_tau',       '视觉低通 τ (s)',         0.0,  0.5, 0.01, 0.15, False),
+    ('tol_px',           '判定对环成功 (px)',      0.0, 100.0, 1.0, 4.0, False),
+    ('stable',           '连续成功帧数',            1,   30,  1,  10, True),
     # 选定最近的那个环后只跟它：新观测离上次环心超过这个像素数就当作
     # 该环丢失（原地等），不会切到旁边别的环导致云台乱晃。
     ('lock_radius_px',   '锁定环最大偏移 (px)',    20.0, 400.0, 5.0, 150.0, False),
@@ -625,7 +628,8 @@ PUT_PARAMS = [
 PUT_GROUPS = [
     ('对环 yaw 环', ('kp_yaw', 'ki_yaw', 'kd_yaw')),
     ('对环 extend 环', ('kp_extend', 'ki_extend', 'kd_extend')),
-    ('速度限幅 / 死区', ('max_yaw_deg_s', 'max_extend_deg_s', 'deadband_px', 'deriv_tau')),
+    ('速度限幅 / 死区 / 滤波', ('max_yaw_deg_s', 'max_extend_deg_s',
+                              'deadband_px', 'deriv_tau', 'filter_tau')),
     ('判定成功', ('tol_px', 'stable')),
     ('搜索范围 / 锁环', ('lock_radius_px', 'max_target_distance_px')),
     ('中间区域（裁掉左右/上下）', ('roi_left_crop', 'roi_right_crop',

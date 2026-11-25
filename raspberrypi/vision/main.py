@@ -32,6 +32,8 @@ from ring_station_detector import draw_ring_station_detection
 from ring_station_detector import load_ring_station_config
 from ring_station_detector import RingStationDetectionError
 from ring_station_detector import RingStationDetector
+import ring_station_detector as ring_station_single_module
+import ring_station_classic as ring_station_classic_module
 from stacked_ring_detector import draw_stacked_ring_detection
 from stacked_ring_detector import load_stacked_ring_config
 from stacked_ring_detector import StackedRingDetectionError
@@ -77,13 +79,17 @@ class Mode(Enum):
     MATERIAL_PICKUP = "material_pickup"
     RING_STATION = "ring_station"
     RING_STACKING = "ring_stacking"
+    RING_SINGLE = "ring_single"     # T：单环 + 遮挡（当前版）
+    RING_LEGACY = "ring_legacy"     # Y：三环 + 遮挡（备份1）
     TURNTABLE = "turntable"
 
 
 # 模式和检测器：initialize()创建检测器，set_mode()清理历史。
 current_mode = Mode.IDLE
 turntable_detector = None
-ring_station_detector = None
+ring_station_detector = None      # T 用：当前单环版
+ring_classic_detector = None      # R 用：三环共线、无物料
+ring_legacy_detector = None       # Y 用：备份1 三环有遮挡
 stacked_ring_detector = None
 material_pickup_detector = None
 last_turntable_detection = None
@@ -145,6 +151,8 @@ def reset_detection_history():
 
     turntable_detector.reset()
     ring_station_detector.reset()
+    ring_classic_detector.reset()
+    ring_legacy_detector.reset()
     material_pickup_detector.reset()
     stacked_ring_detector.reset()
     last_turntable_detection = None
@@ -205,7 +213,8 @@ def handle_serial_command(command):
     if command == TurntableSerialCommand.ENTER_RING_STACKING:
         set_mode(Mode.RING_STACKING)
         return
-    if current_mode in (Mode.RING_STATION, Mode.RING_STACKING):
+    if current_mode in (Mode.RING_STATION, Mode.RING_SINGLE,
+                        Mode.RING_LEGACY, Mode.RING_STACKING):
         if command == TurntableSerialCommand.ENABLE_CONTINUOUS:
             ring_report_mode = TurntableReportMode.CONTINUOUS
             pending_ring_request = False
@@ -232,7 +241,8 @@ def handle_serial_command(command):
 def get_report_status():
     """返回用于终端状态行的上报模式名称。"""
 
-    if current_mode in (Mode.RING_STATION, Mode.RING_STACKING):
+    if current_mode in (Mode.RING_STATION, Mode.RING_SINGLE,
+                        Mode.RING_LEGACY, Mode.RING_STACKING):
         if ring_report_mode is None:
             return (
                 "STACKED_WAITING"
@@ -350,9 +360,22 @@ def process_ring_station(frame):
     """直接检测三圆环，再按策略上报。"""
     global last_ring_station_detection
 
-    result = ring_station_detector.detect(frame)
+    # 两份实现按模式选：
+    #   R（RING_STATION）→ classic + 严格参数：三环共线、无物料
+    #   Y（RING_LEGACY） → classic + 宽松参数：三环、允许遮挡
+    #   T（RING_SINGLE） → 当前版：单环、允许遮挡
+    if current_mode == Mode.RING_SINGLE:
+        detector = ring_station_detector
+        module = ring_station_single_module
+    elif current_mode == Mode.RING_LEGACY:
+        detector = ring_legacy_detector
+        module = ring_station_classic_module
+    else:
+        detector = ring_classic_detector
+        module = ring_station_classic_module
+    result = detector.detect(frame)
     last_ring_station_detection = result
-    draw_ring_station_detection(frame, result)
+    module.draw_ring_station_detection(frame, result)
     send_ring_if_ready(result)
     return result
 
@@ -889,6 +912,10 @@ def handle_key(key):
         set_mode(Mode.RING_STATION)
     elif key in (ord("s"), ord("S")):
         set_mode(Mode.RING_STACKING)
+    elif key in (ord("t"), ord("T")):
+        set_mode(Mode.RING_SINGLE)
+    elif key in (ord("y"), ord("Y")):
+        set_mode(Mode.RING_LEGACY)
     elif key in (ord("m"), ord("M")):
         enter_material_pickup()
     elif key in (ord("i"), ord("I")):
@@ -899,10 +926,12 @@ def handle_key(key):
 def print_runtime_status(result, measured_fps, frame_count):
     """每秒调用一次，输出当前模式结果和完整串口统计。"""
     turntable_result = result if current_mode == Mode.TURNTABLE else None
-    ring_result = result if current_mode == Mode.RING_STATION else None
+    ring_result = (result if current_mode in (
+        Mode.RING_STATION, Mode.RING_SINGLE, Mode.RING_LEGACY) else None)
     stacked_ring_result = result if current_mode == Mode.RING_STACKING else None
     material_result = result if current_mode == Mode.MATERIAL_PICKUP else None
-    if current_mode in (Mode.RING_STATION, Mode.RING_STACKING):
+    if current_mode in (Mode.RING_STATION, Mode.RING_SINGLE,
+                        Mode.RING_LEGACY, Mode.RING_STACKING):
         last_sent = serial_link.last_sent_ring_alignment
     elif current_mode == Mode.MATERIAL_PICKUP:
         last_sent = serial_link.last_sent_material_slots
@@ -1061,6 +1090,7 @@ def initialize(args):
     """只在启动时读取配置、创建检测器和串口，摄像头在read_camera中按需打开。"""
     global settings, undistort_enabled, map1, map2, serial_link
     global turntable_detector, ring_station_detector
+    global ring_classic_detector, ring_legacy_detector
     global material_pickup_detector, stacked_ring_detector
     global current_mode, camera_next_retry, camera_last_error, window_name
 
@@ -1118,6 +1148,21 @@ def initialize(args):
     )
     turntable_detector = TurntableDetector(turntable_config, material_seeder)
     ring_station_detector = RingStationDetector(ring_station_config)
+    # R 和 Y 共用 721 行那份（无 Hough），只是参数不同：
+    #   R（ring_station_classic.json）：三环共线、无物料 → 严格参数
+    #   Y（ring_station_legacy.json） ：三环 + 遮挡      → 宽松参数
+    ring_classic_config = ring_station_classic_module.load_ring_station_config(
+        CONFIG_DIR / "ring_station_classic.json"
+    )
+    ring_classic_detector = (
+        ring_station_classic_module.RingStationDetector(ring_classic_config)
+    )
+    ring_legacy_config = ring_station_classic_module.load_ring_station_config(
+        CONFIG_DIR / "ring_station_legacy.json"
+    )
+    ring_legacy_detector = (
+        ring_station_classic_module.RingStationDetector(ring_legacy_config)
+    )
     material_pickup_detector = MaterialPickupDetector(material_pickup_config, material_color_config)
     stacked_ring_detector = StackedRingDetector(stacked_ring_config, ring_station_config)
     stacked_ring_detector.set_camera_geometry(camera_geometry_signature(
@@ -1222,7 +1267,8 @@ def run(args):
                 result = process_turntable(frame)
             elif current_mode == Mode.MATERIAL_PICKUP:
                 result = process_material_pickup(frame, now)
-            elif current_mode == Mode.RING_STATION:
+            elif current_mode in (Mode.RING_STATION, Mode.RING_SINGLE,
+                                  Mode.RING_LEGACY):
                 result = process_ring_station(frame)
             elif current_mode == Mode.RING_STACKING:
                 result = process_ring_stacking(frame)

@@ -35,7 +35,7 @@
       [-0.0144684, 0.6417575]
     ],
     "minimum_confidence": 0.9,
-    "stable_frame_count": 3,
+    "stable_frame_count": 5,
     "maximum_center_jitter_px": 1.5,
     "maximum_affine_residual": 0.35,
     "perspective_ratio_range": [0.85, 1.15]

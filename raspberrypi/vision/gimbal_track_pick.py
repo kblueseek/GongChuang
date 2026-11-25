@@ -35,7 +35,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
 import select
 import sys
 import threading
@@ -51,6 +53,21 @@ sys.path.insert(0, str(HERE))          # 颜色标定 等同目录模块
 from 颜色标定 import load_color_config  # noqa: E402
 
 COLOR_NAMES = {1: '红', 2: '黄', 3: '蓝', 4: '绿', 5: '黑', 6: '浅蓝'}
+
+# 每次 color_pick / track_debug 的逐帧跟踪数据（覆盖上一次）。
+# 用 scripts/gimbal_pid_analyze.py 离线看波形、调 track_pid.json 的 PID。
+# 设环境变量 TRACK_CSV='' 可关闭。
+_TRACK_CSV = os.environ.get('TRACK_CSV', '/tmp/track_last.csv')
+_TRACK_HEADER = (
+    't', 'color', 'debug', 'phase', 'found',
+    'ex', 'ey', 'yaw_vel', 'ext_vel',
+    'gimbal_yaw', 'gimbal_lift', 'gimbal_ext', 'dt',
+    'kp_yaw', 'ki_yaw', 'kd_yaw', 'kp_ext', 'ki_ext', 'kd_ext', 'deadband',
+)
+
+
+def _csv_fmt(value):
+    return '' if value is None else f'{float(value):.3f}'
 
 
 class PID:
@@ -431,6 +448,37 @@ def track_color(camera, node, args, color_doc, ctx, color,
     next_log = time.monotonic() + 1.0    # 调试模式：下次往日志打状态的时刻
     result = {'ok': False, 'reason': 'timeout'}
 
+    # 逐帧 CSV（调 PID 用；写失败不影响跟踪）
+    csv_file = None
+    csv_writer = None
+    if _TRACK_CSV:
+        try:
+            csv_file = open(_TRACK_CSV, 'w', newline='', encoding='utf-8')
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(_TRACK_HEADER)
+            csv_file.flush()
+        except OSError:
+            csv_file = None
+            csv_writer = None
+
+    def _log_track(now, ex, ey, yaw_vel, ext_vel, dt):
+        if csv_writer is None:
+            return
+        g = node._gimbal if node._gimbal_ok else (None, None, None)
+        try:
+            csv_writer.writerow((
+                f'{now - started:.4f}', args.color, int(bool(debug)), phase,
+                int(bool(found)), f'{ex:.2f}', f'{ey:.2f}',
+                f'{yaw_vel:.2f}', f'{ext_vel:.2f}',
+                _csv_fmt(g[0]), _csv_fmt(g[1]), _csv_fmt(g[2]), f'{dt:.4f}',
+                f'{pid_yaw.kp:.4f}', f'{pid_yaw.ki:.4f}', f'{pid_yaw.kd:.4f}',
+                f'{pid_extend.kp:.4f}', f'{pid_extend.ki:.4f}',
+                f'{pid_extend.kd:.4f}', f'{args.deadband_px:.1f}',
+            ))
+            csv_file.flush()
+        except OSError:
+            pass
+
     def _is_still(now):
         '''最近 still_time 秒内质心抖动 <= still_px = 物料没动。'''
         if args.still_time <= 0.0:
@@ -543,6 +591,7 @@ def track_color(camera, node, args, color_doc, ctx, color,
                                   # 是"真的对中"还是"卡在死区边上"。
                                   'ex_px': round(ex, 2), 'ey_px': round(ey, 2)}
                         print(f'[gimbal_track_pick] 对准收工：{status}', flush=True)
+                        _log_track(now, ex, ey, yaw_vel, ext_vel, dt)
                         break
             else:
                 stable = 0
@@ -574,6 +623,7 @@ def track_color(camera, node, args, color_doc, ctx, color,
             # 每帧都发速度：跟踪时发 PID 输出，等停/丢目标/死区时发 0，
             # 既保证 F407 速度环 300ms 超时不会停得一顿一顿，也保证收工瞬间立即停住。
             node.send_gimbal_vel(yaw_vel, 0.0, ext_vel)
+            _log_track(now, ex, ey, yaw_vel, ext_vel, dt)
 
             if debug and time.monotonic() >= next_log:
                 # 每秒往 ROS 日志打一行，方便不开窗口也能看出参数有没有生效
@@ -608,6 +658,12 @@ def track_color(camera, node, args, color_doc, ctx, color,
     finally:
         # 收工/异常退出：发一帧零速，云台立刻停住，别带着最后一拍速度漂。
         node.send_gimbal_vel(0.0, 0.0, 0.0)
+        if csv_file is not None:
+            try:
+                csv_file.flush()
+                csv_file.close()
+            except OSError:
+                pass
         # 预览窗口也要收掉：业务结束后没人再调 imshow/waitKey，窗口留着
         # 会被系统判定"无响应"，下一次业务切窗口时就会卡死。
         if not args.headless:

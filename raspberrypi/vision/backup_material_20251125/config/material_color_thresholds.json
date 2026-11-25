@@ -1,0 +1,173 @@
+{
+  "format_version": 1,
+  "color_space": "OpenCV_HSV",
+  "camera_device": "/dev/video0",
+  "image_width": 1280,
+  "image_height": 720,
+  "calibration_file": "/home/kbluepi/GongChuang/raspberrypi/vision/config/realtek_rgb_camera.yaml",
+  "colors": [
+    {
+      "color_id": 1,
+      "name": "red",
+      "display_bgr": [
+        0,
+        0,
+        255
+      ],
+      "ranges": [
+        {
+          "lower": [
+            0,
+            45,
+            78
+          ],
+          "upper": [
+            13,
+            252,
+            255
+          ]
+        },
+        {
+          "lower": [
+            166,
+            45,
+            78
+          ],
+          "upper": [
+            179,
+            252,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "color_id": 2,
+      "name": "yellow",
+      "display_bgr": [
+        0,
+        255,
+        255
+      ],
+      "ranges": [
+        {
+          "lower": [
+            0,
+            0,
+            127
+          ],
+          "upper": [
+            48,
+            140,
+            255
+          ]
+        },
+        {
+          "lower": [
+            176,
+            0,
+            127
+          ],
+          "upper": [
+            179,
+            140,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "color_id": 3,
+      "name": "blue",
+      "display_bgr": [
+        255,
+        0,
+        0
+      ],
+      "ranges": [
+        {
+          "lower": [
+            102,
+            129,
+            48
+          ],
+          "upper": [
+            118,
+            229,
+            205
+          ]
+        }
+      ]
+    },
+    {
+      "color_id": 4,
+      "name": "green",
+      "display_bgr": [
+        0,
+        255,
+        0
+      ],
+      "ranges": [
+        {
+          "lower": [
+            63,
+            59,
+            104
+          ],
+          "upper": [
+            79,
+            164,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "color_id": 5,
+      "name": "black",
+      "display_bgr": [
+        80,
+        80,
+        80
+      ],
+      "ranges": [
+        {
+          "lower": [
+            0,
+            0,
+            0
+          ],
+          "upper": [
+            179,
+            130,
+            60
+          ]
+        }
+      ]
+    },
+    {
+      "color_id": 6,
+      "name": "light_blue",
+      "display_bgr": [
+        255,
+        255,
+        0
+      ],
+      "ranges": [
+        {
+          "lower": [
+            94,
+            130,
+            100
+          ],
+          "upper": [
+            104,
+            255,
+            255
+          ]
+        }
+      ]
+    }
+  ],
+  "saved_at_utc": "2026-11-25T03:51:06.408049+00:00"
+}
