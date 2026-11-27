@@ -96,6 +96,7 @@ import math
 import re
 import os
 import queue
+import signal
 import threading
 import time
 from collections import deque
@@ -792,6 +793,7 @@ class GuiRosNode(Node):
         self.create_subscription(String, '/task_code_decoded', self._cb_task_code_decoded, 10)
 
         self.odom = None            # (x, y, theta) 米/米/弧度
+        self.odom_t = 0.0           # 最后一次收到 /odom 的时刻（monotonic 秒），用来判断断连
         self.traj = []              # 历史轨迹 [(x,y), ...]（里程计系）
         self.motion_state = ''
         self.robot_status = None    # [state, err, mask]
@@ -812,6 +814,8 @@ class GuiRosNode(Node):
         theta = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.odom = (msg.pose.pose.position.x, msg.pose.pose.position.y, theta)
+        # 打个时间戳，界面用它判断"多久没收到了"
+        self.odom_t = time.monotonic()
         self.traj.append((self.odom[0], self.odom[1]))
         if len(self.traj) > 4000:               # 别无限长
             del self.traj[:len(self.traj) - 4000]
@@ -868,15 +872,26 @@ class GuiRosNode(Node):
         self.task_code = data if isinstance(data, dict) else None
 
     def send_sequence(self, commands: list) -> bool:
-        """下发一段指令序列。返回 False = 没有节点在听 /motion_load（motion_planner 没起来）。"""
-        if self.pub_load.get_subscription_count() == 0:
-            return False
+        """下发一段指令序列。返回 False = 等了几秒还是没发现 /motion_load 的订阅者。
+
+        为什么要等：ROS 2 的「发现」是异步的。树莓派那边刚起、或者网络抖一下，
+        上位机这边可能还没看到 motion_planner 的订阅，计数是 0。
+        以前一读到 0 就直接拒发，结果车明明是好的却怎么点都不动。
+        现在先等最多 3 秒；等不到也照样发出去（没人听也没坏处），
+        只是返回 False 提醒一句。
+        """
+        found = False
+        for _ in range(30):                    # 30 × 0.1 秒 = 最多等 3 秒
+            if self.pub_load.get_subscription_count() > 0:
+                found = True
+                break
+            time.sleep(0.1)
         # 执行前重新使能：底部【停止】会整车失能，不重新使能的话下发后车不动
         self.send_enable(True)
         s = String()
         s.data = json.dumps(commands, ensure_ascii=False)
         self.pub_load.publish(s)
-        return True
+        return found
 
     def send_stop(self):
         """■ 停止：状态机停在原地，同时整车失能（和手柄 B 键同一套效果）。"""
@@ -4004,12 +4019,15 @@ class App:
 
     def _planner_missing(self):
         """motion_planner 没起来（/motion_load 无订阅者）时给个明确的提示。"""
-        self._set_status('motion_planner 没在运行：/motion_load 没有订阅者，指令没人执行')
+        self._set_status('没发现 motion_planner：/motion_load 没有订阅者，指令已发出但可能没人执行')
         messagebox.showerror(
-            'motion_planner 没在运行',
-            '/motion_load 没有订阅者，指令发出去没人执行。\n\n'
-            '先在另一个终端跑 scripts/run_car.sh，看到终端里出现\n'
-            '"状态机就绪，等待 /motion_load 下发指令序列" 再点导航。')
+            '没发现 /motion_load 的订阅者',
+            '等了 3 秒也没看到 motion_planner 在听 /motion_load。\n'
+            '指令已经照发（万一只是发现慢半拍，车还是会动）。\n\n'
+            '如果车确实没反应，先在树莓派上跑 scripts/run_car.sh，\n'
+            '看到终端里出现“状态机就绪，等待 /motion_load 下发指令序列”再点导航。\n\n'
+            '还不行就检查两边网络：上位机启动时要带上树莓派 IP，例如\n'
+            'bash scripts/run_gui_pc.sh 10.23.113.193')
 
     def navigate_plan(self):
         if not self.plan or not self.plan.get('path_world'):
@@ -4936,7 +4954,19 @@ class App:
 
     def _update_labels(self):
         o = self.node.odom
-        if o:
+        # 断连看门狗：/odom 是 50Hz 发的，超过 1 秒没新消息就认为树莓派掉了
+        # （断电 / 掉线 / 串口断）。不加这个判断的话，界面会一直停在上一个坐标，
+        # 看着像还连着，其实数据早就不动了。
+        t = getattr(self.node, 'odom_t', 0.0)
+        age = (time.monotonic() - t) if t else None
+        disconnected = (o is not None and age is not None and age > 1.0)
+
+        if disconnected:
+            self.pose_var.set(
+                f'⚠ 里程计断连 {age:.1f}s：树莓派断电 / 掉线 / 串口断？'
+                f'    最后收到 x={o[0]:+.3f}m y={o[1]:+.3f}m '
+                f'θ={math.degrees(o[2]):+.1f}°（这是旧数据，别当现在的位姿用）')
+        elif o:
             # 第一次收到里程计、且车还在起点附近（|x|,|y| < 0.2m）→ 自动锁存
             # 里程计 yaw。JY901S 上电 yaw 不一定是 0，这一步不能省。
             if self.odom_start[2] is None and abs(o[0]) < 0.20 and abs(o[1]) < 0.20:
@@ -4960,6 +4990,9 @@ class App:
             self.pose_var.set('当前位姿: 未收到 /odom（检查 run_car.sh / 串口）')
 
         st = f'状态机: {self.node.motion_state or "—"}'
+        if disconnected:
+            # 状态栏也挂个明显的红字提示，免得只盯着下面那行位姿
+            st = '⚠ 树莓派断连（1 秒以上没收到 /odom）    ' + st
         if getattr(self.node, 'task_raw', ''):
             st += f'    任务码: {self.node.task_raw}'
         if self.node.robot_status:
@@ -5155,6 +5188,18 @@ def main():
             root.destroy()
 
     root.protocol('WM_DELETE_WINDOW', on_close)
+
+    # 收到 SIGTERM/SIGINT 时真的退出。
+    # rclpy.init() 会自己装信号处理，但它靠 spin 里检查标志位才生效；这个程序的
+    # spin 跑在独立线程里，结果 kill / timeout 都杀不掉，留下一份还在发
+    # /motion_load 的幽灵进程，下次再启动就变成两个发布者。
+    # 这里改成：收到信号就排一个"关窗"任务回 Tk 主线程，走正常的 on_close 流程。
+    def _on_signal(signum, frame):
+        root.after(0, on_close)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _on_signal)
+
     root.mainloop()
 
 
