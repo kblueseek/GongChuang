@@ -206,9 +206,10 @@ COMMAND_TYPES = {
                 '例：0,-40,0,150,120,35,800'
     },
     'place': {
-        'params': 'yaw_deg,lift_deg,safe_lift_deg,extend_deg,gripper_open,gripper_close,settle_ms',
-        'hint': '放置宏：到安全位→下降到放置位→张爪→抬起。'
-                '例：0,-40,0,150,120,35,800'
+        'params': 'yaw_deg,lift_deg,extend_deg[,gripper_open'
+                  '[,gripper_close[,settle_ms]]]',
+        'hint': '放置宏：直接到放置位→张爪；不再经过安全高度，也不再自动抬回。'
+                '需要抬起/收回就在后面紧跟 gimbal_lift。例：0,-40,150,120,35,800'
     },
     # ---- 任务码驱动动作（参数可写任务码占位符 $b1c1$/$b1p1$/$b2c1$/$b2p1$…）----
     'color_pick': {
@@ -240,8 +241,14 @@ COMMAND_TYPES = {
                 '前面必须先有 calibrate 对位。可写占位符 $b1p1$'
     },
     'double_put': {
-        'params': 'number',
-        'hint': '叠放到第一批上方（环上已有物料，层+1）。同 number_put，例：$b2p1$'
+        'params': 'yaw_deg,lift_deg,extend_deg[,use_last'
+                  '[,offset_yaw[,offset_lift[,offset_ext]]]]',
+        'hint': '叠放/暂存区放置。写三轴时按输入位姿放：use_last=1 优先用 '
+                'vision_put 记录的同工位最终位姿（不用再调），再减三轴偏移；'
+                'use_last=0 只用输入值。例：15.5,1450,600,1,0,0,0。'
+                '显式三轴模式不再自动加 stack_lift_deg，叠层高度直接写进 '
+                'lift_deg（或用负的 offset_lift 抬高）。'
+                '只写一个环号（如 $b2p1$）时保持旧的按环号查表模式。'
     },
     'place_tray': {
         'params': 'yaw_deg,lift_deg,extend_deg[,retract_deg[,lead_s]]',
@@ -342,6 +349,19 @@ def cmd_to_text(cmd: dict) -> str:
     if name == 'number_put':
         return f"放到圆环 {cmd.get('number', '?')}"
     if name == 'double_put':
+        if any(k in cmd for k in ('yaw_deg', 'lift_deg', 'extend_deg')):
+            text = (f"叠放 yaw={cmd.get('yaw_deg', 0)}° "
+                    f"lift={cmd.get('lift_deg', 0)}° "
+                    f"ext={cmd.get('extend_deg', 0)}°")
+            if int(float(cmd.get('use_last', 0) or 0)):
+                text += '，用上次视觉闭环'
+            offs = (cmd.get('offset_yaw_deg', 0), cmd.get('offset_lift_deg', 0),
+                    cmd.get('offset_extend_deg', 0))
+            if any(float(v or 0) for v in offs):
+                text += (f"，偏移({float(offs[0] or 0):+g},"
+                         f"{float(offs[1] or 0):+g},"
+                         f"{float(offs[2] or 0):+g})")
+            return text
         return f"叠放到圆环 {cmd.get('number', '?')}"
     if name == 'place_tray':
         text = (f"放到载物盘 yaw={cmd.get('yaw_deg', 0)}° "
@@ -449,6 +469,18 @@ def build_cmd(name: str, params_str: str) -> dict:
             cmd['target_y'] = float(parts[2])
         return cmd
 
+    if name == 'double_put' and len(parts) >= 2:
+        # 显式三轴模式（暂存区）：yaw,lift,ext[,use_last[,off_yaw[,off_lift[,off_ext]]]]
+        keys = ('yaw_deg', 'lift_deg', 'extend_deg', 'use_last',
+                'offset_yaw_deg', 'offset_lift_deg', 'offset_extend_deg')
+        cmd = {'cmd': name}
+        for key, value in zip(keys, parts):
+            try:
+                cmd[key] = int(float(value)) if key == 'use_last' else float(value)
+            except ValueError:
+                continue
+        return cmd
+
     if name in ('color_pick', 'number_put', 'double_put'):
         # 参数可以是数字，也可以是 $b1c1$ 这类占位符（原样存，不动 motion_planner 执行时替换）
         key = 'color' if name == 'color_pick' else 'number'
@@ -496,7 +528,7 @@ def build_cmd(name: str, params_str: str) -> dict:
                 pass
         return cmd
 
-    if name in ('pick', 'place'):
+    if name == 'pick':
         vals = [float(p) for p in parts] + [0.0] * 7
         return {'cmd': name,
                 'yaw_deg': vals[0],
@@ -506,6 +538,17 @@ def build_cmd(name: str, params_str: str) -> dict:
                 'gripper_open': vals[4] if len(parts) > 4 else 120.0,
                 'gripper_close': vals[5] if len(parts) > 5 else 35.0,
                 'settle_ms': int(vals[6]) if len(parts) > 6 else 800}
+
+    if name == 'place':
+        # place 不再有 safe_lift_deg：第 3 个参数直接是 extend。
+        vals = [float(p) for p in parts] + [0.0] * 6
+        return {'cmd': name,
+                'yaw_deg': vals[0],
+                'lift_deg': vals[1],
+                'extend_deg': vals[2],
+                'gripper_open': vals[3] if len(parts) > 3 else 120.0,
+                'gripper_close': vals[4] if len(parts) > 4 else 35.0,
+                'settle_ms': int(vals[5]) if len(parts) > 5 else 800}
 
     return {'cmd': name}
 
@@ -1124,7 +1167,11 @@ class App:
 
         ttk.Label(tab, text='动作序列（从上到下依次执行）',
                   font=('', 11, 'bold')).pack(anchor='w')
-        self.listbox = tk.Listbox(tab, width=44, height=16)
+        # EXTENDED：Ctrl/Shift 多选，方便一次删多条；exportselection=False
+        # 防止焦点移到按钮上时 Tk 把选中项清掉（否则"选中再点删除"会失效）。
+        self.listbox = tk.Listbox(tab, width=44, height=16,
+                                  selectmode=tk.EXTENDED,
+                                  exportselection=False)
         self.listbox.pack(fill=tk.BOTH, expand=True, pady=4)
 
         # 编辑器和【节点动作序列】共用同一套控件生成逻辑，只是目标列表不同
@@ -1178,12 +1225,13 @@ class App:
 
         on_type('move')
 
-        def add():
+        def build_entry_cmd():
+            """把"类型 + 参数输入框 + 转速框"变成一条指令；失败返回 None。"""
             try:
                 cmd = build_cmd(cmd_type.get(), entry.get())
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror('参数错误', f'参数解析失败：{e}')
-                return
+                return None
             # spin_scan 的转速框：填了就写进 speed_dps（覆盖参数里的第 2 个值）
             if cmd.get('cmd') == 'spin_scan':
                 txt = spin_entry.get().strip()
@@ -1192,18 +1240,48 @@ class App:
                         sp = float(txt)
                     except ValueError:
                         messagebox.showerror('参数错误', f'转速要填数字：{txt!r}')
-                        return
+                        return None
                     if not (5.0 <= sp <= 90.0):
                         messagebox.showerror(
                             '参数错误',
                             f'转速 {sp:g} 超出范围（planner 限制 5~90，'
                             f'建议 15~45；再快远处点云会拖成扇形）')
-                        return
+                        return None
                     cmd['speed_dps'] = sp
+            return cmd
+
+        def add():
+            """追加到序列末尾。"""
+            cmd = build_entry_cmd()
+            if cmd is None:
+                return
             cmds = get_cmds()
             cmds.append(cmd)
-            listbox.insert(tk.END, cmd_to_text(cmd))
+            listbox.insert(tk.END, self._cmd_text(cmd))
             entry.delete(0, tk.END)
+            # 滚到新加的那条并选中，否则长序列里看不到刚加的动作。
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(tk.END)
+            listbox.activate(tk.END)
+            listbox.see(tk.END)
+            on_change()
+
+        def insert_cmd():
+            """插入到**选中项之后**；没有选中就追加到末尾。"""
+            cmd = build_entry_cmd()
+            if cmd is None:
+                return
+            cmds = get_cmds()
+            sel = listbox.curselection()
+            pos = sel[-1] + 1 if sel else len(cmds)
+            pos = max(0, min(pos, len(cmds)))
+            cmds.insert(pos, cmd)
+            self._reload_actions(listbox, cmds)
+            entry.delete(0, tk.END)
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(pos)
+            listbox.activate(pos)
+            listbox.see(pos)
             on_change()
 
         editrow = ttk.Frame(parent)
@@ -1220,16 +1298,31 @@ class App:
                 return
             cmds[i], cmds[j] = cmds[j], cmds[i]
             self._reload_actions(listbox, cmds)
+            # _reload_actions 会 delete+insert 整个列表，Tk 默认把视图滚回顶部。
+            # 必须重新选中移动后的那一行并 see()，否则长序列里看不到它移到哪了。
+            listbox.selection_clear(0, tk.END)
             listbox.selection_set(j)
+            listbox.activate(j)
+            listbox.see(j)
             on_change()
 
         def delete():
+            """删除所有选中项（支持 Ctrl/Shift 多选）。"""
             sel = listbox.curselection()
             if not sel:
                 return
-            i = sel[0]
-            del get_cmds()[i]
-            self._reload_actions(listbox, get_cmds())
+            cmds = get_cmds()
+            for i in sorted(sel, reverse=True):
+                if 0 <= i < len(cmds):
+                    del cmds[i]
+            self._reload_actions(listbox, cmds)
+            if cmds:
+                # 选中删除位置附近的一行，保持视图在操作处而不是跳回第一行。
+                pos = min(min(sel), len(cmds) - 1)
+                listbox.selection_clear(0, tk.END)
+                listbox.selection_set(pos)
+                listbox.activate(pos)
+                listbox.see(pos)
             on_change()
 
         def clear():
@@ -1292,17 +1385,33 @@ class App:
         listbox.bind('<Double-Button-1>', edit_selected)
 
         ttk.Button(addrow, text='＋添加', command=add).pack(side=tk.LEFT)
+        ttk.Button(addrow, text='插入', command=insert_cmd).pack(
+            side=tk.LEFT, padx=(2, 0))
+        # 多选开关：默认开（Ctrl/Shift 选多条一起删）。关掉就退回单选。
+        multi_var = tk.BooleanVar(value=True)
+
+        def toggle_multi():
+            listbox.configure(selectmode=(tk.EXTENDED if multi_var.get()
+                                          else tk.BROWSE))
+            if not multi_var.get():
+                sel = listbox.curselection()
+                listbox.selection_clear(0, tk.END)
+                if sel:
+                    listbox.selection_set(sel[0])
+
         ttk.Button(editrow, text='上移', command=lambda: move(-1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='下移', command=lambda: move(+1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='删除', command=delete).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='复制', command=lambda: duplicate(1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='批量复制', command=duplicate_many).pack(side=tk.LEFT, padx=2)
         ttk.Button(editrow, text='清空', command=clear).pack(side=tk.LEFT, padx=2)
-        ttk.Label(editrow, text='双击动作可改参数', foreground='gray').pack(
+        ttk.Checkbutton(editrow, text='多选', variable=multi_var,
+                        command=toggle_multi).pack(side=tk.LEFT, padx=2)
+        ttk.Label(editrow, text='双击改参数', foreground='gray').pack(
             side=tk.RIGHT, padx=4)
         return {'type': cmd_type, 'entry': entry, 'hint': hint,
                 'spin_entry': spin_entry, 'spin_row': spinrow,
-                'on_type': on_type, 'add': add}
+                'on_type': on_type, 'add': add, 'multi_var': multi_var}
 
     # ---------- 双击编辑单条动作 ----------
 
@@ -1481,7 +1590,9 @@ class App:
 
         ttk.Label(tab, text='该节点的动作（从上到下）：',
                   font=('', 10, 'bold')).pack(anchor='w', pady=(4, 0))
-        self.node_action_list = tk.Listbox(tab, width=44, height=9)
+        self.node_action_list = tk.Listbox(tab, width=44, height=9,
+                                           selectmode=tk.EXTENDED,
+                                           exportselection=False)
         self.node_action_list.pack(fill=tk.BOTH, expand=True, pady=(2, 2))
 
         self.node_editor = self._make_action_editor(

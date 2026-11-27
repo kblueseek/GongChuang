@@ -63,7 +63,6 @@ motion_planner:
     place_ring3_yaw_deg: 0.0
     place_ring3_extend_deg: 0.0
     place_ring3_lift_deg: 0.0
-    place_safe_lift_deg: 0.0
     stack_lift_deg: 0.0
     # ---- 载物盘三个料位角度（tray_slot 指令用）。实测法：手柄按住 L1 步进转盘到
     #      "能接住物料"的位置，ros2 topic echo /cmd_servo --once 读目标角填入。

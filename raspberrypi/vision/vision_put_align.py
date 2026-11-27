@@ -30,6 +30,12 @@
   --target-x / --target-y    夹爪正对环心时，环心落在画面哪个像素
                              用 --dry-run 把臂摆正后读出来填即可
 
+另外支持"闭环起点"（减少每次从盲放位置重新修的时间）：
+  --yaw-deg/--lift-deg/--extend-deg  盲放的三轴值；不写=用当前实测角
+  --use-last 1                       优先用该工位上次成功记录的最终位姿当起点
+  --pose-key                         区分工位；不写则按输入三元组自动生成
+  每次成功都会把最终三轴角写到 ~/.ros/vision_put_poses.json。
+
 选环规则：第一帧取离目标像素最近的那个环并**锁定**；之后只跟同一个环。
 新观测离上次环心超过 --lock-radius-px 就视为该环丢失，原地等它回来，
 不会切到画面里旁边的环（否则云台会来回乱晃）。
@@ -122,6 +128,7 @@ class PutAlignNode(Node):
         # 和 gimbal_track_pick 一样走速度模式：F407 的位置模式优先级高，
         # 所以我们只在它的 3s 保持过期之后才发速度（见 --hold-wait-s）。
         self._pub_vel = self.create_publisher(Float32MultiArray, '/cmd_gimbal_vel', 10)
+        self._pub_pos = self.create_publisher(Float32MultiArray, '/cmd_gimbal', 10)
         self.create_subscription(Float32MultiArray, '/gimbal_state',
                                  self._cb_gimbal_state, 10)
         self._gimbal = [0.0, 0.0, 0.0]
@@ -134,6 +141,11 @@ class PutAlignNode(Node):
 
     def send_gimbal_vel(self, yaw: float, lift: float, extend: float):
         self._pub_vel.publish(Float32MultiArray(data=[yaw, lift, extend]))
+
+    def send_gimbal_target(self, yaw: float, lift: float, extend: float):
+        """位置目标（°/相对 0 点）：用于先把云台送到学习/输入起点。"""
+        self._pub_pos.publish(
+            Float32MultiArray(data=[float(yaw), float(lift), float(extend)]))
 
 
 def build_undistort_maps(width: int, height: int):
@@ -280,6 +292,104 @@ def _ellipse_radius_px(ellipse) -> float | None:
         return None
 
 
+# ==================== 闭环最终位姿记录 ====================
+# 每次 vision_put 成功后，把云台最后停住的三轴角度存下来。下次同一个工位
+# （用输入三元组或 pose_key 区分）可以直接从上次的最终位姿起跑，视觉只需要
+# 修最后一点点，省掉大部分闭环调整时间。
+# 文件默认在 ~/.ros/vision_put_poses.json，可用 VISION_PUT_POSES 覆盖。
+# ⚠ 记录的是"相对云台 0 点"的角度：如果重新置零/示教过，旧记录就不一定
+#   还成立；这时把 use_last 写 0，只使用序列里输入的三轴值。
+def _pose_store_path() -> Path:
+    return Path(os.environ.get(
+        'VISION_PUT_POSES',
+        str(Path.home() / '.ros' / 'vision_put_poses.json')))
+
+
+def _load_pose_store() -> dict:
+    try:
+        doc = json.loads(_pose_store_path().read_text(encoding='utf-8'))
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _get_saved_pose(key: str):
+    """按 key 取上次记录的最终位姿；没有/损坏/不是有限数就返回 None。"""
+    if not key:
+        return None
+    poses = _load_pose_store().get('poses')
+    if not isinstance(poses, dict):
+        return None
+    entry = poses.get(key)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        pose = [float(entry['yaw_deg']), float(entry['lift_deg']),
+                float(entry['extend_deg'])]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return pose if all(math.isfinite(value) for value in pose) else None
+
+
+def _save_pose(key: str, pose, ring: int, source: str) -> None:
+    """原子写入最终位姿；失败只打日志，不能让视觉业务因此失败。"""
+    if not key or pose is None or len(pose) < 3:
+        return
+    path = _pose_store_path()
+    store = _load_pose_store()
+    poses = store.get('poses')
+    if not isinstance(poses, dict):
+        poses = {}
+    poses[key] = {
+        'yaw_deg': round(float(pose[0]), 2),
+        'lift_deg': round(float(pose[1]), 2),
+        'extend_deg': round(float(pose[2]), 2),
+        'ring': int(ring),
+        'source': source,
+        'updated': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    store['poses'] = poses
+    store['last'] = key          # double_put 找不到对应 key 时可退回"上一次闭环"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + '.tmp')
+        temp.write_text(json.dumps(store, ensure_ascii=False, indent=2),
+                        encoding='utf-8')
+        os.replace(temp, path)
+    except OSError as error:
+        print(f'[vision_put_align] 位姿记录失败：{error}', flush=True)
+
+
+def _derive_pose_key(args, input_pose) -> str:
+    """确定这次用哪条记录：显式 pose_key 优先，否则用输入三元组自动区分工位。"""
+    key = str(getattr(args, 'pose_key', '') or '').strip()
+    if key:
+        return key
+    if input_pose is not None:
+        return 'input:%d,%d,%d' % tuple(
+            int(round(float(value))) for value in input_pose[:3])
+    return 'default'
+
+
+def _wait_gimbal_pose(node, target, tol_deg: float, timeout_s: float,
+                      stop=None) -> bool:
+    """等云台三轴实测角进入 ±tol_deg（位置目标由调用方先下发）。
+
+    返回 True=到位，False=超时/被停止。等待期间持续 spin，保证
+    /gimbal_state 和 stop 回调都能进来。
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        if stop is not None and stop():
+            return False
+        rclpy.spin_once(node, timeout_sec=0.02)
+        if node._gimbal_ok and max(
+                abs(float(node._gimbal[i]) - float(target[i]))
+                for i in range(3)) <= tol_deg:
+            return True
+    return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='vision_put 视觉端：圆环圆心对像素')
     parser.add_argument('--lock-radius-px', type=float, default=150.0,
@@ -308,6 +418,25 @@ def build_parser() -> argparse.ArgumentParser:
                         help='目标像素 x，默认画面中心')
     parser.add_argument('--target-y', type=float, default=None,
                         help='目标像素 y，默认画面中心')
+    # ---- 闭环起点位姿：从盲放位置/上次最终位姿起跑，减少视觉调整时间 ----
+    parser.add_argument('--yaw-deg', type=float, default=None,
+                        help='盲放的 yaw 输入角（°）。不写=用当前实测角')
+    parser.add_argument('--lift-deg', type=float, default=None,
+                        help='盲放的 lift 输入角（°）。不写=用当前实测角')
+    parser.add_argument('--extend-deg', type=float, default=None,
+                        help='盲放的 extend 输入角（°）。不写=用当前实测角')
+    parser.add_argument('--use-last', type=int, default=0, choices=[0, 1],
+                        help='1=优先用上次闭环记录的最终位姿作为起点；'
+                             '0=只用 --yaw/lift/extend 输入值（默认）')
+    parser.add_argument('--pose-key', default='',
+                        help='记录键，区分不同工位；不写则按输入三元组自动生成，'
+                             '例如 input:16,1450,600')
+    parser.add_argument('--start-tol-deg', type=float, default=2.0,
+                        help='起点位姿三轴到位容差（°）')
+    parser.add_argument('--start-timeout-s', type=float, default=5.0,
+                        help='起点位姿移动超时（s）；超时也继续跑视觉，不再干等')
+    parser.add_argument('--start-save', type=int, default=1, choices=[0, 1],
+                        help='1=成功时记录最终位姿（默认）；0=不记录')
     parser.add_argument('--device', default='/dev/video0')
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
@@ -467,14 +596,73 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
     pid_ext = PID(args.kp_extend, args.ki_extend, args.kd_extend,
                   args.max_extend_deg_s, args.deriv_tau)
 
+    # ---- 起点位姿：上次闭环结果（use_last=1）或序列输入的三轴值 ----
+    # 先在位置模式下把云台送到起点，再开始视觉；到位后跳过下面的"停稳等待"，
+    # 因为此时已经确认过三轴不再动了。这样既少走视觉修正行程，也省掉 settle。
+    t_enter = time.monotonic()
+    input_pose = None
+    if (args.yaw_deg is not None or args.lift_deg is not None
+            or args.extend_deg is not None):
+        current = list(node._gimbal) if node._gimbal_ok else [0.0, 0.0, 0.0]
+        input_pose = [
+            float(args.yaw_deg) if args.yaw_deg is not None else current[0],
+            float(args.lift_deg) if args.lift_deg is not None else current[1],
+            float(args.extend_deg) if args.extend_deg is not None else current[2],
+        ]
+
+    pose_key = _derive_pose_key(args, input_pose)
+    saved_pose = (_get_saved_pose(pose_key)
+                  if (args.use_last and pose_key) else None)
+    start_pose = saved_pose if saved_pose is not None else input_pose
+    settle_skipped = False
+    if args.dry_run:
+        start_pose = None
+    if start_pose is not None:
+        source = '上次闭环' if saved_pose is not None else '输入'
+        if (node._gimbal_ok and max(
+                abs(float(node._gimbal[i]) - float(start_pose[i]))
+                for i in range(3)) <= args.start_tol_deg):
+            print(f'[vision_put_align] 已在{source}起点 key={pose_key} '
+                  f'yaw={start_pose[0]:+.1f} lift={start_pose[1]:+.1f} '
+                  f'ext={start_pose[2]:+.1f}，跳过停稳等待', flush=True)
+            settle_skipped = True
+        elif hasattr(node, 'send_gimbal_target'):
+            print(f'[vision_put_align] 先到{source}起点 key={pose_key} '
+                  f'yaw={start_pose[0]:+.1f} lift={start_pose[1]:+.1f} '
+                  f'ext={start_pose[2]:+.1f}', flush=True)
+            node.send_gimbal_target(*start_pose)
+            reached = _wait_gimbal_pose(
+                node, start_pose, args.start_tol_deg,
+                args.start_timeout_s, stop)
+            print(f'[vision_put_align] 起点位姿'
+                  f'{"已到位" if reached else "等待超时（继续跑视觉）"}', flush=True)
+            settle_skipped = True
+        else:
+            print('[vision_put_align] 节点不支持位置目标，无法预置起点，'
+                  '按原流程等停稳', flush=True)
+    elif args.use_last:
+        print(f'[vision_put_align] use_last=1 但没有 key={pose_key} 的记录，'
+              '本次不用学习位姿', flush=True)
+    startup_s = time.monotonic() - t_enter
+
     started = time.monotonic()
     last_t = time.monotonic()
     stable = 0
     settle_since = None          # 云台角度最后一次变化的时刻
     last_angles = None
     # 先确认臂已经走到盲放位置：还在走的时候取消位置目标会把臂停在半路。
-    # 停下来的那一刻立刻取消保持、开始跟随，不多等。
-    phase = 'settle' if (args.settle_stable_s > 0.0 and not args.dry_run) else 'servo'
+    # 停下来的那一刻立刻取消保持、开始跟随，不多等。起点位姿已经等到位时跳过。
+    phase = ('servo' if settle_skipped else
+             ('settle' if (args.settle_stable_s > 0.0 and not args.dry_run)
+              else 'servo'))
+    if args.dry_run:
+        start_mode = 'dry-run（只看不动）'
+    elif settle_skipped:
+        start_mode = '起点已就位，直接开环'
+    else:
+        start_mode = '先等臂停稳'
+    print(f'[vision_put_align] 视觉闭环起跑：准备 {startup_s * 1000:.0f}ms'
+          f'，{start_mode}', flush=True)
     result = {'ok': False, 'reason': 'timeout'}
     frames = 0
     found_frames = 0
@@ -807,12 +995,29 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
                 saved_frame = True
 
             if (not args.dry_run) and stable >= args.stable and node._gimbal_ok:
+                final_pose = [float(node._gimbal[0]),
+                              float(node._gimbal[1]),
+                              float(node._gimbal[2])]
                 result = {'ok': True, 'ring': index + 1,
                           'dx_px': round(ex_raw, 1), 'dy_px': round(ey_raw, 1),
-                          'yaw_deg': round(node._gimbal[0], 2),
-                          'lift_deg': round(node._gimbal[1], 2),
-                          'extend_deg': round(node._gimbal[2], 2),
+                          'yaw_deg': round(final_pose[0], 2),
+                          'lift_deg': round(final_pose[1], 2),
+                          'extend_deg': round(final_pose[2], 2),
+                          'pose_key': pose_key,
+                          'startup_s': round(startup_s, 3),
                           'frames': frames}
+                # 记录最终位姿：下次 use_last=1 时直接从这里起跑。
+                if args.start_save:
+                    _save_pose(pose_key, final_pose, index + 1, 'vision_put')
+                    result['pose_saved'] = True
+                    print(f'[vision_put_align] 已记录最终位姿 key={pose_key} '
+                          f'yaw={final_pose[0]:+.2f} lift={final_pose[1]:+.2f} '
+                          f'ext={final_pose[2]:+.2f} → {_pose_store_path()}',
+                          flush=True)
+                    print(f'[vision_put_align] 下次这条盲放可直接用 '
+                          f'yaw_deg={final_pose[0]:.1f}, '
+                          f'lift_deg={final_pose[1]:.1f}, '
+                          f'extend_deg={final_pose[2]:.1f}', flush=True)
                 print(f'[vision_put_align] 对环完成：{status}', flush=True)
                 break
     finally:
@@ -839,6 +1044,8 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
                   'target_x': target_x, 'target_y': target_y,
                   'frames': frames}
 
+    result.setdefault('startup_s', round(startup_s, 3))
+    result.setdefault('pose_key', pose_key)
     return result
 
 

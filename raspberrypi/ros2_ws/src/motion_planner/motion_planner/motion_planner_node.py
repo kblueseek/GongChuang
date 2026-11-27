@@ -80,6 +80,10 @@
            F407 收到非零速度帧会立即顶掉位置保持，不用等那 3s。整段就是
            "臂到位 + 视觉对中"的时间。返回 JSON 后状态机继续往下走，
            并把对中后的角度锁回位置模式。
+           可选闭环起点：yaw_deg/lift_deg/extend_deg 写盲放三轴值，
+           use_last=1 时优先用该工位上次成功的最终位姿起跑（use_last=0
+           只用输入值）；pose_key 区分工位，不写按输入三元组自动生成。
+           成功后的最终位姿会写到 ~/.ros/vision_put_poses.json。
   track_debug {"cmd":"track_debug", "color":"1"}
            纯调参（阻塞）：一直跟随该颜色，永远不判"对中完成"，直到点■停止 /
            超时 timeout_s（默认 600s）。视觉端每秒重读 config/track_pid.json，
@@ -201,7 +205,6 @@ class MotionPlannerNode(Node):
             self.declare_parameter(f'place_ring{_ring}_extend_deg',
                                    150.0 if _ring == 2 else 0.0)
             self.declare_parameter(f'place_ring{_ring}_lift_deg', 0.0)
-        self.declare_parameter('place_safe_lift_deg', 0.0)
         self.declare_parameter('stack_lift_deg', 0.0)         # 待标定：叠一层 lift 增量°
         self.declare_parameter('place_gripper_open_deg', 120.0)
         self.declare_parameter('place_settle_ms', 800)
@@ -549,8 +552,129 @@ class MotionPlannerNode(Node):
             'yaw_deg': float(gp(f'place_ring{n}_yaw_deg').value),
             'lift_deg': float(gp(f'place_ring{n}_lift_deg').value)
                          + layer * float(gp('stack_lift_deg').value),
-            'safe_lift_deg': float(gp('place_safe_lift_deg').value),
             'extend_deg': float(gp(f'place_ring{n}_extend_deg').value),
+            'gripper_open': float(gp('place_gripper_open_deg').value),
+            'gripper_close': 35.0,
+            'settle_ms': int(gp('place_settle_ms').value),
+        }
+
+    @staticmethod
+    def _pose_store_path() -> str:
+        return (os.environ.get('VISION_PUT_POSES')
+                or os.path.expanduser('~/.ros/vision_put_poses.json'))
+
+    @staticmethod
+    def _input_pose_key(yaw: float, lift: float, extend: float) -> str:
+        """和 vision_put_align._derive_pose_key 用同一套规则，保证能对上记录。"""
+        return 'input:%d,%d,%d' % (int(round(yaw)), int(round(lift)),
+                                   int(round(extend)))
+
+    def _load_learned_pose(self, key: str):
+        """读 vision_put 记录的最终位姿；没有/损坏/非有限数返回 None。"""
+        if not key:
+            return None
+        try:
+            with open(self._pose_store_path(), 'r', encoding='utf-8') as f:
+                doc = json.load(f)
+            entry = (doc.get('poses') or {}).get(key)
+            pose = [float(entry['yaw_deg']), float(entry['lift_deg']),
+                    float(entry['extend_deg'])]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+        return pose if all(math.isfinite(v) for v in pose) else None
+
+    def _load_last_pose(self):
+        """取 vision_put 最后写入的那条位姿，返回 (pose, key)；没有返回 (None, '')。"""
+        try:
+            with open(self._pose_store_path(), 'r', encoding='utf-8') as f:
+                doc = json.load(f)
+            key = str(doc.get('last') or '')
+            entry = (doc.get('poses') or {}).get(key)
+            pose = [float(entry['yaw_deg']), float(entry['lift_deg']),
+                    float(entry['extend_deg'])]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None, ''
+        if not all(math.isfinite(v) for v in pose):
+            return None, ''
+        return pose, key
+
+    def _explicit_place_cmd(self, cmd: dict, layer: int) -> dict:
+        """double_put 的显式三轴模式（暂存区/任意位姿放置）。
+
+        输入（共 7 个，number 可省略）：
+            yaw_deg / lift_deg / extend_deg   盲放三轴基准
+            use_last                          1=优先用 vision_put 该工位的最终位姿
+            offset_yaw_deg / offset_lift_deg / offset_extend_deg
+                                              目标 = 基准 - 偏移
+        缺的轴如果有 number，就退回环号表；没有就按 0。
+        显式三轴模式**不再自动加 stack_lift_deg**：叠层高度直接写进 lift_deg。
+        """
+        gp = self.get_parameter
+        axes = ('yaw_deg', 'lift_deg', 'extend_deg')
+        base = []
+        for axis in axes:
+            raw = cmd.get(axis)
+            if raw is None or raw == '':
+                base.append(None)
+            else:
+                base.append(float(self._resolve_token(raw, axis)))
+
+        # 缺轴兜底：有环号就查环号表（保留旧的按环号行为），否则 0
+        if any(value is None for value in base) and cmd.get('number') not in (None, ''):
+            try:
+                number = int(self._resolve_token(cmd.get('number'), 'number'))
+                table = self._ring_place_cmd(number, layer)
+                for i, axis in enumerate(axes):
+                    if base[i] is None:
+                        base[i] = float(table[axis])
+            except (KeyError, TypeError, ValueError):
+                pass
+        base = [0.0 if value is None else value for value in base]
+
+        # 学习位姿：key 用**输入基准**算，和 vision_put 记录时一致；
+        # 也允许显式 pose_key（例如同一工位输入值微调后仍指向同一条记录）。
+        try:
+            use_last = int(float(self._resolve_token(
+                cmd.get('use_last', 0), 'use_last')))
+        except (KeyError, TypeError, ValueError):
+            use_last = 0
+        key = str(cmd.get('pose_key') or '').strip() or \
+            self._input_pose_key(*base)
+        used_key = key
+        learned = self._load_learned_pose(key) if use_last else None
+        if use_last and learned is None and not str(cmd.get('pose_key') or '').strip():
+            # 输入值换了/没有对应记录时，退回 vision_put **最后一次**写入的位姿。
+            # 显式写了 pose_key 就不退回，避免拿错工位。
+            learned, last_key = self._load_last_pose()
+            if learned is not None:
+                used_key = last_key
+                self.get_logger().warning(
+                    f'double_put 没找到 key={key} 的学习位姿，'
+                    f'退回全局上一次闭环 key={last_key}')
+        source = '学习位姿' if learned is not None else '输入位姿'
+        if learned is not None:
+            base = list(learned)
+
+        # 偏移：目标 = 基准 - offset（负 offset 等于往正方向补）
+        offsets = []
+        for axis in ('offset_yaw_deg', 'offset_lift_deg',
+                     'offset_extend_deg'):
+            try:
+                offsets.append(float(cmd.get(axis, 0.0) or 0.0))
+            except (TypeError, ValueError):
+                offsets.append(0.0)
+        target = [base[i] - offsets[i] for i in range(3)]
+
+        self.get_logger().info(
+            f'double_put {source} key={used_key}：'
+            f'yaw {base[0]:+.1f}→{target[0]:+.1f} '
+            f'lift {base[1]:+.1f}→{target[1]:+.1f} '
+            f'ext {base[2]:+.1f}→{target[2]:+.1f}（减偏移）')
+        return {
+            'cmd': 'place',
+            'yaw_deg': target[0],
+            'lift_deg': target[1],
+            'extend_deg': target[2],
             'gripper_open': float(gp('place_gripper_open_deg').value),
             'gripper_close': 35.0,
             'settle_ms': int(gp('place_settle_ms').value),
@@ -1386,7 +1510,11 @@ class MotionPlannerNode(Node):
             except (TypeError, ValueError):
                 timeout = 45.0
             vargs = {}
-            for key in ('ring', 'target_x', 'target_y', 'dry_run'):
+            for key in ('ring', 'target_x', 'target_y', 'dry_run',
+                        # 闭环起点/学习位姿：盲放三轴输入 + 是否使用上次结果
+                        'yaw_deg', 'lift_deg', 'extend_deg',
+                        'use_last', 'pose_key', 'start_tol_deg',
+                        'start_timeout_s', 'start_save'):
                 if key in cmd and cmd[key] is not None:
                     vargs[key] = cmd[key]
             if isinstance(cmd.get('args'), dict):
@@ -1406,25 +1534,41 @@ class MotionPlannerNode(Node):
                 '等云台停稳 → 圆环对到目标像素…')
             self.phase = 'vision'
         elif name in ('number_put', 'double_put'):   # 按环号放置 / 叠放
-            try:
-                number = int(self._resolve_token(cmd.get('number'), 'number'))
-            except (KeyError, ValueError) as error:
-                self._publish_state(
-                    f'[{self.index+1}/{len(self.commands)}] {name}：参数无效（{error}），跳过')
-                return
-            if not 1 <= number <= 3:
-                self._publish_state(
-                    f'[{self.index+1}/{len(self.commands)}] {name}：环号 {number} 越界'
-                    '（只能 1~3），跳过')
-                return
             layer = 1 if name == 'double_put' else 0
-            place = self._ring_place_cmd(number, layer)
+            # double_put 显式三轴模式：暂存区按输入位姿放，优先用 vision_put
+            # 记录的该工位最终位姿，再减三轴偏移；不再依赖 place_ringN 表。
+            explicit = (name == 'double_put' and any(
+                cmd.get(axis) not in (None, '')
+                for axis in ('yaw_deg', 'lift_deg', 'extend_deg')))
+            if explicit:
+                place = self._explicit_place_cmd(cmd, layer)
+                number = None
+            else:
+                try:
+                    number = int(self._resolve_token(cmd.get('number'), 'number'))
+                except (KeyError, ValueError) as error:
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] {name}：'
+                        f'参数无效（{error}），跳过')
+                    return
+                if not 1 <= number <= 3:
+                    self._publish_state(
+                        f'[{self.index+1}/{len(self.commands)}] {name}：'
+                        f'环号 {number} 越界（只能 1~3），跳过')
+                    return
+                place = self._ring_place_cmd(number, layer)
             expanded = self._macro_pick(place, 'place')
             self.commands[self.index + 1:self.index + 1] = expanded
+            if explicit:
+                detail = ('显式三轴'
+                          f'（yaw={place["yaw_deg"]:.1f}° '
+                          f'lift={place["lift_deg"]:.1f}° '
+                          f'ext={place["extend_deg"]:.1f}°）')
+            else:
+                detail = f'环{number} 层{layer}'
             self._publish_state(
-                f'[{self.index+1}/{len(self.commands)}] {name} → '
-                f'环{number} 层{layer}（yaw={place["yaw_deg"]}° '
-                f'lift={place["lift_deg"]}° ext={place["extend_deg"]}°），执行 place 宏')
+                f'[{self.index+1}/{len(self.commands)}] {name} → {detail}，'
+                f'执行 place 宏')
         elif name == 'script':
             wait = bool(cmd.get('wait', True))
             if self._start_proc(cmd, 'script'):
@@ -1540,8 +1684,8 @@ class MotionPlannerNode(Node):
         """抓取宏的具体动作序列。
 
         参数（都有默认值，节点动作序列里可以只填想改的）：
-          yaw_deg / lift_deg / extend_deg  抓取位姿
-          safe_lift_deg                    抬起后的安全高度（默认 0）
+          yaw_deg / lift_deg / extend_deg  抓取/放置位姿
+          safe_lift_deg                    仅 pick 使用：抬起后的安全高度（默认 0）
           gripper_open / gripper_close     夹爪张开/夹紧角度（默认 120 / 35）
           settle_ms                        每个阶段等待时间（默认 800ms）
         """
@@ -1571,11 +1715,11 @@ class MotionPlannerNode(Node):
                 grip(g_close), wait(),
                 gimbal(safe),
             ]
-        return [                       # place
-            gimbal(safe), wait(),
+        # place：直接到放置位 → 张爪。不再插"安全高度"中转，也不在宏末尾
+        # 自动抬回；需要抬起/收回就在序列里紧跟一条 gimbal_lift。
+        return [
             gimbal(lift), wait(),
             grip(g_open), wait(),
-            gimbal(safe),
         ]
 
     # ---------------- 子程序（script / align / vision_pick） ----------------

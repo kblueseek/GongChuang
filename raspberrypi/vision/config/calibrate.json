@@ -7,7 +7,7 @@
   "align_yaw_deg": "",
   "_target": "中间圆环要对到的画面像素。不写/空 = 用 ring_station_detector.json 的参考环心（633.5, 321.6）。当前安装方向下实测调好的值是 (595, 348)。",
   "target_x": 587.0,
-  "target_y": 323.0,
+  "target_y": 299.0,
   "_cam_rotation": "calibrate 专用画面旋转角：摄像头安装方向变了之后，把画面转回标定时的方向。当前用 180；不写/空 = 跟随 vision_node 的 cam_rotation。只影响 calibrate，不影响 color_pick。",
   "cam_rotation": 180,
   "_pid": "底盘对位 PID：输入是视觉纠偏量（mm/mm/°），输出是速度（mm/s、°/s），再按 lead=v/chassis_pos_kp 换算成 /cmd_pose 领先量。外环等效单步增益≈ctrl_kp_xy/chassis_pos_kp。当前 1.39/1.74≈0.8，一步消掉约80%误差。ki/kd 归零：稳态误差来自轮速整数RPM量化，不是积分不够；积分只会让末端来回抖。",

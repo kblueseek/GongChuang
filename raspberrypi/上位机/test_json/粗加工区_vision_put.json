@@ -50,14 +50,18 @@
     {
       "cmd": "place_tray",
       "yaw_deg": 15.5,
-      "lift_deg": 1450.0,
-      "extend_deg": 656.0,
+      "lift_deg": 400.0,
+      "extend_deg": 400.0,
       "retract_deg": 150.0,
       "lead_s": 50.0
     },
     {
       "cmd": "vision_put",
-      "ring": 0
+      "ring": 0,
+      "yaw_deg": 15.5,
+      "lift_deg": 1450.0,
+      "extend_deg": 600.0,
+      "use_last": 1
     },
     {
       "cmd": "gimbal_lift",
@@ -116,14 +120,12 @@
       "lead_s": 50.0
     },
     {
-      "cmd": "gimbal",
+      "cmd": "vision_put",
+      "ring": 0,
       "yaw_deg": -170.0,
       "lift_deg": 1450.0,
-      "extend_deg": 1133.0
-    },
-    {
-      "cmd": "vision_put",
-      "ring": 0
+      "extend_deg": 1100.0,
+      "use_last": 1
     },
     {
       "cmd": "gimbal_lift",
@@ -182,20 +184,16 @@
       "lead_s": 50.0
     },
     {
-      "cmd": "place_tray",
-      "yaw_deg": 178.0,
-      "lift_deg": 1450.0,
-      "extend_deg": 1227.0,
-      "retract_deg": 600.0,
-      "lead_s": 50.0
-    },
-    {
       "cmd": "vision_put",
-      "ring": 0
+      "ring": 0,
+      "yaw_deg": 178.0,
+      "lift_deg": 1480.0,
+      "extend_deg": 1200.0,
+      "use_last": 1
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": 65.0
+      "delta_deg": 45.0
     },
     {
       "cmd": "gripper",
@@ -277,7 +275,7 @@
       "cmd": "place_tray",
       "yaw_deg": -162.0,
       "lift_deg": 500.0,
-      "extend_deg": 1134.0,
+      "extend_deg": 1100.0,
       "retract_deg": 200.0,
       "lead_s": 50.0
     },
@@ -337,7 +335,7 @@
       "cmd": "place_tray",
       "yaw_deg": 15.5,
       "lift_deg": 500.0,
-      "extend_deg": 656.0,
+      "extend_deg": 620.0,
       "retract_deg": 200.0,
       "lead_s": 50.0
     },
