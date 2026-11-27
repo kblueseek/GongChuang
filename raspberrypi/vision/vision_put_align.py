@@ -929,7 +929,12 @@ def run_align(camera, node, args, detector, stop=None) -> dict:
                     pid_yaw.reset()
                     pid_ext.reset()
                 else:
-                    stable = 0
+                    # 失败时递减而不是归零：原来是 stable=0，只要有一帧被抖动/
+                    # 收残速打断，前面数过的帧全部作废、从头再数 5 帧 ——
+                    # 表现就是"明明已经对准了，却要停好几秒才退出"。
+                    # 递减让孤立的坏帧只扣 1 帧，连续坏帧照样数不上去，
+                    # 判定精度不变，但不会被单帧噪声反复清零。
+                    stable = max(0, stable - 1)
                     # 控制死区要小于 tol：死区一停 PID 就不再补速度，
                     # 死区若等于/大于 tol，就会出现"还差一点却停了"。
                     if abs(ex) > args.deadband_px or abs(ey) > args.deadband_px:

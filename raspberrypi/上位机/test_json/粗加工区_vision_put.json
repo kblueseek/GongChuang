@@ -65,7 +65,7 @@
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": 65.0
+      "delta_deg": 70.0
     },
     {
       "cmd": "gripper",
@@ -129,7 +129,7 @@
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": 65.0
+      "delta_deg": 70.0
     },
     {
       "cmd": "gripper",
@@ -193,7 +193,7 @@
     },
     {
       "cmd": "gimbal_lift",
-      "delta_deg": 45.0
+      "delta_deg": 50.0
     },
     {
       "cmd": "gripper",

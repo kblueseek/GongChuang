@@ -10,7 +10,7 @@
     "canny_low": 60,
     "canny_high": 160,
     "min_contour_points": 20,
-    "min_minor_axis_px": 12.0,
+    "min_minor_axis_px": 18.0,
     "max_major_axis_px": 700.0,
     "min_ellipse_aspect": 0.25,
     "max_edge_saturation": 90.0,

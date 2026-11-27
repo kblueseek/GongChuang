@@ -270,6 +270,22 @@ def _extract_observations(image, config, border_margin_px=0.0):
             or minor / major < config.min_ellipse_aspect
         ):
             continue
+        # 圆周覆盖率：完整圆环的轮廓点绕中心接近 360°，一段弧只有几十度。
+        # cv2.fitEllipse 对弧段也能返回合法椭圆（短轴小、长轴大），光靠长短轴
+        # 筛不掉；背景里深色虚线圆的碎片就是这么混进来被当成第三个环的。
+        # 36 个桶至少占 15 个（约 150°）：40~60° 的弧段只占 4~6 个桶，照样被挡；
+        # 遮挡到只剩 150° 左右时仍能通过。想更严就往 17 调，更松往 12 调，
+        # 一次动 2 个桶（=20°），别一步跨太多。
+        points_xy = np.asarray(contour, dtype=np.float64).reshape(-1, 2)
+        angles = np.arctan2(
+            points_xy[:, 1] - center[1],
+            points_xy[:, 0] - center[0],
+        )
+        coverage_bins = set(
+            ((angles + math.pi) * (36.0 / (2.0 * math.pi))).astype(int) % 36
+        )
+        if len(coverage_bins) < 15:
+            continue
         # 颜色过滤：沿轮廓往椭圆中心收 12% 采样，看边缘内侧的饱和度。
         # 黑白圆环饱和度低；夹着的物料球（红/黄/绿/蓝）和绿色夹爪饱和度高，
         # 它们的外轮廓也会被 fitEllipse 拟合成圆，必须在这里排掉。
@@ -461,8 +477,10 @@ def _select_pair(candidates, image_width, config):
             continue
         # 用观测到的环直径估像素/毫米，再和物理间距（150 / 300mm）比。
         # 不能直接和参考像素间距比：参考是标定距离下的尺度，车一近一远就偏。
-        diameter_px = float(np.mean([
-            item.effective_diameter_px for item in pair]))
+        # 用较大的那个直径估尺度：误判候选（弧段）的直径通常明显偏小，
+        # 取平均会把 px_per_mm 一起带偏，反而让错误的间距"自洽"过校验。
+        diameter_px = float(max(
+            item.effective_diameter_px for item in pair))
         if diameter_px > 1e-6 and config.outer_diameter_mm > 0:
             px_per_mm = diameter_px / config.outer_diameter_mm
             expected = [
@@ -851,11 +869,19 @@ class RingStationDetector:
         ) / 2.0
         margin = self.config.roi_margin_px + half_diameter
         height, width = shape[:2]
+        # 边界按 24px 量化：ROI 每帧跟着检测结果微动，裁剪边缘就切到不同的
+        # 像素，Canny 结果逐帧变，表现出来就是环心抖 1~2px。量化之后只有
+        # 圆心移动超过一格才换 ROI，抖动源头就断了。
+        quantum = 24
+        x0 = int(math.floor(points[:, 0].min() - margin))
+        y0 = int(math.floor(points[:, 1].min() - margin))
+        x1 = int(math.ceil(points[:, 0].max() + margin))
+        y1 = int(math.ceil(points[:, 1].max() + margin))
         return (
-            max(0, int(math.floor(points[:, 0].min() - margin))),
-            max(0, int(math.floor(points[:, 1].min() - margin))),
-            min(width, int(math.ceil(points[:, 0].max() + margin))),
-            min(height, int(math.ceil(points[:, 1].max() + margin))),
+            max(0, x0 // quantum * quantum),
+            max(0, y0 // quantum * quantum),
+            min(width, -(-x1 // quantum) * quantum),
+            min(height, -(-y1 // quantum) * quantum),
         )
 
     @staticmethod
